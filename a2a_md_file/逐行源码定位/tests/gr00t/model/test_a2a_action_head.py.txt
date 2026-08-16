@@ -1,0 +1,343 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """CPU unit tests for the latent A2A GR00T action head."""
+00004 | 
+00005 | from types import SimpleNamespace
+00006 | 
+00007 | from gr00t.configs.model.gr00t_n1d7_a2a import Gr00tN1d7A2AConfig
+00008 | from gr00t.model.gr00t_n1d7_a2a.gr00t_n1d7_a2a import Gr00tN1d7A2AActionHead
+00009 | import pytest
+00010 | import torch
+00011 | from transformers.feature_extraction_utils import BatchFeature
+00012 | 
+00013 | 
+00014 | def _config(**overrides):
+00015 |     values = dict(
+00016 |         backbone_embedding_dim=32,
+00017 |         max_action_dim=7,
+00018 |         action_horizon=4,
+00019 |         max_num_embodiments=3,
+00020 |         a2a_history_horizon=4,
+00021 |         a2a_future_horizon=4,
+00022 |         a2a_latent_dim=16,
+00023 |         a2a_encoder_channels=(8, 12, 16),
+00024 |         a2a_encoder_kernel_size=5,
+00025 |         a2a_flow_blocks=4,
+00026 |         a2a_flow_mlp_ratio=2,
+00027 |         a2a_decoder_res_blocks=4,
+00028 |         a2a_num_inference_steps=1,
+00029 |         a2a_ic_train_steps=1,
+00030 |         a2a_history_noise_train_std=0.0,
+00031 |         a2a_history_noise_infer_std=0.0,
+00032 |         a2a_training_stage="joint",
+00033 |         a2a_strict_paper_architecture=False,
+00034 |         use_vlln=True,
+00035 |         tune_projector=True,
+00036 |         tune_diffusion_model=True,
+00037 |         tune_vlln=True,
+00038 |     )
+00039 |     values.update(overrides)
+00040 |     return Gr00tN1d7A2AConfig(**values)
+00041 | 
+00042 | 
+00043 | def _strict_paper_overrides(**overrides):
+00044 |     values = dict(
+00045 |         action_horizon=8,
+00046 |         a2a_history_horizon=8,
+00047 |         a2a_future_horizon=8,
+00048 |         a2a_latent_dim=512,
+00049 |         a2a_encoder_channels=(128, 256, 512),
+00050 |         a2a_encoder_kernel_size=5,
+00051 |         a2a_flow_blocks=4,
+00052 |         a2a_flow_mlp_ratio=4,
+00053 |         a2a_decoder_res_blocks=4,
+00054 |         a2a_strict_paper_architecture=True,
+00055 |     )
+00056 |     values.update(overrides)
+00057 |     return values
+00058 | 
+00059 | 
+00060 | def _backbone(config, batch_size=2):
+00061 |     attention = torch.ones(batch_size, 6, dtype=torch.long)
+00062 |     image = torch.zeros(batch_size, 6, dtype=torch.bool)
+00063 |     image[:, :3] = True
+00064 |     return BatchFeature(
+00065 |         data={
+00066 |             "backbone_features": torch.randn(batch_size, 6, config.backbone_embedding_dim),
+00067 |             "backbone_attention_mask": attention,
+00068 |             "image_mask": image,
+00069 |         }
+00070 |     )
+00071 | 
+00072 | 
+00073 | def _inputs(config, batch_size=2):
+00074 |     shape = (batch_size, config.a2a_future_horizon, config.max_action_dim)
+00075 |     continuous = torch.zeros(shape)
+00076 |     continuous[..., :6] = 1
+00077 |     auxiliary = torch.zeros(shape)
+00078 |     auxiliary[..., 6:] = 1
+00079 |     return BatchFeature(
+00080 |         data={
+00081 |             "history_action_canonical": torch.randn(shape),
+00082 |             "future_action_canonical": torch.randn(shape).clamp(-1, 1),
+00083 |             "history_action_mask": continuous.clone(),
+00084 |             "future_action_mask": torch.ones(shape),
+00085 |             "continuous_action_mask": continuous,
+00086 |             "auxiliary_action_mask": auxiliary,
+00087 |             "binary_action_mask": torch.zeros(shape),
+00088 |             "categorical_action_mask": torch.zeros(shape),
+00089 |             "categorical_group_index": torch.full(shape, -1, dtype=torch.long),
+00090 |             "embodiment_id": torch.zeros(batch_size, dtype=torch.long),
+00091 |             "state": torch.randn(batch_size, 1, config.max_state_dim),
+00092 |         }
+00093 |     )
+00094 | 
+00095 | 
+00096 | def test_forward_exposes_paper_losses_and_gradients():
+00097 |     config = _config()
+00098 |     head = Gr00tN1d7A2AActionHead(config).train()
+00099 |     output = head(_backbone(config), _inputs(config))
+00100 |     for key in ("loss", "loss_fm", "loss_ae", "loss_ic", "loss_aux"):
+00101 |         assert output[key].ndim == 0
+00102 |         assert torch.isfinite(output[key])
+00103 |     output["loss"].backward()
+00104 |     assert any(parameter.grad is not None for parameter in head.flow_net.parameters())
+00105 |     assert any(parameter.grad is not None for parameter in head.trajectory_encoder.parameters())
+00106 |     assert output["action_pred"].shape == (2, 4, 7)
+00107 | 
+00108 | 
+00109 | def test_mlp_backend_remains_default_with_vector_latent():
+00110 |     config = _config()
+00111 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00112 |     output = head.get_action(_backbone(config), _inputs(config))
+00113 | 
+00114 |     assert config.a2a_flow_backbone == "mlp"
+00115 |     assert output["z0"].shape == (2, 16)
+00116 |     assert output["z1_inferred"].shape == (2, 16)
+00117 | 
+00118 |     # The MLP branch adds only an Identity summary adapter, so no DiT-only or
+00119 |     # compatibility-shim parameter is serialized into an old-style checkpoint.
+00120 |     state_keys = tuple(head.state_dict())
+00121 |     assert not any("position_embedding" in key for key in state_keys)
+00122 |     assert not any("latent_summary_projection" in key for key in state_keys)
+00123 |     Gr00tN1d7A2AActionHead(config).load_state_dict(head.state_dict(), strict=True)
+00124 | 
+00125 | 
+00126 | def test_dit_backend_trains_and_infers_with_temporal_latent_tokens():
+00127 |     config = _config(
+00128 |         a2a_flow_backbone="dit",
+00129 |         a2a_dit_token_dim=16,
+00130 |         a2a_dit_num_layers=2,
+00131 |         a2a_dit_num_heads=4,
+00132 |         a2a_dit_mlp_ratio=2,
+00133 |         a2a_dit_dropout=0.0,
+00134 |     )
+00135 |     head = Gr00tN1d7A2AActionHead(config).train()
+00136 |     backbone = _backbone(config)
+00137 |     inputs = _inputs(config)
+00138 |     output = head(backbone, inputs)
+00139 |     output["loss"].backward()
+00140 | 
+00141 |     assert output["z0"].shape == (2, 4, 16)
+00142 |     assert output["z1"].shape == (2, 4, 16)
+00143 |     assert output["z1_inferred"].shape == (2, 4, 16)
+00144 |     assert output["action_pred"].shape == (2, 4, 7)
+00145 |     assert torch.isfinite(output["loss"])
+00146 |     assert any(parameter.grad is not None for parameter in head.flow_net.parameters())
+00147 |     assert any(parameter.grad is not None for parameter in head.trajectory_encoder.parameters())
+00148 | 
+00149 |     head.eval()
+00150 |     first = head.get_action(backbone, inputs)["action_pred"]
+00151 |     second = head.get_action(backbone, inputs)["action_pred"]
+00152 |     torch.testing.assert_close(first, second)
+00153 | 
+00154 | 
+00155 | def test_dit_backend_respects_partial_cold_start_history_mask():
+00156 |     config = _config(
+00157 |         a2a_flow_backbone="dit",
+00158 |         a2a_dit_token_dim=16,
+00159 |         a2a_dit_num_layers=2,
+00160 |         a2a_dit_num_heads=4,
+00161 |         a2a_dit_mlp_ratio=2,
+00162 |     )
+00163 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00164 |     inputs = _inputs(config)
+00165 |     inputs["history_action_mask"][:, :3] = 0
+00166 |     output = head.get_action(_backbone(config), inputs)
+00167 | 
+00168 |     torch.testing.assert_close(output["z0"][:, :3], torch.zeros_like(output["z0"][:, :3]))
+00169 |     assert output["action_pred"].shape == (2, 4, 7)
+00170 |     assert torch.isfinite(output["action_pred"]).all()
+00171 | 
+00172 | 
+00173 | def test_dit_large_default_profile_smoke():
+00174 |     """Exercise the documented 8-token, 256-wide, 8-layer comparison profile."""
+00175 |     config = _config(
+00176 |         action_horizon=8,
+00177 |         a2a_history_horizon=8,
+00178 |         a2a_future_horizon=8,
+00179 |         a2a_flow_backbone="dit",
+00180 |     )
+00181 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00182 |     output = head.get_action(_backbone(config, batch_size=1), _inputs(config, batch_size=1))
+00183 | 
+00184 |     assert output["z0"].shape == (1, 8, 256)
+00185 |     assert output["z1_inferred"].shape == (1, 8, 256)
+00186 |     assert output["action_pred"].shape == (1, 8, 7)
+00187 |     assert len(head.flow_net.blocks) == 8
+00188 | 
+00189 | 
+00190 | def test_inference_is_deterministic_without_history_noise():
+00191 |     config = _config()
+00192 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00193 |     backbone = _backbone(config)
+00194 |     inputs = _inputs(config)
+00195 |     first = head.get_action(backbone, inputs)["action_pred"]
+00196 |     second = head.get_action(backbone, inputs)["action_pred"]
+00197 |     torch.testing.assert_close(first, second)
+00198 | 
+00199 | 
+00200 | def test_source_latent_depends_on_executed_history():
+00201 |     config = _config()
+00202 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00203 |     backbone = _backbone(config)
+00204 |     first_inputs = _inputs(config)
+00205 |     second_inputs = BatchFeature(data=dict(first_inputs))
+00206 |     second_inputs["history_action_canonical"] = (
+00207 |         first_inputs["history_action_canonical"] + first_inputs["history_action_mask"] * 0.5
+00208 |     )
+00209 |     first = head.get_action(backbone, first_inputs)["z0"]
+00210 |     second = head.get_action(backbone, second_inputs)["z0"]
+00211 |     assert not torch.allclose(first, second)
+00212 | 
+00213 | 
+00214 | def test_optional_current_state_condition_is_an_explicit_nonstrict_ablation():
+00215 |     config = _config(a2a_include_current_state_condition=True)
+00216 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00217 |     backbone = _backbone(config)
+00218 |     first_inputs = _inputs(config)
+00219 |     second_inputs = BatchFeature(data=dict(first_inputs))
+00220 |     second_inputs["state"] = first_inputs["state"] + 0.5
+00221 | 
+00222 |     first = head.get_action(backbone, first_inputs)["action_pred"]
+00223 |     second = head.get_action(backbone, second_inputs)["action_pred"]
+00224 |     assert not torch.allclose(first, second)
+00225 | 
+00226 | 
+00227 | def test_unassigned_future_channel_is_rejected():
+00228 |     config = _config()
+00229 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00230 |     inputs = _inputs(config)
+00231 |     inputs["auxiliary_action_mask"][..., -1] = 0
+00232 |     try:
+00233 |         head.get_action(_backbone(config), inputs)
+00234 |     except ValueError as error:
+00235 |         assert "no generation head" in str(error)
+00236 |     else:
+00237 |         raise AssertionError("unassigned action channel should fail")
+00238 | 
+00239 | 
+00240 | def test_inference_rejects_history_future_channel_mismatch():
+00241 |     config = _config()
+00242 |     head = Gr00tN1d7A2AActionHead(config).eval()
+00243 |     inputs = _inputs(config)
+00244 |     inputs["history_action_mask"][..., 0] = 0
+00245 |     with pytest.raises(ValueError, match="same channels"):
+00246 |         head.get_action(_backbone(config), inputs)
+00247 | 
+00248 | 
+00249 | def test_strict_paper_config_accepts_exact_architecture():
+00250 |     config = _config(**_strict_paper_overrides())
+00251 |     assert tuple(config.a2a_encoder_channels) == (128, 256, 512)
+00252 |     assert config.a2a_flow_mlp_ratio == 4
+00253 |     assert config.a2a_decoder_res_blocks == 4
+00254 | 
+00255 | 
+00256 | def test_joint_stage_rejects_frozen_random_trajectory_autoencoder():
+00257 |     config = _config(tune_projector=False, a2a_training_stage="joint")
+00258 | 
+00259 |     with pytest.raises(ValueError, match="trajectory encoder/decoder"):
+00260 |         Gr00tN1d7A2AActionHead(config)
+00261 | 
+00262 | 
+00263 | def test_autoencoder_stage_rejects_unused_trainable_backbone():
+00264 |     config = _config(a2a_training_stage="autoencoder", tune_llm=True)
+00265 | 
+00266 |     with pytest.raises(ValueError, match="bypasses the VLM backbone"):
+00267 |         Gr00tN1d7A2AActionHead(config)
+00268 | 
+00269 | 
+00270 | def test_checkpoint_load_overrides_saved_autoencoder_stage_for_joint_training():
+00271 |     from gr00t.model.gr00t_n1d7_a2a.setup import Gr00tN1d7A2APipeline
+00272 | 
+00273 |     pipeline = object.__new__(Gr00tN1d7A2APipeline)
+00274 |     pipeline.config = SimpleNamespace(model=_config(a2a_training_stage="joint"))
+00275 | 
+00276 |     overrides = pipeline._get_model_extra_kwargs()
+00277 |     assert overrides["a2a_training_stage"] == "joint"
+00278 |     assert overrides["a2a_num_inference_steps"] == 1
+00279 |     assert overrides["a2a_history_noise_train_std"] == 0.0
+00280 |     assert overrides["a2a_flow_backbone"] == "mlp"
+00281 |     assert overrides["a2a_dit_num_layers"] == 8
+00282 | 
+00283 | 
+00284 | def test_dit_config_rejects_invalid_head_width_and_strict_paper_claim():
+00285 |     with pytest.raises(ValueError, match="divisible"):
+00286 |         _config(
+00287 |             a2a_flow_backbone="dit",
+00288 |             a2a_dit_token_dim=18,
+00289 |             a2a_dit_num_heads=4,
+00290 |         )
+00291 | 
+00292 |     with pytest.raises(ValueError, match="flow_backbone"):
+00293 |         _config(
+00294 |             **_strict_paper_overrides(),
+00295 |             a2a_flow_backbone="dit",
+00296 |         )
+00297 | 
+00298 | 
+00299 | def test_full_checkpoint_cannot_silently_switch_mlp_to_dit(monkeypatch):
+00300 |     from gr00t.model.gr00t_n1d7_a2a import setup as a2a_setup
+00301 | 
+00302 |     saved_config = _config(a2a_flow_backbone="mlp")
+00303 |     requested_config = _config(
+00304 |         a2a_flow_backbone="dit",
+00305 |         a2a_dit_token_dim=16,
+00306 |         a2a_dit_num_layers=2,
+00307 |         a2a_dit_num_heads=4,
+00308 |         a2a_dit_mlp_ratio=2,
+00309 |     )
+00310 |     pipeline = object.__new__(a2a_setup.Gr00tN1d7A2APipeline)
+00311 |     pipeline.config = SimpleNamespace(
+00312 |         model=requested_config,
+00313 |         training=SimpleNamespace(start_from_checkpoint="mlp-checkpoint"),
+00314 |     )
+00315 |     pipeline.transformers_loading_kwargs = {}
+00316 |     monkeypatch.setattr(
+00317 |         a2a_setup.AutoConfig,
+00318 |         "from_pretrained",
+00319 |         lambda *args, **kwargs: saved_config,
+00320 |     )
+00321 | 
+00322 |     with pytest.raises(ValueError, match="cannot change its MLP/DiT module graph"):
+00323 |         pipeline._normalize_checkpoint_sources()
+00324 | 
+00325 | 
+00326 | @pytest.mark.parametrize(
+00327 |     ("override", "mismatch_name"),
+00328 |     (
+00329 |         ({"action_horizon": 7}, "action_horizon"),
+00330 |         ({"a2a_history_horizon": 7}, "history_horizon"),
+00331 |         ({"a2a_future_horizon": 7}, "future_horizon"),
+00332 |         ({"a2a_latent_dim": 256}, "latent_dim"),
+00333 |         ({"a2a_encoder_channels": (64, 256, 512)}, "encoder_channels"),
+00334 |         ({"a2a_encoder_kernel_size": 3}, "encoder_kernel"),
+00335 |         ({"a2a_flow_blocks": 3}, "flow_blocks"),
+00336 |         ({"a2a_flow_mlp_ratio": 2}, "flow_mlp_ratio"),
+00337 |         ({"a2a_decoder_res_blocks": 3}, "decoder_blocks"),
+00338 |         ({"a2a_include_current_state_condition": True}, "include_current_state_condition"),
+00339 |     ),
+00340 | )
+00341 | def test_strict_paper_config_rejects_architecture_drift(override, mismatch_name):
+00342 |     with pytest.raises(ValueError, match=mismatch_name):
+00343 |         _config(**_strict_paper_overrides(**override))

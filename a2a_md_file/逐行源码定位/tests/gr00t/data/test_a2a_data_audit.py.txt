@@ -1,0 +1,255 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | import json
+00004 | 
+00005 | from gr00t.data.a2a_contract import canonical_contract_sha256
+00006 | import numpy as np
+00007 | import pytest
+00008 | from scripts.a2a.audit_a2a_data import audit_a2a_arrays, audit_channel_spec, main as audit_main
+00009 | from scripts.a2a.build_canonical_stats import (
+00010 |     compute_shared_canonical_statistics,
+00011 |     main as stats_main,
+00012 | )
+00013 | 
+00014 | 
+00015 | def test_shared_stats_pool_history_and_future_on_continuous_intersection():
+00016 |     history = np.array([[[0.0, 10.0, 100.0], [2.0, 12.0, 101.0]]])
+00017 |     future = np.array([[[4.0, 14.0, 200.0], [6.0, 16.0, 201.0]]])
+00018 |     history_mask = np.array([[[1, 1, 0], [1, 1, 0]]], dtype=bool)
+00019 |     future_mask = np.ones_like(future, dtype=bool)
+00020 | 
+00021 |     stats = compute_shared_canonical_statistics(history, future, history_mask, future_mask)
+00022 | 
+00023 |     assert stats["normalization"] == "shared_history_future_continuous_intersection"
+00024 |     assert stats["active_channel_mask"] == [True, True, False]
+00025 |     assert stats["mean"] == pytest.approx([3.0, 13.0, 0.0])
+00026 |     assert stats["valid_count"] == [4, 4, 0]
+00027 |     assert stats["std"][2] == 1.0
+00028 | 
+00029 | 
+00030 | def test_stats_reject_nonfinite_active_values_but_audit_reports_them():
+00031 |     history = np.array([[[0.0], [np.nan]]])
+00032 |     future = np.array([[[1.0], [2.0]]])
+00033 | 
+00034 |     with pytest.raises(ValueError, match="non-finite active values"):
+00035 |         compute_shared_canonical_statistics(history, future)
+00036 | 
+00037 |     report = audit_a2a_arrays(history, future)
+00038 |     assert report["history_nonfinite_active_count"] == 1
+00039 |     assert report["errors"] == ["Non-finite values occur under active canonical masks"]
+00040 | 
+00041 | 
+00042 | def test_audit_detects_history_distance_advantage_over_gaussian():
+00043 |     history = np.array(
+00044 |         [
+00045 |             [[0.0, 1.0], [0.5, 1.5]],
+00046 |             [[1.0, 2.0], [1.5, 2.5]],
+00047 |             [[2.0, 3.0], [2.5, 3.5]],
+00048 |         ]
+00049 |     )
+00050 |     future = history.copy()
+00051 | 
+00052 |     report = audit_a2a_arrays(history, future, random_seed=123)
+00053 | 
+00054 |     assert report["history_closer_than_gaussian"] is True
+00055 |     assert report["history_to_gaussian_mean_distance_ratio"] == pytest.approx(0.0)
+00056 |     assert report["history_future_trajectory_rms"]["mean"] == pytest.approx(0.0)
+00057 |     assert report["errors"] == []
+00058 | 
+00059 | 
+00060 | def test_audit_supports_different_history_and_future_horizons():
+00061 |     history = np.zeros((2, 3, 2))
+00062 |     future = np.zeros((2, 5, 2))
+00063 | 
+00064 |     report = audit_a2a_arrays(history, future)
+00065 | 
+00066 |     assert report["history_future_trajectory_rms"] is None
+00067 |     assert report["history_last_future_first_rms"]["count"] == 2
+00068 | 
+00069 | 
+00070 | def test_channel_spec_requires_executed_source_for_continuous_actions():
+00071 |     report = audit_channel_spec(
+00072 |         [
+00073 |             {
+00074 |                 "action_key": "arm",
+00075 |                 "source_state_key": "joint_positions",
+00076 |                 "kind": "continuous",
+00077 |             },
+00078 |             {"action_key": "gripper", "source_state_key": None, "kind": "binary"},
+00079 |             {"action_key": "base", "source_state_key": "missing", "kind": "continuous"},
+00080 |         ],
+00081 |         available_state_keys={"joint_positions"},
+00082 |         available_action_keys={"arm", "gripper", "base"},
+00083 |     )
+00084 | 
+00085 |     assert report["missing_source_state_keys"] == ["base"]
+00086 |     assert report["discrete_channels"] == ["gripper"]
+00087 |     assert report["errors"]
+00088 | 
+00089 | 
+00090 | def test_stats_and_audit_cli_npz_contract(tmp_path):
+00091 |     input_path = tmp_path / "windows.npz"
+00092 |     stats_path = tmp_path / "a2a_statistics.json"
+00093 |     audit_path = tmp_path / "a2a_audit.json"
+00094 |     contract_path = tmp_path / "channel_contract.json"
+00095 |     history = np.arange(24, dtype=np.float32).reshape(2, 4, 3)
+00096 |     future = history + 0.25
+00097 |     mask = np.ones_like(history, dtype=np.uint8)
+00098 |     contract = {
+00099 |         "version": 1,
+00100 |         "embodiment": "test_robot",
+00101 |         "feature_dim": 3,
+00102 |         "history_horizon": 4,
+00103 |         "future_horizon": 4,
+00104 |         "channels": [
+00105 |             {
+00106 |                 "action_key": "arm",
+00107 |                 "source_state_key": "arm",
+00108 |                 "kind": "continuous",
+00109 |                 "start": 0,
+00110 |                 "end": 3,
+00111 |                 "canonical_format": "joint_position",
+00112 |                 "source_format": "joint_position",
+00113 |                 "target_format": "joint_position",
+00114 |                 "source_unit": "radian",
+00115 |                 "target_unit": "radian",
+00116 |                 "source_frame": "joint",
+00117 |                 "target_frame": "joint",
+00118 |             }
+00119 |         ],
+00120 |         "provenance": {
+00121 |             "dataset": "unit_test",
+00122 |             "dataset_revision": "1",
+00123 |             "dataset_fingerprint_sha256": "0" * 64,
+00124 |             "source_schema_sha256": "1" * 64,
+00125 |             "canonicalizer": "identity",
+00126 |             "canonicalizer_version": "1",
+00127 |             "canonicalizer_sha256": "2" * 64,
+00128 |             "exporter_version": "1",
+00129 |             "target_definition": "absolute_joint_target",
+00130 |             "time_alignment": "history_t_minus_3_to_t__future_t_to_t_plus_3",
+00131 |         },
+00132 |         "controller": {
+00133 |             "type": "joint_position",
+00134 |             "version": "1",
+00135 |             "frame": "joint",
+00136 |             "control_delta": False,
+00137 |             "rotation_composition": "none",
+00138 |             "scale": [1.0, 1.0, 1.0],
+00139 |         },
+00140 |     }
+00141 |     contract_path.write_text(json.dumps(contract), encoding="utf-8")
+00142 |     export_metadata = {
+00143 |         "input_space": np.asarray("unnormalized_canonical_physical"),
+00144 |         "contract_json": np.asarray(json.dumps(contract, sort_keys=True)),
+00145 |         "contract_sha256": np.asarray(canonical_contract_sha256(contract)),
+00146 |         "num_windows": np.asarray(2, dtype=np.int64),
+00147 |         "history_horizon": np.asarray(4, dtype=np.int64),
+00148 |         "future_horizon": np.asarray(4, dtype=np.int64),
+00149 |         "feature_dim": np.asarray(3, dtype=np.int64),
+00150 |     }
+00151 |     np.savez(
+00152 |         input_path,
+00153 |         history=history,
+00154 |         future=future,
+00155 |         history_mask=mask,
+00156 |         future_mask=mask,
+00157 |         **export_metadata,
+00158 |     )
+00159 | 
+00160 |     assert (
+00161 |         stats_main(
+00162 |             [
+00163 |                 "--input",
+00164 |                 str(input_path),
+00165 |                 "--output",
+00166 |                 str(stats_path),
+00167 |                 "--contract",
+00168 |                 str(contract_path),
+00169 |             ]
+00170 |         )
+00171 |         == 0
+00172 |     )
+00173 |     assert (
+00174 |         audit_main(
+00175 |             [
+00176 |                 "--input",
+00177 |                 str(input_path),
+00178 |                 "--output",
+00179 |                 str(audit_path),
+00180 |                 "--fail-on-errors",
+00181 |             ]
+00182 |         )
+00183 |         == 0
+00184 |     )
+00185 | 
+00186 |     saved_stats = json.loads(stats_path.read_text())
+00187 |     assert saved_stats["feature_dim"] == 3
+00188 |     assert len(saved_stats["channel_contract"]["sha256"]) == 64
+00189 |     saved_audit = json.loads(audit_path.read_text())
+00190 |     assert saved_audit["num_windows"] == 2
+00191 |     assert saved_audit["export_contract_sha256"] == canonical_contract_sha256(contract)
+00192 | 
+00193 |     np.savez(
+00194 |         input_path,
+00195 |         history=history,
+00196 |         future=future,
+00197 |         history_mask=mask,
+00198 |         future_mask=mask,
+00199 |         **{**export_metadata, "contract_sha256": np.asarray("f" * 64)},
+00200 |     )
+00201 |     with pytest.raises(ValueError, match="does not match --contract"):
+00202 |         stats_main(
+00203 |             [
+00204 |                 "--input",
+00205 |                 str(input_path),
+00206 |                 "--output",
+00207 |                 str(stats_path),
+00208 |                 "--contract",
+00209 |                 str(contract_path),
+00210 |             ]
+00211 |         )
+00212 | 
+00213 |     np.savez(
+00214 |         input_path,
+00215 |         history=history,
+00216 |         future=future,
+00217 |         history_mask=mask,
+00218 |         future_mask=mask,
+00219 |         **{
+00220 |             **export_metadata,
+00221 |             "input_space": np.asarray("already_normalized_model_space"),
+00222 |         },
+00223 |     )
+00224 |     with pytest.raises(ValueError, match="exporter metadata"):
+00225 |         stats_main(
+00226 |             [
+00227 |                 "--input",
+00228 |                 str(input_path),
+00229 |                 "--output",
+00230 |                 str(stats_path),
+00231 |                 "--contract",
+00232 |                 str(contract_path),
+00233 |             ]
+00234 |         )
+00235 | 
+00236 |     np.savez(
+00237 |         input_path,
+00238 |         history=history,
+00239 |         future=future,
+00240 |         future_mask=mask,
+00241 |         **export_metadata,
+00242 |     )
+00243 |     with pytest.raises(KeyError, match="both history_mask and future_mask"):
+00244 |         stats_main(
+00245 |             [
+00246 |                 "--input",
+00247 |                 str(input_path),
+00248 |                 "--output",
+00249 |                 str(stats_path),
+00250 |                 "--contract",
+00251 |                 str(contract_path),
+00252 |             ]
+00253 |         )
+00254 |     with pytest.raises(KeyError, match="both history_mask and future_mask"):
+00255 |         audit_main(["--input", str(input_path), "--output", str(audit_path)])

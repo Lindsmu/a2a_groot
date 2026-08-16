@@ -1,0 +1,395 @@
+00001 | #!/usr/bin/env python
+00002 | 
+00003 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00004 | # SPDX-License-Identifier: Apache-2.0
+00005 | 
+00006 | """Build shared normalization statistics for canonical A2A trajectories.
+00007 | 
+00008 | The action-to-action encoder is shared by executed history and future targets,
+00009 | so using independent state/action statistics would put its two inputs in
+00010 | different coordinate systems.  This utility pools both sides and emits one set
+00011 | of statistics.  Only dimensions enabled on *both* sides participate; inactive
+00012 | padded dimensions receive neutral ``mean=0, std=1`` values plus an explicit
+00013 | ``active_channel_mask``.
+00014 | 
+00015 | The CLI consumes an NPZ emitted by ``export_canonical_windows.py`` with arrays
+00016 | ``history``, ``future``, ``history_mask`` and ``future_mask``.  The pure NumPy
+00017 | functions are reusable from conversion jobs without invoking the CLI.  History
+00018 | and future arrays must be unnormalized canonical physical trajectories; feeding
+00019 | already-normalized arrays would create a second, incompatible normalization.
+00020 | """
+00021 | 
+00022 | import argparse
+00023 | import json
+00024 | from pathlib import Path
+00025 | from typing import Any
+00026 | 
+00027 | from gr00t.data.a2a_contract import canonical_statistics_sha256, validate_channel_contract
+00028 | import numpy as np
+00029 | 
+00030 | 
+00031 | CANONICAL_STATS_VERSION = 1
+00032 | 
+00033 | 
+00034 | def as_trajectory_batch(array: np.ndarray, name: str) -> np.ndarray:
+00035 |     """Convert ``[T,D]`` or ``[N,T,D]`` input to a float64 batch."""
+00036 | 
+00037 |     array = np.asarray(array)
+00038 |     if array.ndim == 2:
+00039 |         array = array[None, ...]
+00040 |     if array.ndim != 3:
+00041 |         raise ValueError(f"{name} must have shape [T,D] or [N,T,D], got {array.shape}")
+00042 |     if not np.issubdtype(array.dtype, np.number):
+00043 |         raise TypeError(f"{name} must be numeric, got dtype {array.dtype}")
+00044 |     return array.astype(np.float64, copy=False)
+00045 | 
+00046 | 
+00047 | def broadcast_trajectory_mask(
+00048 |     mask: np.ndarray | None,
+00049 |     shape: tuple[int, int, int],
+00050 |     name: str,
+00051 | ) -> np.ndarray:
+00052 |     """Validate and broadcast a mask to ``[N,T,D]``."""
+00053 | 
+00054 |     if mask is None:
+00055 |         return np.ones(shape, dtype=bool)
+00056 |     mask = np.asarray(mask)
+00057 |     if not (np.issubdtype(mask.dtype, np.bool_) or np.issubdtype(mask.dtype, np.number)):
+00058 |         raise TypeError(f"{name} must be boolean or numeric, got dtype {mask.dtype}")
+00059 |     if np.issubdtype(mask.dtype, np.number):
+00060 |         if not np.isfinite(mask).all() or not np.isin(mask, [0, 1]).all():
+00061 |             raise ValueError(f"{name} must contain only finite 0/1 values")
+00062 |     try:
+00063 |         return np.broadcast_to(mask.astype(bool, copy=False), shape).copy()
+00064 |     except ValueError as error:
+00065 |         raise ValueError(f"{name} with shape {mask.shape} cannot broadcast to {shape}") from error
+00066 | 
+00067 | 
+00068 | def prepare_canonical_inputs(
+00069 |     history: np.ndarray,
+00070 |     future: np.ndarray,
+00071 |     history_mask: np.ndarray | None = None,
+00072 |     future_mask: np.ndarray | None = None,
+00073 | ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+00074 |     """Validate canonical trajectories and return their shared channel mask."""
+00075 | 
+00076 |     history = as_trajectory_batch(history, "history")
+00077 |     future = as_trajectory_batch(future, "future")
+00078 |     if 0 in history.shape or 0 in future.shape:
+00079 |         raise ValueError(
+00080 |             f"Canonical trajectory batches must be non-empty, got {history.shape} and {future.shape}"
+00081 |         )
+00082 |     if history.shape[0] != future.shape[0]:
+00083 |         raise ValueError(
+00084 |             "history and future must have the same number of windows, got "
+00085 |             f"{history.shape[0]} and {future.shape[0]}"
+00086 |         )
+00087 |     if history.shape[2] != future.shape[2]:
+00088 |         raise ValueError(
+00089 |             "history and future must share canonical feature dimension, got "
+00090 |             f"{history.shape[2]} and {future.shape[2]}"
+00091 |         )
+00092 | 
+00093 |     history_mask = broadcast_trajectory_mask(history_mask, history.shape, "history_mask")
+00094 |     future_mask = broadcast_trajectory_mask(future_mask, future.shape, "future_mask")
+00095 | 
+00096 |     # A channel is canonical-A2A compatible only if both executed proprio and
+00097 |     # future target supply at least one valid element for it.  Per-element masks
+00098 |     # remain in force after this dataset-level intersection.
+00099 |     shared_channel_mask = np.any(history_mask, axis=(0, 1)) & np.any(future_mask, axis=(0, 1))
+00100 |     history_mask &= shared_channel_mask[None, None, :]
+00101 |     future_mask &= shared_channel_mask[None, None, :]
+00102 |     return history, future, history_mask, future_mask, shared_channel_mask
+00103 | 
+00104 | 
+00105 | def compute_shared_canonical_statistics(
+00106 |     history: np.ndarray,
+00107 |     future: np.ndarray,
+00108 |     history_mask: np.ndarray | None = None,
+00109 |     future_mask: np.ndarray | None = None,
+00110 |     *,
+00111 |     lower_quantile: float = 0.01,
+00112 |     upper_quantile: float = 0.99,
+00113 |     min_std: float = 1e-6,
+00114 |     allow_nonfinite: bool = False,
+00115 |     channel_contract: dict[str, Any] | None = None,
+00116 | ) -> dict[str, Any]:
+00117 |     """Compute one set of per-channel stats from history and future values.
+00118 | 
+00119 |     Non-finite values under an active mask fail by default so a stats build can
+00120 |     never silently legitimize corrupt training data.  Audit callers may set
+00121 |     ``allow_nonfinite=True`` to obtain a diagnostic report from the remaining
+00122 |     finite values.
+00123 |     """
+00124 | 
+00125 |     if not 0 <= lower_quantile < upper_quantile <= 1:
+00126 |         raise ValueError(
+00127 |             "Quantiles must satisfy 0 <= lower < upper <= 1, got "
+00128 |             f"{lower_quantile}, {upper_quantile}"
+00129 |         )
+00130 |     if min_std <= 0:
+00131 |         raise ValueError(f"min_std must be positive, got {min_std}")
+00132 | 
+00133 |     history, future, history_mask, future_mask, shared_channel_mask = prepare_canonical_inputs(
+00134 |         history, future, history_mask, future_mask
+00135 |     )
+00136 |     history_bad = history_mask & ~np.isfinite(history)
+00137 |     future_bad = future_mask & ~np.isfinite(future)
+00138 |     nonfinite_count = int(history_bad.sum() + future_bad.sum())
+00139 |     if nonfinite_count and not allow_nonfinite:
+00140 |         raise ValueError(
+00141 |             f"Canonical trajectories contain {nonfinite_count} non-finite active values; "
+00142 |             "run audit_a2a_data.py before building statistics"
+00143 |         )
+00144 |     history_mask &= np.isfinite(history)
+00145 |     future_mask &= np.isfinite(future)
+00146 | 
+00147 |     feature_dim = history.shape[2]
+00148 |     mean = np.zeros(feature_dim, dtype=np.float64)
+00149 |     std = np.ones(feature_dim, dtype=np.float64)
+00150 |     minimum = np.zeros(feature_dim, dtype=np.float64)
+00151 |     maximum = np.zeros(feature_dim, dtype=np.float64)
+00152 |     q_low = np.zeros(feature_dim, dtype=np.float64)
+00153 |     q_high = np.zeros(feature_dim, dtype=np.float64)
+00154 |     valid_count = np.zeros(feature_dim, dtype=np.int64)
+00155 |     history_valid_count = history_mask.sum(axis=(0, 1), dtype=np.int64)
+00156 |     future_valid_count = future_mask.sum(axis=(0, 1), dtype=np.int64)
+00157 |     constant_mask = np.zeros(feature_dim, dtype=bool)
+00158 | 
+00159 |     for channel in np.flatnonzero(shared_channel_mask):
+00160 |         values = np.concatenate(
+00161 |             [
+00162 |                 history[..., channel][history_mask[..., channel]],
+00163 |                 future[..., channel][future_mask[..., channel]],
+00164 |             ]
+00165 |         )
+00166 |         if values.size == 0:
+00167 |             shared_channel_mask[channel] = False
+00168 |             continue
+00169 |         channel_std = float(values.std())
+00170 |         mean[channel] = float(values.mean())
+00171 |         std[channel] = max(channel_std, min_std)
+00172 |         minimum[channel] = float(values.min())
+00173 |         maximum[channel] = float(values.max())
+00174 |         q_low[channel] = float(np.quantile(values, lower_quantile))
+00175 |         q_high[channel] = float(np.quantile(values, upper_quantile))
+00176 |         valid_count[channel] = values.size
+00177 |         constant_mask[channel] = channel_std < min_std or q_high[channel] - q_low[channel] < min_std
+00178 | 
+00179 |     result = {
+00180 |         "version": CANONICAL_STATS_VERSION,
+00181 |         "normalization": "shared_history_future_continuous_intersection",
+00182 |         "input_space": "unnormalized_canonical_physical",
+00183 |         "feature_dim": feature_dim,
+00184 |         "num_windows": history.shape[0],
+00185 |         "history_horizon": history.shape[1],
+00186 |         "future_horizon": future.shape[1],
+00187 |         "lower_quantile": lower_quantile,
+00188 |         "upper_quantile": upper_quantile,
+00189 |         "mean": mean.tolist(),
+00190 |         "std": std.tolist(),
+00191 |         "min": minimum.tolist(),
+00192 |         "max": maximum.tolist(),
+00193 |         "q01": q_low.tolist(),
+00194 |         "q99": q_high.tolist(),
+00195 |         "q_low": q_low.tolist(),
+00196 |         "q_high": q_high.tolist(),
+00197 |         "valid_count": valid_count.tolist(),
+00198 |         "history_valid_count": history_valid_count.tolist(),
+00199 |         "future_valid_count": future_valid_count.tolist(),
+00200 |         "active_channel_mask": shared_channel_mask.tolist(),
+00201 |         "constant_mask": constant_mask.tolist(),
+00202 |         "nonfinite_active_count": nonfinite_count,
+00203 |     }
+00204 |     if channel_contract is not None:
+00205 |         result["channel_contract"] = validate_channel_contract(
+00206 |             channel_contract,
+00207 |             feature_dim=feature_dim,
+00208 |             history_horizon=history.shape[1],
+00209 |             future_horizon=future.shape[1],
+00210 |         )
+00211 |     result["statistics_sha256"] = canonical_statistics_sha256(result)
+00212 |     return result
+00213 | 
+00214 | 
+00215 | def save_canonical_statistics(statistics: dict[str, Any], output_path: str | Path) -> Path:
+00216 |     """Write canonical statistics as deterministic, human-readable JSON."""
+00217 | 
+00218 |     output_path = Path(output_path)
+00219 |     output_path.parent.mkdir(parents=True, exist_ok=True)
+00220 |     output_path.write_text(
+00221 |         json.dumps(statistics, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+00222 |     )
+00223 |     return output_path
+00224 | 
+00225 | 
+00226 | def load_a2a_npz(
+00227 |     input_path: str | Path,
+00228 | ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+00229 |     """Load the standard A2A audit interchange NPZ."""
+00230 | 
+00231 |     with np.load(Path(input_path), allow_pickle=False) as payload:
+00232 |         missing = {"history", "future"} - set(payload.files)
+00233 |         if missing:
+00234 |             raise KeyError(f"A2A NPZ is missing required arrays: {sorted(missing)}")
+00235 |         history = payload["history"]
+00236 |         future = payload["future"]
+00237 |         history_mask = payload["history_mask"] if "history_mask" in payload else None
+00238 |         future_mask = payload["future_mask"] if "future_mask" in payload else None
+00239 |     return history, future, history_mask, future_mask
+00240 | 
+00241 | 
+00242 | def load_a2a_npz_export_metadata(input_path: str | Path) -> dict[str, Any]:
+00243 |     """Load the provenance written by ``export_canonical_windows.py``.
+00244 | 
+00245 |     Requiring the complete scalar metadata prevents an arbitrary or already
+00246 |     normalized NPZ from becoming trusted merely by copying a contract hash.
+00247 |     """
+00248 | 
+00249 |     required = {
+00250 |         "input_space",
+00251 |         "contract_json",
+00252 |         "contract_sha256",
+00253 |         "num_windows",
+00254 |         "history_horizon",
+00255 |         "future_horizon",
+00256 |         "feature_dim",
+00257 |     }
+00258 |     with np.load(Path(input_path), allow_pickle=False) as payload:
+00259 |         missing = required - set(payload.files)
+00260 |         if missing:
+00261 |             raise KeyError(
+00262 |                 "A2A NPZ is missing exporter provenance fields "
+00263 |                 f"{sorted(missing)}; re-export it with export_canonical_windows.py"
+00264 |             )
+00265 |         metadata = {}
+00266 |         for key in required:
+00267 |             encoded = np.asarray(payload[key])
+00268 |             if encoded.shape != ():
+00269 |                 raise ValueError(
+00270 |                     f"A2A NPZ {key} must be one scalar value, got shape {encoded.shape}"
+00271 |                 )
+00272 |             metadata[key] = encoded.item()
+00273 | 
+00274 |     for key in ("input_space", "contract_json", "contract_sha256"):
+00275 |         if not isinstance(metadata[key], str):
+00276 |             raise TypeError(f"A2A NPZ {key} must be a Unicode string")
+00277 |     contract_sha256 = metadata["contract_sha256"]
+00278 |     if len(contract_sha256) != 64 or any(
+00279 |         character not in "0123456789abcdef" for character in contract_sha256
+00280 |     ):
+00281 |         raise ValueError("A2A NPZ contract_sha256 must be a lowercase SHA-256")
+00282 |     for key in ("num_windows", "history_horizon", "future_horizon", "feature_dim"):
+00283 |         value = metadata[key]
+00284 |         if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+00285 |             raise ValueError(f"A2A NPZ {key} must be a positive integer, got {value!r}")
+00286 |         metadata[key] = int(value)
+00287 |     try:
+00288 |         metadata["contract"] = json.loads(metadata["contract_json"])
+00289 |     except json.JSONDecodeError as error:
+00290 |         raise ValueError("A2A NPZ contract_json is not valid JSON") from error
+00291 |     return metadata
+00292 | 
+00293 | 
+00294 | def _trajectory_horizon_and_dim(array: np.ndarray, name: str) -> tuple[int, int]:
+00295 |     """Read temporal/feature dimensions without materializing a float64 copy."""
+00296 | 
+00297 |     shape = np.asarray(array).shape
+00298 |     if len(shape) not in {2, 3}:
+00299 |         raise ValueError(f"{name} must have shape [T,D] or [N,T,D], got {shape}")
+00300 |     return int(shape[-2]), int(shape[-1])
+00301 | 
+00302 | 
+00303 | def build_argument_parser() -> argparse.ArgumentParser:
+00304 |     parser = argparse.ArgumentParser(description=__doc__)
+00305 |     parser.add_argument("--input", type=Path, required=True, help="A2A windows NPZ")
+00306 |     parser.add_argument("--output", type=Path, required=True, help="Output statistics JSON")
+00307 |     parser.add_argument("--lower-quantile", type=float, default=0.01)
+00308 |     parser.add_argument("--upper-quantile", type=float, default=0.99)
+00309 |     parser.add_argument("--min-std", type=float, default=1e-6)
+00310 |     parser.add_argument(
+00311 |         "--contract",
+00312 |         type=Path,
+00313 |         required=True,
+00314 |         help="Versioned channel/provenance contract JSON bound into the statistics",
+00315 |     )
+00316 |     parser.add_argument(
+00317 |         "--allow-nonfinite",
+00318 |         action="store_true",
+00319 |         help="Ignore non-finite active values after recording their count (audit only)",
+00320 |     )
+00321 |     return parser
+00322 | 
+00323 | 
+00324 | def main(argv: list[str] | None = None) -> int:
+00325 |     args = build_argument_parser().parse_args(argv)
+00326 |     history, future, history_mask, future_mask = load_a2a_npz(args.input)
+00327 |     if history_mask is None or future_mask is None:
+00328 |         raise KeyError(
+00329 |             "Strict canonical statistics require both history_mask and future_mask; "
+00330 |             "re-export the windows instead of inferring validity"
+00331 |         )
+00332 |     history_horizon, history_dim = _trajectory_horizon_and_dim(history, "history")
+00333 |     future_horizon, future_dim = _trajectory_horizon_and_dim(future, "future")
+00334 |     if history_dim != future_dim:
+00335 |         raise ValueError(
+00336 |             f"history/future feature dimensions differ: {history_dim} and {future_dim}"
+00337 |         )
+00338 |     channel_contract = validate_channel_contract(
+00339 |         json.loads(args.contract.read_text(encoding="utf-8")),
+00340 |         feature_dim=history_dim,
+00341 |         history_horizon=history_horizon,
+00342 |         future_horizon=future_horizon,
+00343 |     )
+00344 |     metadata = load_a2a_npz_export_metadata(args.input)
+00345 |     num_windows = 1 if np.asarray(history).ndim == 2 else int(np.asarray(history).shape[0])
+00346 |     expected_metadata = {
+00347 |         "input_space": "unnormalized_canonical_physical",
+00348 |         "num_windows": num_windows,
+00349 |         "history_horizon": history_horizon,
+00350 |         "future_horizon": future_horizon,
+00351 |         "feature_dim": history_dim,
+00352 |     }
+00353 |     mismatches = {
+00354 |         key: {"expected": expected, "actual": metadata[key]}
+00355 |         for key, expected in expected_metadata.items()
+00356 |         if metadata[key] != expected
+00357 |     }
+00358 |     if mismatches:
+00359 |         raise ValueError(f"A2A NPZ exporter metadata does not match its arrays: {mismatches}")
+00360 |     exported_contract = validate_channel_contract(
+00361 |         metadata["contract"],
+00362 |         feature_dim=history_dim,
+00363 |         history_horizon=history_horizon,
+00364 |         future_horizon=future_horizon,
+00365 |     )
+00366 |     if (
+00367 |         metadata["contract_sha256"] != exported_contract["sha256"]
+00368 |         or exported_contract["sha256"] != channel_contract["sha256"]
+00369 |     ):
+00370 |         raise ValueError(
+00371 |             "A2A NPZ contract_sha256/contract_json does not match --contract: "
+00372 |             f"npz_hash={metadata['contract_sha256']}, "
+00373 |             f"npz_contract={exported_contract['sha256']}, "
+00374 |             f"cli_contract={channel_contract['sha256']}"
+00375 |         )
+00376 |     statistics = compute_shared_canonical_statistics(
+00377 |         history,
+00378 |         future,
+00379 |         history_mask,
+00380 |         future_mask,
+00381 |         lower_quantile=args.lower_quantile,
+00382 |         upper_quantile=args.upper_quantile,
+00383 |         min_std=args.min_std,
+00384 |         allow_nonfinite=args.allow_nonfinite,
+00385 |         channel_contract=channel_contract,
+00386 |     )
+00387 |     save_canonical_statistics(statistics, args.output)
+00388 |     print(f"Wrote shared canonical A2A statistics to {args.output}")
+00389 |     print(f"Channel contract SHA-256: {statistics['channel_contract']['sha256']}")
+00390 |     print(f"Statistics SHA-256: {statistics['statistics_sha256']}")
+00391 |     return 0
+00392 | 
+00393 | 
+00394 | if __name__ == "__main__":
+00395 |     raise SystemExit(main())

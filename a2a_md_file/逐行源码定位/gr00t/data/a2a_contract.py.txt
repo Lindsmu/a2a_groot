@@ -1,0 +1,143 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Versioned, hashable data contract for canonical latent-A2A trajectories."""
+00004 | 
+00005 | from __future__ import annotations
+00006 | 
+00007 | import hashlib
+00008 | import json
+00009 | from typing import Any
+00010 | 
+00011 | 
+00012 | A2A_CHANNEL_CONTRACT_VERSION = 1
+00013 | 
+00014 | 
+00015 | def canonical_contract_sha256(contract: dict[str, Any]) -> str:
+00016 |     """Return a deterministic SHA-256 over a contract excluding any stored hash."""
+00017 |     payload = dict(contract)
+00018 |     payload.pop("sha256", None)
+00019 |     encoded = json.dumps(
+00020 |         payload,
+00021 |         ensure_ascii=False,
+00022 |         sort_keys=True,
+00023 |         separators=(",", ":"),
+00024 |     ).encode("utf-8")
+00025 |     return hashlib.sha256(encoded).hexdigest()
+00026 | 
+00027 | 
+00028 | def canonical_statistics_sha256(statistics: dict[str, Any]) -> str:
+00029 |     """Hash the complete statistics payload, excluding only its stored hash."""
+00030 |     payload = dict(statistics)
+00031 |     payload.pop("statistics_sha256", None)
+00032 |     encoded = json.dumps(
+00033 |         payload,
+00034 |         ensure_ascii=False,
+00035 |         sort_keys=True,
+00036 |         separators=(",", ":"),
+00037 |     ).encode("utf-8")
+00038 |     return hashlib.sha256(encoded).hexdigest()
+00039 | 
+00040 | 
+00041 | def validate_channel_contract(
+00042 |     contract: dict[str, Any],
+00043 |     *,
+00044 |     feature_dim: int,
+00045 |     history_horizon: int,
+00046 |     future_horizon: int,
+00047 | ) -> dict[str, Any]:
+00048 |     """Validate the generic shape/provenance fields and return a normalized copy."""
+00049 |     if not isinstance(contract, dict):
+00050 |         raise TypeError("A2A channel contract must be a JSON object")
+00051 |     normalized = dict(contract)
+00052 |     if normalized.get("version") != A2A_CHANNEL_CONTRACT_VERSION:
+00053 |         raise ValueError(
+00054 |             "Unsupported A2A channel contract version: "
+00055 |             f"{normalized.get('version')!r}"
+00056 |         )
+00057 |     expected = {
+00058 |         "feature_dim": int(feature_dim),
+00059 |         "history_horizon": int(history_horizon),
+00060 |         "future_horizon": int(future_horizon),
+00061 |     }
+00062 |     for key, value in expected.items():
+00063 |         if int(normalized.get(key, -1)) != value:
+00064 |             raise ValueError(
+00065 |                 f"A2A channel contract {key}={normalized.get(key)!r}, expected {value}"
+00066 |             )
+00067 |     if not isinstance(normalized.get("embodiment"), str) or not normalized["embodiment"]:
+00068 |         raise ValueError("A2A channel contract requires a non-empty embodiment")
+00069 |     if not isinstance(normalized.get("channels"), list) or not normalized["channels"]:
+00070 |         raise ValueError("A2A channel contract requires a non-empty channels list")
+00071 |     provenance = normalized.get("provenance")
+00072 |     required_provenance = (
+00073 |         "dataset",
+00074 |         "dataset_revision",
+00075 |         "dataset_fingerprint_sha256",
+00076 |         "source_schema_sha256",
+00077 |         "canonicalizer",
+00078 |         "canonicalizer_version",
+00079 |         "canonicalizer_sha256",
+00080 |         "exporter_version",
+00081 |         "target_definition",
+00082 |         "time_alignment",
+00083 |     )
+00084 |     if not isinstance(provenance, dict) or not all(
+00085 |         isinstance(provenance.get(key), str) and provenance[key]
+00086 |         for key in required_provenance
+00087 |     ):
+00088 |         raise ValueError(
+00089 |             "A2A channel contract provenance is incomplete; it must bind the dataset/schema, "
+00090 |             "canonicalizer code, exporter, target definition, and time alignment"
+00091 |         )
+00092 |     for key in (
+00093 |         "dataset_fingerprint_sha256",
+00094 |         "source_schema_sha256",
+00095 |         "canonicalizer_sha256",
+00096 |     ):
+00097 |         value = provenance[key]
+00098 |         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+00099 |             raise ValueError(f"A2A provenance {key} must be a lowercase SHA-256")
+00100 |     controller = normalized.get("controller")
+00101 |     required_controller = (
+00102 |         "type",
+00103 |         "version",
+00104 |         "frame",
+00105 |         "control_delta",
+00106 |         "rotation_composition",
+00107 |         "scale",
+00108 |     )
+00109 |     if not isinstance(controller, dict) or any(key not in controller for key in required_controller):
+00110 |         raise ValueError(
+00111 |             "A2A channel contract must explicitly bind controller type/version/scale/frame"
+00112 |         )
+00113 |     channels = normalized["channels"]
+00114 |     expected_start = 0
+00115 |     seen_action_keys = set()
+00116 |     for channel in channels:
+00117 |         if not isinstance(channel, dict):
+00118 |             raise TypeError("Each A2A contract channel must be a JSON object")
+00119 |         action_key = channel.get("action_key")
+00120 |         if not isinstance(action_key, str) or not action_key or action_key in seen_action_keys:
+00121 |             raise ValueError("A2A contract action keys must be unique non-empty strings")
+00122 |         seen_action_keys.add(action_key)
+00123 |         start = int(channel.get("start", -1))
+00124 |         end = int(channel.get("end", -1))
+00125 |         if start != expected_start or end <= start or end > feature_dim:
+00126 |             raise ValueError(
+00127 |                 "A2A contract channels must be positive, contiguous, non-overlapping slices"
+00128 |             )
+00129 |         expected_start = end
+00130 |     stored_hash = normalized.get("sha256")
+00131 |     computed_hash = canonical_contract_sha256(normalized)
+00132 |     if stored_hash is not None and stored_hash != computed_hash:
+00133 |         raise ValueError("A2A channel contract SHA-256 does not match its contents")
+00134 |     normalized["sha256"] = computed_hash
+00135 |     return normalized
+00136 | 
+00137 | 
+00138 | __all__ = [
+00139 |     "A2A_CHANNEL_CONTRACT_VERSION",
+00140 |     "canonical_contract_sha256",
+00141 |     "canonical_statistics_sha256",
+00142 |     "validate_channel_contract",
+00143 | ]

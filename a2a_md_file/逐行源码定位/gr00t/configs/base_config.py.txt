@@ -1,0 +1,232 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | from dataclasses import asdict, dataclass, field
+00017 | from enum import Enum
+00018 | import json
+00019 | from pathlib import Path
+00020 | from typing import Any, List, Optional
+00021 | 
+00022 | import yaml
+00023 | 
+00024 | from gr00t.data.types import ActionConfig, ActionFormat, ActionRepresentation, ActionType
+00025 | 
+00026 | from .data.data_config import DataConfig, SingleDatasetConfig
+00027 | from .model import MODEL_CONFIG_TYPES, create_model_union_type
+00028 | from .model.gr00t_n1d7 import Gr00tN1d7Config
+00029 | from .training.training_config import TrainingConfig
+00030 | 
+00031 | 
+00032 | def _build_safe_tree(obj: Any) -> Any:
+00033 |     """Convert an ``asdict()`` tree into one that ``yaml.safe_dump`` accepts.
+00034 | 
+00035 |     ``yaml.safe_dump`` only knows how to write plain primitives (str / int /
+00036 |     bool / None / list / dict); it raises ``RepresenterError`` on anything
+00037 |     else. The only "anything else" we hit today is ``Enum`` values —
+00038 |     ``MODALITY_CONFIGS`` carries ``ActionConfig`` fields holding
+00039 |     ``ActionRepresentation`` / ``ActionType`` / ``ActionFormat`` enums — so we
+00040 |     walk the tree once and replace each ``Enum`` with its ``.value`` string
+00041 |     (e.g. ``ActionRepresentation.RELATIVE`` -> ``"relative"``). An explicit
+00042 |     walk is easier to audit than a custom ``SafeDumper`` and leaves no global
+00043 |     YAML state behind.
+00044 |     """
+00045 |     if isinstance(obj, Enum):
+00046 |         return obj.value
+00047 |     if isinstance(obj, dict):
+00048 |         return {k: _build_safe_tree(v) for k, v in obj.items()}
+00049 |     if isinstance(obj, (list, tuple)):
+00050 |         return [_build_safe_tree(v) for v in obj]
+00051 |     return obj
+00052 | 
+00053 | 
+00054 | def _load_safe_yaml(path: Path):
+00055 |     """Load YAML with ``yaml.safe_load`` (never the object-constructing
+00056 |     ``yaml.Loader``), turning the safe loader's rejection of legacy
+00057 |     ``!!python/object`` tags into a friendly migration error.
+00058 | 
+00059 |     ``yaml.safe_load`` refuses those tags with a ``ConstructorError``; we
+00060 |     re-raise it as a ``ValueError`` that explains the old config can't load
+00061 |     and needs a one-time re-save, instead of leaking a cryptic PyYAML
+00062 |     traceback.
+00063 |     """
+00064 |     text = path.read_text()
+00065 |     try:
+00066 |         return yaml.safe_load(text)
+00067 |     except yaml.constructor.ConstructorError as e:
+00068 |         raise ValueError(
+00069 |             f"{path}: rejected unsafe legacy config YAML (contains "
+00070 |             f"{e.problem!r}). The pre-2026-05 Config.save() emitted "
+00071 |             "PyYAML !!python/object tags which the loader is no longer "
+00072 |             "willing to instantiate — that path was an arbitrary-code-"
+00073 |             "execution gadget. Re-save the config via the current "
+00074 |             "Config.save() to migrate to the plain-dict YAML format."
+00075 |         ) from e
+00076 | 
+00077 | 
+00078 | ModelUnionType = create_model_union_type()
+00079 | 
+00080 | 
+00081 | @dataclass
+00082 | class Config:
+00083 |     """Complete configuration."""
+00084 | 
+00085 |     load_config_path: Optional[str] = None
+00086 |     model: ModelUnionType = field(default_factory=lambda: Gr00tN1d7Config())
+00087 |     data: DataConfig = field(default_factory=DataConfig)
+00088 |     training: TrainingConfig = field(default_factory=TrainingConfig)
+00089 | 
+00090 |     def save(self, path: Path):
+00091 |         """Save the config as plain key/value YAML (no Python-object tags).
+00092 | 
+00093 |         Writes ``asdict(self)`` with ``yaml.safe_dump``, so the file is human
+00094 |         readable, diffable, and — crucially — builds no Python objects when
+00095 |         read back. ``_build_safe_tree`` first lowers any ``Enum`` fields to
+00096 |         plain strings, which ``yaml.safe_dump`` would otherwise refuse to
+00097 |         write. Replaces the old ``yaml.dump(self)``, which embedded
+00098 |         ``!!python/object`` tags that made loading a config able to run code.
+00099 |         """
+00100 |         path = Path(path)
+00101 |         path.parent.mkdir(parents=True, exist_ok=True)
+00102 | 
+00103 |         with open(path, "w") as f:
+00104 |             yaml.safe_dump(_build_safe_tree(asdict(self)), f, sort_keys=False)
+00105 | 
+00106 |     def load(self, path: Path):
+00107 |         """Load config from a plain key/value YAML file into ``self``.
+00108 | 
+00109 |         Reads via the safe loader (so a malicious or legacy
+00110 |         ``!!python/object`` file is refused with a migration error, never
+00111 |         executed) and rebuilds the nested dataclasses with :meth:`load_dict`.
+00112 |         """
+00113 |         data = _load_safe_yaml(path)
+00114 |         if not isinstance(data, dict):
+00115 |             raise ValueError(
+00116 |                 f"Invalid config file: {path}. Expected a YAML mapping at "
+00117 |                 f"the top level (saved by Config.save()); got {type(data).__name__}."
+00118 |             )
+00119 |         self.load_dict(data)
+00120 |         return self
+00121 | 
+00122 |     def load_dict(self, data: dict):
+00123 |         if "model" in data:
+00124 |             model_data = data["model"]
+00125 |             if not isinstance(model_data, dict):
+00126 |                 raise ValueError("Config.model must be a mapping")
+00127 |             model_type = model_data.get("model_type")
+00128 |             if model_type is None:
+00129 |                 model_class = self.model.__class__
+00130 |             else:
+00131 |                 model_class = MODEL_CONFIG_TYPES.get(model_type)
+00132 |                 if model_class is None:
+00133 |                     raise ValueError(
+00134 |                         f"Unknown model_type {model_type!r}; available types are "
+00135 |                         f"{sorted(MODEL_CONFIG_TYPES)}"
+00136 |                     )
+00137 |             self.model = model_class(**model_data)
+00138 |         if "data" in data:
+00139 |             self.data = DataConfig(**data["data"])
+00140 |             # Ensure nested datasets are converted to dataclass instances
+00141 |             converted: List[SingleDatasetConfig] = []
+00142 |             for ds in self.data.datasets:
+00143 |                 if isinstance(ds, dict):
+00144 |                     converted.append(SingleDatasetConfig(**ds))
+00145 |                 else:
+00146 |                     converted.append(ds)
+00147 |             self.data.datasets = converted
+00148 |         if "training" in data:
+00149 |             self.training = TrainingConfig(**data["training"])
+00150 |         return self
+00151 | 
+00152 |     @classmethod
+00153 |     def from_pretrained(cls, path: Path) -> "Config":
+00154 |         """Build a fresh ``Config`` from a YAML file saved by :meth:`save`.
+00155 | 
+00156 |         Same safe-load contract as :meth:`load` (no object construction from
+00157 |         disk), but returns a new instance via ``cls().load_dict(data)`` instead
+00158 |         of mutating an existing one.
+00159 |         """
+00160 |         data = _load_safe_yaml(Path(path))
+00161 |         if not isinstance(data, dict):
+00162 |             raise ValueError(
+00163 |                 f"Invalid config file: {path}. Expected a YAML mapping at "
+00164 |                 f"the top level (saved by Config.save()); got {type(data).__name__}."
+00165 |             )
+00166 |         return cls().load_dict(data)
+00167 | 
+00168 |     def get_deepspeed_config(self) -> dict:
+00169 |         """Generate DeepSpeed configuration."""
+00170 |         stage = self.training.deepspeed_stage
+00171 | 
+00172 |         gr00t_dir = Path(__file__).parent.parent
+00173 |         if stage == 2:
+00174 |             config = json.load(open(gr00t_dir / "configs/deepspeed/zero2_config.json"))
+00175 |         elif stage == 3:
+00176 |             config = json.load(open(gr00t_dir / "configs/deepspeed/zero3_config.json"))
+00177 |         else:
+00178 |             raise ValueError(f"Invalid DeepSpeed stage: {stage}")
+00179 | 
+00180 |         return config
+00181 | 
+00182 |     def validate(self):
+00183 |         """Validate configuration."""
+00184 |         # Check dataset path(s)
+00185 |         embodiment_tags = set()
+00186 |         for d_cfg in self.data.datasets:
+00187 |             # (Disable missing data check because we now support caching PDX data sources.)
+00188 |             # if not Path(d_cfg.dataset_path).exists():
+00189 |             #     raise ValueError(f"Dataset path does not exist: {d_cfg.dataset_path}")
+00190 |             if d_cfg.dataset_type == "physical_embodiment" and not d_cfg.embodiment_tag:
+00191 |                 raise ValueError(f"Embodiment tag is empty for dataset {d_cfg.dataset_path}")
+00192 |             if d_cfg.embodiment_tag is not None:
+00193 |                 embodiment_tags.add(d_cfg.embodiment_tag)
+00194 | 
+00195 |         stripped_modality_configs = {}
+00196 |         for embodiment_tag in embodiment_tags:
+00197 |             modality_cfg = self.data.modality_configs.get(embodiment_tag)
+00198 |             if modality_cfg is None:
+00199 |                 raise ValueError(
+00200 |                     f"No modality config registered for embodiment tag '{embodiment_tag}'. "
+00201 |                     f"Available tags: {sorted(self.data.modality_configs.keys())}. "
+00202 |                     f"Provide --modality-config-path to register a custom modality config, "
+00203 |                     f"or use one of the pre-registered tags."
+00204 |                 )
+00205 |             stripped_modality_configs[embodiment_tag] = modality_cfg
+00206 |         self.data.modality_configs = stripped_modality_configs
+00207 | 
+00208 |         # ensure mix ratios are valid
+00209 |         total_ratio = sum(d.mix_ratio for d in self.data.datasets)
+00210 |         if total_ratio <= 0:
+00211 |             raise ValueError("Sum of mix_ratio must be greater than zero")
+00212 | 
+00213 |         # Fill in default values for action configs
+00214 |         for embodiment_tag in self.data.modality_configs:
+00215 |             # Fill in default values for action representation, type and format
+00216 |             if self.data.modality_configs[embodiment_tag]["action"].action_configs is None:
+00217 |                 self.data.modality_configs[embodiment_tag]["action"].action_configs = [
+00218 |                     ActionConfig(
+00219 |                         rep=ActionRepresentation.ABSOLUTE,
+00220 |                         type=ActionType.NON_EEF,
+00221 |                         format=ActionFormat.DEFAULT,
+00222 |                     )
+00223 |                 ] * len(self.data.modality_configs[embodiment_tag]["action"].modality_keys)
+00224 | 
+00225 |         # Validate precision settings
+00226 |         if self.training.fp16 and self.training.bf16:
+00227 |             raise ValueError("Cannot use both fp16 and bf16")
+00228 | 
+00229 | 
+00230 | def get_default_config() -> Config:
+00231 |     """Get default configuration."""
+00232 |     return Config()

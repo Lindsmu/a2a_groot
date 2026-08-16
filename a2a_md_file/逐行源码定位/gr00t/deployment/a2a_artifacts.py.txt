@@ -1,0 +1,94 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Deterministic identities for latent-A2A deployment artifacts."""
+00004 | 
+00005 | from __future__ import annotations
+00006 | 
+00007 | import hashlib
+00008 | import json
+00009 | from pathlib import Path
+00010 | from typing import Any
+00011 | 
+00012 | 
+00013 | def sha256_file(path: str | Path) -> str:
+00014 |     """Return the lowercase SHA-256 digest of one file."""
+00015 | 
+00016 |     digest = hashlib.sha256()
+00017 |     with Path(path).open("rb") as handle:
+00018 |         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+00019 |             digest.update(chunk)
+00020 |     return digest.hexdigest()
+00021 | 
+00022 | 
+00023 | def canonical_json_sha256(payload: Any) -> str:
+00024 |     """Hash a JSON-compatible payload independently of key order/whitespace."""
+00025 | 
+00026 |     encoded = json.dumps(
+00027 |         payload,
+00028 |         sort_keys=True,
+00029 |         separators=(",", ":"),
+00030 |         ensure_ascii=False,
+00031 |     ).encode("utf-8")
+00032 |     return hashlib.sha256(encoded).hexdigest()
+00033 | 
+00034 | 
+00035 | def checkpoint_sha256(checkpoint_directory: str | Path) -> str:
+00036 |     """Bind a deployment graph to the exact checkpoint config and weight files.
+00037 | 
+00038 |     Optimizer/RNG state is intentionally excluded because it is not consumed by
+00039 |     ``AutoModel.from_pretrained``.  Relative file names are included in the
+00040 |     digest, so replacing or renaming one shard changes the identity.
+00041 |     """
+00042 | 
+00043 |     checkpoint_directory = Path(checkpoint_directory).resolve()
+00044 |     if not checkpoint_directory.is_dir():
+00045 |         raise FileNotFoundError(f"A2A checkpoint directory does not exist: {checkpoint_directory}")
+00046 | 
+00047 |     files: set[Path] = set()
+00048 |     config_path = checkpoint_directory / "config.json"
+00049 |     if not config_path.is_file():
+00050 |         raise FileNotFoundError(f"A2A checkpoint is missing {config_path}")
+00051 |     files.add(config_path)
+00052 |     for pattern in ("*.safetensors", "pytorch_model*.bin", "model*.bin"):
+00053 |         files.update(path for path in checkpoint_directory.rglob(pattern) if path.is_file())
+00054 |     for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+00055 |         index_path = checkpoint_directory / name
+00056 |         if index_path.is_file():
+00057 |             files.add(index_path)
+00058 |     weight_files = [
+00059 |         path
+00060 |         for path in files
+00061 |         if path.suffix in {".safetensors", ".bin"}
+00062 |     ]
+00063 |     if not weight_files:
+00064 |         raise FileNotFoundError(
+00065 |             "A2A checkpoint contains no .safetensors or model .bin weight files"
+00066 |         )
+00067 | 
+00068 |     digest = hashlib.sha256()
+00069 |     for path in sorted(files, key=lambda item: item.relative_to(checkpoint_directory).as_posix()):
+00070 |         relative = path.relative_to(checkpoint_directory).as_posix().encode("utf-8")
+00071 |         digest.update(len(relative).to_bytes(8, "big"))
+00072 |         digest.update(relative)
+00073 |         digest.update(path.stat().st_size.to_bytes(8, "big"))
+00074 |         with path.open("rb") as handle:
+00075 |             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+00076 |                 digest.update(chunk)
+00077 |     return digest.hexdigest()
+00078 | 
+00079 | 
+00080 | def canonical_statistics_sha256(processor_or_payload: Any) -> str:
+00081 |     """Hash the complete canonical-statistics payload used by the processor."""
+00082 | 
+00083 |     payload = getattr(processor_or_payload, "a2a_canonical_statistics", processor_or_payload)
+00084 |     if not isinstance(payload, dict) or not payload:
+00085 |         raise ValueError("A2A canonical statistics are absent or empty")
+00086 |     return canonical_json_sha256(payload)
+00087 | 
+00088 | 
+00089 | __all__ = [
+00090 |     "canonical_json_sha256",
+00091 |     "canonical_statistics_sha256",
+00092 |     "checkpoint_sha256",
+00093 |     "sha256_file",
+00094 | ]

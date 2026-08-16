@@ -1,0 +1,758 @@
+00001 | #!/usr/bin/env python3
+00002 | 
+00003 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00004 | # SPDX-License-Identifier: Apache-2.0
+00005 | #
+00006 | # Licensed under the Apache License, Version 2.0 (the "License");
+00007 | # you may not use this file except in compliance with the License.
+00008 | # You may obtain a copy of the License at
+00009 | #
+00010 | # http://www.apache.org/licenses/LICENSE-2.0
+00011 | #
+00012 | # Unless required by applicable law or agreed to in writing, software
+00013 | # distributed under the License is distributed on an "AS IS" BASIS,
+00014 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00015 | # See the License for the specific language governing permissions and
+00016 | # limitations under the License.
+00017 | 
+00018 | """
+00019 | Build TensorRT engines from exported ONNX models.
+00020 | 
+00021 | Supports two modes:
+00022 | - single: Build engine for a single ONNX model
+00023 | - full_pipeline: Build engines for all pipeline components
+00024 |   (ViT, LLM, State Encoder, Action Encoder, DiT, Action Decoder)
+00025 | 
+00026 | Shape profiles are automatically derived from the ONNX models.
+00027 | 
+00028 | Usage:
+00029 |     # Full pipeline:
+00030 |     python scripts/deployment/build_tensorrt_engine.py \
+00031 |         --mode full_pipeline \
+00032 |         --onnx-dir ./gr00t_trt_deployment/onnx \
+00033 |         --engine-dir ./gr00t_trt_deployment/engines \
+00034 |         --precision bf16
+00035 | """
+00036 | 
+00037 | from dataclasses import dataclass
+00038 | import logging
+00039 | import os
+00040 | import time
+00041 | from typing import Literal
+00042 | 
+00043 | from _trt_contract import load_export_metadata, validate_export_metadata
+00044 | from gr00t.deployment.a2a_artifacts import sha256_file
+00045 | from gr00t.deployment.modes import FULL_PIPELINE_COMPONENTS, BuildEngineMode
+00046 | import onnx
+00047 | import tensorrt as trt
+00048 | import tyro
+00049 | 
+00050 | 
+00051 | # Set up logging
+00052 | logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+00053 | logger = logging.getLogger(__name__)
+00054 | 
+00055 | 
+00056 | # STRONGLY_TYPED precision sanity check: TRT 10+ STRONGLY_TYPED reads
+00057 | # precision from the ONNX tensor types and ignores --precision builder
+00058 | # flags. Catch the silent mismatch (user asks fp16, ONNX is bf16, engine
+00059 | # silently builds bf16) before burning build time. Indirected through
+00060 | # dtype *names* so the helper can be unit-tested without TensorRT.
+00061 | _PRECISION_TO_TRT_DTYPE_NAME: dict[str, str] = {
+00062 |     "bf16": "BF16",
+00063 |     "fp16": "HALF",
+00064 |     "fp32": "FLOAT",
+00065 |     "fp8": "FP8",
+00066 | }
+00067 | 
+00068 | 
+00069 | def _check_strongly_typed_precision_match(
+00070 |     network_dtype_names: set[str], requested_precision: str
+00071 | ) -> None:
+00072 |     """Raise if --precision cannot be honored by this STRONGLY_TYPED network."""
+00073 |     expected = _PRECISION_TO_TRT_DTYPE_NAME.get(requested_precision)
+00074 |     if expected is None:
+00075 |         raise ValueError(
+00076 |             f"Unknown precision: {requested_precision!r}. "
+00077 |             f"Expected one of {sorted(_PRECISION_TO_TRT_DTYPE_NAME)}."
+00078 |         )
+00079 |     if expected not in network_dtype_names:
+00080 |         raise ValueError(
+00081 |             f"--precision={requested_precision} cannot be honored by this ONNX. "
+00082 |             f"STRONGLY_TYPED (TRT 10+) reads precision from ONNX tensor types "
+00083 |             f"and ignores builder flags. Network has tensor dtypes "
+00084 |             f"{sorted(network_dtype_names)}; none of them are {expected}. "
+00085 |             f"Either re-export the ONNX with the requested precision, or "
+00086 |             f"pass --precision matching the existing ONNX dtypes."
+00087 |         )
+00088 |     # When fp32 is requested, the network must not contain any reduced-precision
+00089 |     # tensors. STRONGLY_TYPED won't promote BF16/FP16/FP8 to FLOAT, so a mixed
+00090 |     # BF16+FLOAT network silently runs at BF16 for those tensors despite the
+00091 |     # caller asking for fp32.
+00092 |     if requested_precision == "fp32":
+00093 |         reduced = {"BF16", "HALF", "FP8"} & network_dtype_names
+00094 |         if reduced:
+00095 |             raise ValueError(
+00096 |                 f"--precision=fp32 cannot be honored: network also contains "
+00097 |                 f"reduced-precision tensors {sorted(reduced)}. STRONGLY_TYPED "
+00098 |                 f"won't promote them to FLOAT, so the engine would silently "
+00099 |                 f"run mixed precision. Re-export the ONNX as pure FP32, or "
+00100 |                 f"pass --precision matching the dominant reduced dtype."
+00101 |             )
+00102 | 
+00103 | 
+00104 | def _precision_from_onnx_path(onnx_path: str, default: str) -> str:
+00105 |     """Return the precision tag suffixed in the ONNX filename (e.g.
+00106 |     ``vit_fp32.onnx`` → ``"fp32"``), else ``default``. Used so the
+00107 |     full-pipeline build mirrors the export's per-component dtype instead
+00108 |     of forwarding the pipeline-wide ``--precision`` to a mismatched ONNX.
+00109 |     """
+00110 |     stem = os.path.splitext(os.path.basename(onnx_path))[0]
+00111 |     for tag in _PRECISION_TO_TRT_DTYPE_NAME:
+00112 |         if stem.endswith(f"_{tag}"):
+00113 |             return tag
+00114 |     return default
+00115 | 
+00116 | 
+00117 | # ============================================================
+00118 | # Auto Shape Profile from ONNX
+00119 | # ============================================================
+00120 | 
+00121 | 
+00122 | def derive_shapes_from_onnx(onnx_path, max_batch=8):
+00123 |     """Read an ONNX model and derive min/opt/max shape profiles.
+00124 | 
+00125 |     For each input:
+00126 |     - Fixed dimensions (concrete values) are kept as-is across min/opt/max.
+00127 |     - Dynamic batch dimension: min=1, opt=1, max=max_batch.
+00128 |     - Dynamic sequence dimensions: min=1, opt=concrete_value, max=2*concrete_value.
+00129 |       (concrete_value comes from the ONNX model's shape hints)
+00130 | 
+00131 |     Returns (min_shapes, opt_shapes, max_shapes) dicts.
+00132 |     """
+00133 |     model = onnx.load(onnx_path, load_external_data=False)
+00134 | 
+00135 |     min_shapes, opt_shapes, max_shapes = {}, {}, {}
+00136 | 
+00137 |     for inp in model.graph.input:
+00138 |         name = inp.name
+00139 |         dims = inp.type.tensor_type.shape.dim
+00140 | 
+00141 |         min_shape, opt_shape, max_shape = [], [], []
+00142 |         for i, d in enumerate(dims):
+00143 |             if d.dim_value > 0:
+00144 |                 # Fixed dimension — use as-is
+00145 |                 min_shape.append(d.dim_value)
+00146 |                 opt_shape.append(d.dim_value)
+00147 |                 max_shape.append(d.dim_value)
+00148 |             else:
+00149 |                 # Dynamic dimension
+00150 |                 if i == 0:
+00151 |                     # Batch dimension
+00152 |                     min_shape.append(1)
+00153 |                     opt_shape.append(1)
+00154 |                     max_shape.append(max_batch)
+00155 |                 else:
+00156 |                     # Sequence/spatial dimension — use generous range
+00157 |                     # We don't know the "typical" value from ONNX alone,
+00158 |                     # so use 1 / 1 / large_max. The builder will optimize for opt.
+00159 |                     min_shape.append(1)
+00160 |                     opt_shape.append(1)
+00161 |                     max_shape.append(512)
+00162 | 
+00163 |         min_shapes[name] = tuple(min_shape)
+00164 |         opt_shapes[name] = tuple(opt_shape)
+00165 |         max_shapes[name] = tuple(max_shape)
+00166 | 
+00167 |     return min_shapes, opt_shapes, max_shapes
+00168 | 
+00169 | 
+00170 | def derive_shapes_with_hint(onnx_path, opt_seq_lens=None, max_batch=8):
+00171 |     """Derive shapes from ONNX, with optional sequence length hints.
+00172 | 
+00173 |     Args:
+00174 |         onnx_path: Path to ONNX model
+00175 |         opt_seq_lens: Dict mapping dynamic dim names to optimal sequence lengths.
+00176 |                       e.g. {"sa_seq_len": 51, "vl_seq_len": 280, "sequence_length": 280}
+00177 |         max_batch: Maximum batch size
+00178 |     """
+00179 |     model = onnx.load(onnx_path, load_external_data=False)
+00180 |     opt_seq_lens = opt_seq_lens or {}
+00181 | 
+00182 |     min_shapes, opt_shapes, max_shapes = {}, {}, {}
+00183 | 
+00184 |     for inp in model.graph.input:
+00185 |         name = inp.name
+00186 |         dims = inp.type.tensor_type.shape.dim
+00187 | 
+00188 |         min_shape, opt_shape, max_shape = [], [], []
+00189 |         for i, d in enumerate(dims):
+00190 |             if d.dim_value > 0:
+00191 |                 # Fixed dimension
+00192 |                 min_shape.append(d.dim_value)
+00193 |                 opt_shape.append(d.dim_value)
+00194 |                 max_shape.append(d.dim_value)
+00195 |             else:
+00196 |                 dim_name = d.dim_param if d.dim_param else f"dim_{i}"
+00197 |                 if dim_name in {"batch", "batch_size"}:
+00198 |                     # Batch dimension (at any index)
+00199 |                     min_shape.append(1)
+00200 |                     opt_shape.append(1)
+00201 |                     max_shape.append(max_batch)
+00202 |                 elif dim_name in opt_seq_lens:
+00203 |                     # Named dynamic dim with a hint
+00204 |                     opt_val = opt_seq_lens[dim_name]
+00205 |                     min_shape.append(1)
+00206 |                     opt_shape.append(opt_val)
+00207 |                     max_shape.append(max(opt_val * 2, opt_val + 64))
+00208 |                 else:
+00209 |                     # Unknown dynamic dim — use wide range
+00210 |                     min_shape.append(1)
+00211 |                     opt_shape.append(256)
+00212 |                     max_shape.append(512)
+00213 | 
+00214 |         min_shapes[name] = tuple(min_shape)
+00215 |         opt_shapes[name] = tuple(opt_shape)
+00216 |         max_shapes[name] = tuple(max_shape)
+00217 | 
+00218 |     return min_shapes, opt_shapes, max_shapes
+00219 | 
+00220 | 
+00221 | # ============================================================
+00222 | # Engine Builder
+00223 | # ============================================================
+00224 | 
+00225 | 
+00226 | def build_engine(
+00227 |     onnx_path: str,
+00228 |     engine_path: str,
+00229 |     precision: str = "bf16",
+00230 |     workspace_mb: int = 8192,
+00231 |     min_shapes: dict = None,
+00232 |     opt_shapes: dict = None,
+00233 |     max_shapes: dict = None,
+00234 |     trt_severity=None,
+00235 | ):
+00236 |     """Build TensorRT engine from ONNX model.
+00237 | 
+00238 |     Args:
+00239 |         onnx_path: Path to ONNX model
+00240 |         engine_path: Path to save TensorRT engine
+00241 |         precision: Precision mode ('fp32', 'fp16', 'bf16', 'fp8')
+00242 |         workspace_mb: Workspace size in MB
+00243 |         min_shapes: Minimum input shapes (dict: name -> shape tuple)
+00244 |         opt_shapes: Optimal input shapes (dict: name -> shape tuple)
+00245 |         max_shapes: Maximum input shapes (dict: name -> shape tuple)
+00246 |     """
+00247 |     logger.info("=" * 80)
+00248 |     logger.info("TensorRT Engine Builder")
+00249 |     logger.info("=" * 80)
+00250 |     logger.info(f"ONNX model: {onnx_path}")
+00251 |     logger.info(f"Engine output: {engine_path}")
+00252 |     logger.info(f"Precision: {precision.upper()}")
+00253 |     logger.info(f"Workspace: {workspace_mb} MB")
+00254 |     logger.info("=" * 80)
+00255 | 
+00256 |     TRT_LOGGER = trt.Logger(trt.Logger.VERBOSE if trt_severity is None else trt_severity)
+00257 | 
+00258 |     # Create builder and network
+00259 |     logger.info("\n[Step 1/5] Creating TensorRT builder...")
+00260 |     builder = trt.Builder(TRT_LOGGER)
+00261 | 
+00262 |     # TRT 10.x prefers STRONGLY_TYPED; EXPLICIT_BATCH is the 9.x fallback.
+00263 |     use_strongly_typed = hasattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED")
+00264 |     if use_strongly_typed:
+00265 |         network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+00266 |         logger.info("Using STRONGLY_TYPED network (TRT 10.x+)")
+00267 |     else:
+00268 |         network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+00269 |         logger.info("Using EXPLICIT_BATCH network (TRT 9.x fallback)")
+00270 |     network = builder.create_network(network_flags)
+00271 |     parser = trt.OnnxParser(network, TRT_LOGGER)
+00272 | 
+00273 |     # Parse ONNX model
+00274 |     logger.info("\n[Step 2/5] Parsing ONNX model...")
+00275 |     if not parser.parse_from_file(onnx_path):
+00276 |         logger.error("Failed to parse ONNX file")
+00277 |         for error in range(parser.num_errors):
+00278 |             logger.error(parser.get_error(error))
+00279 |         raise RuntimeError("ONNX parsing failed")
+00280 | 
+00281 |     logger.info(f"Network inputs: {network.num_inputs}")
+00282 |     for i in range(network.num_inputs):
+00283 |         inp = network.get_input(i)
+00284 |         logger.info(f"  Input {i}: {inp.name} {inp.shape}")
+00285 | 
+00286 |     logger.info(f"Network outputs: {network.num_outputs}")
+00287 |     for i in range(network.num_outputs):
+00288 |         out = network.get_output(i)
+00289 |         logger.info(f"  Output {i}: {out.name} {out.shape}")
+00290 | 
+00291 |     # Create builder config
+00292 |     logger.info("\n[Step 3/5] Configuring builder...")
+00293 |     config = builder.create_builder_config()
+00294 | 
+00295 |     config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+00296 |     logger.info("Enabled DETAILED profiling verbosity for engine inspection")
+00297 | 
+00298 |     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_mb * (1024**2))
+00299 | 
+00300 |     if use_strongly_typed:
+00301 |         network_dtype_names: set[str] = set()
+00302 |         for i in range(network.num_inputs):
+00303 |             network_dtype_names.add(network.get_input(i).dtype.name)
+00304 |         for i in range(network.num_outputs):
+00305 |             network_dtype_names.add(network.get_output(i).dtype.name)
+00306 |         _check_strongly_typed_precision_match(network_dtype_names, precision)
+00307 |         logger.info(
+00308 |             f"Precision '{precision}' matches ONNX tensor dtypes (STRONGLY_TYPED, "
+00309 |             f"network has {sorted(network_dtype_names)})"
+00310 |         )
+00311 |     else:
+00312 |         # Weak-typed fallback: explicitly set precision flags
+00313 |         if precision == "fp16":
+00314 |             config.set_flag(trt.BuilderFlag.FP16)
+00315 |             logger.info("Enabled FP16 mode")
+00316 |         elif precision == "bf16":
+00317 |             config.set_flag(trt.BuilderFlag.BF16)
+00318 |             logger.info("Enabled BF16 mode")
+00319 |         elif precision == "fp8":
+00320 |             config.set_flag(trt.BuilderFlag.FP8)
+00321 |             config.set_flag(trt.BuilderFlag.BF16)
+00322 |             logger.info("Enabled FP8 + BF16 mode")
+00323 |         elif precision == "fp32":
+00324 |             logger.info("Using FP32 (default precision)")
+00325 |         else:
+00326 |             raise ValueError(f"Unknown precision: {precision}")
+00327 | 
+00328 |     # Set optimization profiles for dynamic shapes
+00329 |     if min_shapes and opt_shapes and max_shapes:
+00330 |         logger.info("\n[Step 4/5] Setting optimization profiles...")
+00331 |         profile = builder.create_optimization_profile()
+00332 | 
+00333 |         for i in range(network.num_inputs):
+00334 |             inp = network.get_input(i)
+00335 |             input_name = inp.name
+00336 | 
+00337 |             if input_name in min_shapes:
+00338 |                 min_shape = min_shapes[input_name]
+00339 |                 opt_shape = opt_shapes[input_name]
+00340 |                 max_shape = max_shapes[input_name]
+00341 | 
+00342 |                 profile.set_shape(input_name, min_shape, opt_shape, max_shape)
+00343 |                 logger.info(f"  {input_name}:")
+00344 |                 logger.info(f"    min: {min_shape}")
+00345 |                 logger.info(f"    opt: {opt_shape}")
+00346 |                 logger.info(f"    max: {max_shape}")
+00347 | 
+00348 |         config.add_optimization_profile(profile)
+00349 |     else:
+00350 |         raise RuntimeError("Provide min/max and opt shapes for dynamic axes")
+00351 | 
+00352 |     # Build engine
+00353 |     logger.info("\n[Step 5/5] Building TensorRT engine...")
+00354 | 
+00355 |     start_time = time.time()
+00356 |     serialized_engine = builder.build_serialized_network(network, config)
+00357 |     build_time = time.time() - start_time
+00358 | 
+00359 |     if serialized_engine is None:
+00360 |         raise RuntimeError("Failed to build TensorRT engine")
+00361 | 
+00362 |     logger.info(f"Engine built in {build_time:.1f} seconds ({build_time / 60:.1f} minutes)")
+00363 | 
+00364 |     # Save engine
+00365 |     logger.info(f"\nSaving engine to {engine_path}...")
+00366 |     os.makedirs(os.path.dirname(engine_path) or ".", exist_ok=True)
+00367 |     with open(engine_path, "wb") as f:
+00368 |         f.write(serialized_engine)
+00369 | 
+00370 |     engine_size_mb = os.path.getsize(engine_path) / (1024**2)
+00371 |     logger.info(f"Engine saved! Size: {engine_size_mb:.2f} MB")
+00372 | 
+00373 |     logger.info("\n" + "=" * 80)
+00374 |     logger.info("ENGINE BUILD COMPLETE!")
+00375 |     logger.info("=" * 80)
+00376 |     logger.info(f"Engine file: {engine_path}")
+00377 |     logger.info(f"Size: {engine_size_mb:.2f} MB")
+00378 |     logger.info(f"Build time: {build_time:.1f}s")
+00379 |     logger.info(f"Precision: {precision.upper()}")
+00380 |     logger.info("=" * 80)
+00381 | 
+00382 |     return engine_path
+00383 | 
+00384 | 
+00385 | # ============================================================
+00386 | # Full Pipeline Builder
+00387 | # ============================================================
+00388 | 
+00389 | 
+00390 | def build_full_pipeline(
+00391 |     onnx_dir,
+00392 |     engine_dir,
+00393 |     precision="bf16",
+00394 |     workspace_mb=8192,
+00395 |     trt_severity=None,
+00396 |     only: frozenset[str] | None = None,
+00397 |     allow_default_hints: bool = False,
+00398 | ):
+00399 |     """Build all TRT engines for the full pipeline.
+00400 | 
+00401 |     Shape profiles are automatically derived from the ONNX models.
+00402 |     Dynamic sequence dimensions use hints based on typical inference shapes.
+00403 | 
+00404 |     Args:
+00405 |         onnx_dir: Directory containing exported ONNX models
+00406 |         engine_dir: Directory to save TRT engines
+00407 |         precision: Precision mode
+00408 |         workspace_mb: Workspace size in MB
+00409 |         only: Restrict the build to this subset of component names (from
+00410 |             ``FULL_PIPELINE_COMPONENTS``). ``None`` builds the full 7. A partial
+00411 |             export (e.g. ``action_head``, which keeps ViT/LLM in PyTorch) must
+00412 |             pass its produced subset so the completeness check requires exactly
+00413 |             those, not the full pipeline.
+00414 |     """
+00415 |     os.makedirs(engine_dir, exist_ok=True)
+00416 | 
+00417 |     # Sequence/patch hints for the TRT shape profiles come from export_metadata.json
+00418 |     # (single source of truth). A missing, stale, or incomplete bundle is rejected so
+00419 |     # the build can't silently bake wrong shapes; --allow-default-hints opts into the
+00420 |     # hardcoded GR1 single-view fallbacks.
+00421 |     metadata = load_export_metadata(onnx_dir)
+00422 |     try:
+00423 |         if metadata is None:
+00424 |             raise ValueError(f"no export_metadata.json found in {onnx_dir}")
+00425 |         validate_export_metadata(metadata, source="build_full_pipeline", engine_path=onnx_dir)
+00426 |     except ValueError as e:
+00427 |         if not allow_default_hints:
+00428 |             raise ValueError(
+00429 |                 f"{e}. Re-export with the current exporter, or pass --allow-default-hints "
+00430 |                 "to build with hardcoded GR1 single-view shape hints (the engine may get "
+00431 |                 "wrong sequence/patch shapes)."
+00432 |             ) from e
+00433 |         logger.warning("%s; using default shape hints (--allow-default-hints).", e)
+00434 |         metadata = None
+00435 | 
+00436 |     if metadata is not None:
+00437 |         # The engine must be built at the precision it was exported for; a drift here
+00438 |         # produces a valid-but-wrong engine. Per-component precision is still taken from
+00439 |         # each ONNX filename below — this guards the pipeline-wide default.
+00440 |         if metadata["precision"] != precision:
+00441 |             raise ValueError(
+00442 |                 f"build_full_pipeline: --precision={precision} but export_metadata.json in "
+00443 |                 f"{onnx_dir} records precision={metadata['precision']!r}. Build at the "
+00444 |                 f"exported precision (--precision {metadata['precision']}) or re-export."
+00445 |             )
+00446 |         seq_hints = {
+00447 |             "sa_seq_len": metadata["sa_seq_len"],
+00448 |             "vl_seq_len": metadata["vl_seq_len"],
+00449 |             "sequence_length": metadata["llm_seq_len"],
+00450 |             "seq_len": metadata["llm_seq_len"],  # N1.7 LLM dynamic dim name
+00451 |             "num_patches": metadata["num_patches"],
+00452 |             "num_merged_patches": metadata["num_merged_patches"],
+00453 |             "num_vis_tokens": metadata["num_vis_tokens"],  # N1.7 deepstack
+00454 |         }
+00455 |         logger.info(f"Loaded shape hints from export_metadata.json in {onnx_dir}: {seq_hints}")
+00456 |     else:
+00457 |         seq_hints = {
+00458 |             "sa_seq_len": 51,  # 1 state + action_horizon
+00459 |             "vl_seq_len": 280,  # typical backbone output seq_len
+00460 |             "sequence_length": 280,  # LLM seq_len
+00461 |         }
+00462 |         logger.warning(f"Using default shape hints (no usable metadata): {seq_hints}")
+00463 | 
+00464 |     # Build order, ONNX candidates, and engine filenames come from the shared
+00465 |     # component table (single source of truth). ``only`` restricts to the subset
+00466 |     # a partial export produced. FP32 ViT is preferred for accuracy and falls
+00467 |     # back to BF16; the engine filename stays precision-neutral (vit.engine)
+00468 |     # because the input ONNX may be either FP32 or BF16 — the real precision is
+00469 |     # recorded in export_metadata.json and inspectable via TRT tooling.
+00470 |     if only is not None:
+00471 |         valid_names = {c.name for c in FULL_PIPELINE_COMPONENTS}
+00472 |         unknown = set(only) - valid_names
+00473 |         if unknown:
+00474 |             raise ValueError(
+00475 |                 f"Unknown pipeline component(s) {sorted(unknown)}; "
+00476 |                 f"valid components: {sorted(valid_names)}"
+00477 |             )
+00478 |     components: list[tuple[str, str, str]] = []
+00479 |     for component in FULL_PIPELINE_COMPONENTS:
+00480 |         if only is not None and component.name not in only:
+00481 |             continue
+00482 |         onnx_file = next(
+00483 |             (c for c in component.onnx_candidates if os.path.exists(os.path.join(onnx_dir, c))),
+00484 |             component.onnx_candidates[0],
+00485 |         )
+00486 |         components.append((component.name, onnx_file, component.engine))
+00487 | 
+00488 |     results: list[tuple[str, str, str]] = []
+00489 |     skipped: list[tuple[str, str]] = []  # (name, onnx_path) for components with no ONNX input
+00490 | 
+00491 |     for name, onnx_file, engine_file in components:
+00492 |         onnx_path = os.path.join(onnx_dir, onnx_file)
+00493 | 
+00494 |         if not os.path.exists(onnx_path):
+00495 |             logger.warning(f"Skipping {name}: ONNX file not found at {onnx_path}")
+00496 |             skipped.append((name, onnx_path))
+00497 |             continue
+00498 | 
+00499 |         logger.info(f"\n{'#' * 80}")
+00500 |         logger.info(f"# Building {name} engine")
+00501 |         logger.info(f"{'#' * 80}")
+00502 | 
+00503 |         engine_path = os.path.join(engine_dir, engine_file)
+00504 |         # Pick the precision that actually matches this ONNX's tensor types.
+00505 |         # The full_pipeline export is mixed-precision (ViT FP32, rest BF16),
+00506 |         # so the pipeline-wide ``precision`` argument is the default but each
+00507 |         # component uses what it was actually exported with.
+00508 |         component_precision = _precision_from_onnx_path(onnx_path, default=precision)
+00509 |         if component_precision != precision:
+00510 |             logger.info(
+00511 |                 f"  Using precision={component_precision} for {name} (from ONNX filename); "
+00512 |                 f"pipeline default is {precision}"
+00513 |             )
+00514 | 
+00515 |         try:
+00516 |             # Derive shapes from the ONNX model itself
+00517 |             min_shapes, opt_shapes, max_shapes = derive_shapes_with_hint(
+00518 |                 onnx_path, opt_seq_lens=seq_hints
+00519 |             )
+00520 | 
+00521 |             logger.info(f"  Auto-derived shape profiles for {name}:")
+00522 |             for input_name in opt_shapes:
+00523 |                 logger.info(
+00524 |                     f"    {input_name}: min={min_shapes[input_name]} "
+00525 |                     f"opt={opt_shapes[input_name]} max={max_shapes[input_name]}"
+00526 |                 )
+00527 | 
+00528 |             build_engine(
+00529 |                 onnx_path=onnx_path,
+00530 |                 engine_path=engine_path,
+00531 |                 precision=component_precision,
+00532 |                 workspace_mb=workspace_mb,
+00533 |                 min_shapes=min_shapes,
+00534 |                 opt_shapes=opt_shapes,
+00535 |                 max_shapes=max_shapes,
+00536 |                 trt_severity=trt_severity,
+00537 |             )
+00538 |             results.append((name, engine_path, "SUCCESS"))
+00539 |         except Exception as e:
+00540 |             logger.error(f"Failed to build {name} engine: {e}")
+00541 |             results.append((name, engine_path, f"FAILED: {e}"))
+00542 | 
+00543 |     # Print summary
+00544 |     logger.info("\n" + "=" * 80)
+00545 |     logger.info("FULL PIPELINE BUILD SUMMARY")
+00546 |     logger.info("=" * 80)
+00547 |     for name, path, status in results:
+00548 |         logger.info(f"  {name:20s} -> {status}")
+00549 |     logger.info("=" * 80)
+00550 | 
+00551 |     # Every component must build; missing ONNX inputs and failed builds are
+00552 |     # equally fatal, otherwise an empty/half-built engine dir exits 0.
+00553 |     failures = [(name, status) for name, _, status in results if status.startswith("FAILED")]
+00554 |     if failures or skipped:
+00555 |         parts = []
+00556 |         if failures:
+00557 |             parts.append(
+00558 |                 f"{len(failures)}/{len(components)} engine(s) failed: "
+00559 |                 + "; ".join(f"{name} ({status})" for name, status in failures)
+00560 |             )
+00561 |         if skipped:
+00562 |             parts.append(
+00563 |                 f"{len(skipped)}/{len(components)} component(s) had no ONNX input: "
+00564 |                 + ", ".join(f"{name} ({path})" for name, path in skipped)
+00565 |             )
+00566 |         raise RuntimeError("Pipeline build incomplete — " + " | ".join(parts))
+00567 | 
+00568 | 
+00569 | def build_a2a_action_head_engine(
+00570 |     onnx_path: str,
+00571 |     engine_path: str,
+00572 |     *,
+00573 |     vl_sequence_length: int = 512,
+00574 |     max_batch: int = 1,
+00575 |     workspace_mb: int = 8192,
+00576 |     trt_severity=None,
+00577 | ) -> None:
+00578 |     """Build the fixed-step latent-A2A head with an explicit FP32 contract.
+00579 | 
+00580 |     The A2A exporter emits a strongly-typed FP32 graph whose only dynamic
+00581 |     dimensions are ``batch`` and ``vl_sequence``.  Keeping this path separate
+00582 |     prevents the generic BF16 default and unknown-axis heuristics from silently
+00583 |     producing an incompatible or excessively large optimization profile.
+00584 |     """
+00585 |     import hashlib
+00586 |     import json
+00587 |     from pathlib import Path
+00588 | 
+00589 |     if vl_sequence_length <= 0:
+00590 |         raise ValueError("vl_sequence_length must be positive")
+00591 |     if max_batch <= 0:
+00592 |         raise ValueError("max_batch must be positive")
+00593 | 
+00594 |     onnx_file = Path(onnx_path)
+00595 |     engine_file = Path(engine_path)
+00596 |     if engine_file.name != "a2a_action_head.engine":
+00597 |         raise ValueError(
+00598 |             "a2a_action_head mode requires engine filename a2a_action_head.engine"
+00599 |         )
+00600 |     metadata_source = onnx_file.parent / "a2a_export_metadata.json"
+00601 |     if not metadata_source.is_file():
+00602 |         raise FileNotFoundError(
+00603 |             f"Missing {metadata_source}; export the A2A action head and metadata together"
+00604 |         )
+00605 |     with metadata_source.open("r", encoding="utf-8") as handle:
+00606 |         metadata = json.load(handle)
+00607 |     if metadata.get("model_type") != "Gr00tN1d7A2A":
+00608 |         raise ValueError(
+00609 |             "a2a_export_metadata.json does not describe a Gr00tN1d7A2A export"
+00610 |         )
+00611 |     for key in (
+00612 |         "onnx_sha256",
+00613 |         "checkpoint_sha256",
+00614 |         "data_contract_sha256",
+00615 |         "canonical_statistics_sha256",
+00616 |     ):
+00617 |         value = metadata.get(key)
+00618 |         if not isinstance(value, str) or len(value) != 64:
+00619 |             raise ValueError(f"A2A export metadata is missing a valid {key}")
+00620 |     actual_onnx_sha256 = sha256_file(onnx_file)
+00621 |     if metadata["onnx_sha256"] != actual_onnx_sha256:
+00622 |         raise ValueError(
+00623 |             "A2A ONNX SHA-256 mismatch: "
+00624 |             f"expected={metadata['onnx_sha256']}, actual={actual_onnx_sha256}"
+00625 |         )
+00626 |     if metadata.get("verification") != "onnx_checker+torch_ort_rtol1e-4_atol1e-4":
+00627 |         raise ValueError(
+00628 |             "Refusing to build an A2A TensorRT engine from an ONNX graph that was not "
+00629 |             "validated with ONNX checker and the PyTorch/ORT numerical oracle"
+00630 |         )
+00631 | 
+00632 |     min_shapes, opt_shapes, max_shapes = derive_shapes_with_hint(
+00633 |         str(onnx_file),
+00634 |         opt_seq_lens={"vl_sequence": int(vl_sequence_length)},
+00635 |         max_batch=int(max_batch),
+00636 |     )
+00637 |     build_engine(
+00638 |         onnx_path=str(onnx_file),
+00639 |         engine_path=str(engine_file),
+00640 |         precision="fp32",
+00641 |         workspace_mb=workspace_mb,
+00642 |         min_shapes=min_shapes,
+00643 |         opt_shapes=opt_shapes,
+00644 |         max_shapes=max_shapes,
+00645 |         trt_severity=trt_severity,
+00646 |     )
+00647 | 
+00648 |     digest = hashlib.sha256()
+00649 |     with engine_file.open("rb") as handle:
+00650 |         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+00651 |             digest.update(chunk)
+00652 |     metadata.update(
+00653 |         {
+00654 |             "engine": engine_file.name,
+00655 |             "engine_sha256": digest.hexdigest(),
+00656 |             "build_precision": "fp32",
+00657 |             "build_profiles": {
+00658 |                 "min": {name: list(shape) for name, shape in min_shapes.items()},
+00659 |                 "opt": {name: list(shape) for name, shape in opt_shapes.items()},
+00660 |                 "max": {name: list(shape) for name, shape in max_shapes.items()},
+00661 |             },
+00662 |         }
+00663 |     )
+00664 |     engine_file.parent.mkdir(parents=True, exist_ok=True)
+00665 |     metadata_destination = engine_file.parent / "a2a_export_metadata.json"
+00666 |     metadata_destination.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+00667 | 
+00668 | 
+00669 | # ============================================================
+00670 | # Main
+00671 | # ============================================================
+00672 | 
+00673 | 
+00674 | @dataclass
+00675 | class BuildConfig:
+00676 |     """Configuration for building TensorRT engines from ONNX models."""
+00677 | 
+00678 |     mode: BuildEngineMode = BuildEngineMode.single
+00679 |     """Build mode: generic single, latent-A2A head, or the full N1.7 pipeline."""
+00680 | 
+00681 |     onnx: str | None = None
+00682 |     """Path to ONNX model (single mode)."""
+00683 | 
+00684 |     engine: str | None = None
+00685 |     """Path to save TensorRT engine (single mode)."""
+00686 | 
+00687 |     onnx_dir: str = "./gr00t_trt_deployment/onnx"
+00688 |     """Directory with ONNX models (full_pipeline mode)."""
+00689 | 
+00690 |     engine_dir: str = "./gr00t_trt_deployment/engines"
+00691 |     """Directory to save engines (full_pipeline mode)."""
+00692 | 
+00693 |     precision: Literal["fp32", "fp16", "bf16", "fp8"] = "bf16"
+00694 |     """Precision mode (default: bf16)."""
+00695 | 
+00696 |     workspace: int = 8192
+00697 |     """Workspace size in MB (default: 8192)."""
+00698 | 
+00699 |     allow_default_hints: bool = False
+00700 |     """full_pipeline: build with hardcoded GR1 single-view shape hints when
+00701 |     export_metadata.json is missing/stale/incomplete, instead of failing. The
+00702 |     engine may get wrong sequence/patch shapes — use only for legacy bundles."""
+00703 | 
+00704 | 
+00705 |     a2a_vl_sequence_length: int = 512
+00706 |     """A2A action-head optimal VLM sequence length."""
+00707 | 
+00708 |     a2a_max_batch: int = 1
+00709 |     """A2A action-head maximum dynamic batch size."""
+00710 | 
+00711 | 
+00712 | def main(args: BuildConfig | None = None, trt_severity=None):
+00713 |     if args is None:
+00714 |         args = tyro.cli(BuildConfig)
+00715 | 
+00716 |     if args.mode == "full_pipeline":
+00717 |         build_full_pipeline(
+00718 |             onnx_dir=args.onnx_dir,
+00719 |             engine_dir=args.engine_dir,
+00720 |             precision=args.precision,
+00721 |             workspace_mb=args.workspace,
+00722 |             trt_severity=trt_severity,
+00723 |             allow_default_hints=args.allow_default_hints,
+00724 |         )
+00725 |     elif args.mode == "a2a_action_head":
+00726 |         if not args.onnx or not args.engine:
+00727 |             raise ValueError(
+00728 |                 "--onnx and --engine are required in a2a_action_head mode"
+00729 |             )
+00730 |         build_a2a_action_head_engine(
+00731 |             onnx_path=args.onnx,
+00732 |             engine_path=args.engine,
+00733 |             vl_sequence_length=args.a2a_vl_sequence_length,
+00734 |             max_batch=args.a2a_max_batch,
+00735 |             workspace_mb=args.workspace,
+00736 |             trt_severity=trt_severity,
+00737 |         )
+00738 |     else:
+00739 |         if not args.onnx or not args.engine:
+00740 |             raise ValueError("--onnx and --engine are required in single mode")
+00741 | 
+00742 |         # Auto-derive shapes from the ONNX model
+00743 |         min_shapes, opt_shapes, max_shapes = derive_shapes_with_hint(args.onnx)
+00744 |         build_engine(
+00745 |             onnx_path=args.onnx,
+00746 |             engine_path=args.engine,
+00747 |             precision=args.precision,
+00748 |             workspace_mb=args.workspace,
+00749 |             min_shapes=min_shapes,
+00750 |             opt_shapes=opt_shapes,
+00751 |             max_shapes=max_shapes,
+00752 |             trt_severity=trt_severity,
+00753 |         )
+00754 | 
+00755 | 
+00756 | if __name__ == "__main__":
+00757 |     config = tyro.cli(BuildConfig)
+00758 |     main(config)

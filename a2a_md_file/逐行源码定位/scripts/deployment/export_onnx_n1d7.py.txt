@@ -1,0 +1,1600 @@
+00001 | #!/usr/bin/env python3
+00002 | 
+00003 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00004 | # SPDX-License-Identifier: Apache-2.0
+00005 | #
+00006 | # Licensed under the Apache License, Version 2.0 (the "License");
+00007 | # you may not use this file except in compliance with the License.
+00008 | # You may obtain a copy of the License at
+00009 | #
+00010 | # http://www.apache.org/licenses/LICENSE-2.0
+00011 | #
+00012 | # Unless required by applicable law or agreed to in writing, software
+00013 | # distributed under the License is distributed on an "AS IS" BASIS,
+00014 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00015 | # See the License for the specific language governing permissions and
+00016 | # limitations under the License.
+00017 | 
+00018 | """
+00019 | Export GR00T N1.7 model components to ONNX for TensorRT optimization.
+00020 | 
+00021 | Supports three export modes:
+00022 |   - dit_only:      Export only the DiT (backward compatible with N1.6).
+00023 |   - action_head:   Export 4 action head components (ViT + LLM stay in PyTorch).
+00024 |   - full_pipeline: Export ViT + LLM + 4 action head components. Lightweight
+00025 |                    glue ops (embed_tokens, masked_scatter, get_rope_index,
+00026 |                    VLLN) remain in PyTorch. Referred to as 'n17_full_pipeline'
+00027 |                    by the engine-loading code (trt_model_forward.py,
+00028 |                    build_trt_pipeline.py) and as 'trt_full_pipeline' by the
+00029 |                    standalone_inference_script.py --inference-mode flag;
+00030 |                    both names describe the same engine set.
+00031 | 
+00032 | Usage:
+00033 |     # Download finetuned model first (HF doesn't support nested repo paths)
+00034 |     uv run hf download nvidia/GR00T-N1.7-LIBERO --include "libero_10/config.json" "libero_10/embodiment_id.json" "libero_10/model-*.safetensors" "libero_10/model.safetensors.index.json" "libero_10/processor_config.json" "libero_10/statistics.json" --local-dir checkpoints/GR00T-N1.7-LIBERO
+00035 | 
+00036 |     # DiT only (default). N1.7 TRT export uses the legacy ONNX exporter
+00037 |     # explicitly (`dynamo=False`) so dynamic axes remain TensorRT-friendly.
+00038 |     python export_onnx_n1d7.py \\
+00039 |         --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \\
+00040 |         --dataset-path demo_data/libero_demo \\
+00041 |         --output-dir ./gr00t_trt_deployment/onnx
+00042 | 
+00043 |     # Action head (4 components)
+00044 |     python export_onnx_n1d7.py \\
+00045 |         --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \\
+00046 |         --dataset-path demo_data/libero_demo \\
+00047 |         --output-dir ./gr00t_trt_deployment/onnx \\
+00048 |         --export-mode action_head
+00049 | """
+00050 | 
+00051 | import copy
+00052 | from dataclasses import dataclass
+00053 | import json
+00054 | import logging
+00055 | import os
+00056 | from pathlib import Path
+00057 | from typing import Literal, Optional
+00058 | 
+00059 | from _trt_contract import EXPORT_METADATA_SCHEMA_VERSION
+00060 | from gr00t.data.dataset.a2a_single_step_dataset import (
+00061 |     compute_a2a_window_bounds,
+00062 |     extract_a2a_step_data,
+00063 | )
+00064 | from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+00065 | from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
+00066 | from gr00t.data.embodiment_tags import EmbodimentTag
+00067 | from gr00t.data.utils import parse_observation_gr00t
+00068 | from gr00t.deployment.modes import ExportMode
+00069 | from gr00t.model.modules.qwen3_backbone import _assign_inv_freq, recompute_vision_rotary_inv_freq
+00070 | from gr00t.policy.gr00t_policy import Gr00tPolicy
+00071 | import numpy as np
+00072 | import torch
+00073 | import torch.nn as nn
+00074 | import torch.nn.functional as F
+00075 | import torch.onnx
+00076 | import tyro
+00077 | 
+00078 | 
+00079 | # Set up logging
+00080 | logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+00081 | logger = logging.getLogger(__name__)
+00082 | 
+00083 | 
+00084 | def _consolidate_external_data(onnx_path: str) -> None:
+00085 |     """Merge scattered external-data files into a single .data file next to the ONNX model."""
+00086 |     import onnx
+00087 |     from onnx.external_data_helper import convert_model_to_external_data
+00088 | 
+00089 |     onnx_dir = os.path.dirname(onnx_path)
+00090 |     onnx_name = os.path.basename(onnx_path)
+00091 |     data_file = onnx_name + ".data"
+00092 | 
+00093 |     # Check if there are scattered files (files without .onnx/.json extension)
+00094 |     scattered = [
+00095 |         f
+00096 |         for f in os.listdir(onnx_dir)
+00097 |         if os.path.isfile(os.path.join(onnx_dir, f))
+00098 |         and not f.endswith((".onnx", ".json", ".data"))
+00099 |         and f != data_file
+00100 |     ]
+00101 |     if not scattered:
+00102 |         return
+00103 | 
+00104 |     logger.info(f"  Consolidating {len(scattered)} external data files into {data_file}...")
+00105 |     model = onnx.load(onnx_path, load_external_data=True)
+00106 |     convert_model_to_external_data(
+00107 |         model, all_tensors_to_one_file=True, location=data_file, size_threshold=0
+00108 |     )
+00109 |     onnx.save(model, onnx_path)
+00110 | 
+00111 |     # Clean up scattered files
+00112 |     for f in scattered:
+00113 |         os.remove(os.path.join(onnx_dir, f))
+00114 |     logger.info(f"  Consolidated and cleaned up {len(scattered)} files.")
+00115 | 
+00116 | 
+00117 | def verify_onnx_export(onnx_path: str) -> None:
+00118 |     """Load and check the exported ONNX model for validity."""
+00119 |     import onnx
+00120 | 
+00121 |     logger.info(f"  Verifying {onnx_path} ...")
+00122 |     onnx.checker.check_model(onnx_path)
+00123 |     logger.info("  ONNX model verified successfully.")
+00124 | 
+00125 | 
+00126 | def verify_onnx_with_ort(
+00127 |     onnx_path: str,
+00128 |     pytorch_module: torch.nn.Module,
+00129 |     sample_inputs: dict[str, torch.Tensor],
+00130 |     output_names: list[str],
+00131 |     label: str = "model",
+00132 | ) -> dict[str, float]:
+00133 |     """Run ONNX Runtime inference and compare against PyTorch output.
+00134 | 
+00135 |     Returns dict of {output_name: cosine_similarity}.
+00136 |     Requires onnxruntime-gpu; skips gracefully if not installed.
+00137 |     """
+00138 |     try:
+00139 |         import onnxruntime as ort
+00140 |     except ImportError:
+00141 |         logger.warning("  onnxruntime not installed — skipping ORT verification")
+00142 |         return {}
+00143 | 
+00144 |     logger.info(f"  ORT verification for {label}...")
+00145 | 
+00146 |     # Run PyTorch
+00147 |     with torch.inference_mode():
+00148 |         pt_inputs = tuple(sample_inputs[name] for name in sample_inputs)
+00149 |         pt_outputs = pytorch_module(*pt_inputs)
+00150 |         if not isinstance(pt_outputs, (tuple, list)):
+00151 |             pt_outputs = (pt_outputs,)
+00152 | 
+00153 |     # Run ONNX Runtime
+00154 |     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+00155 |     sess = ort.InferenceSession(onnx_path, providers=providers)
+00156 |     ort_inputs = {name: t.cpu().numpy() for name, t in sample_inputs.items()}
+00157 |     ort_outputs = sess.run(output_names, ort_inputs)
+00158 | 
+00159 |     # Compare
+00160 |     results = {}
+00161 |     for i, name in enumerate(output_names):
+00162 |         pt_flat = pt_outputs[i].float().flatten().cpu()
+00163 |         ort_flat = torch.tensor(ort_outputs[i]).float().flatten()
+00164 |         cosine = torch.nn.functional.cosine_similarity(
+00165 |             pt_flat.unsqueeze(0), ort_flat.unsqueeze(0)
+00166 |         ).item()
+00167 |         results[name] = cosine
+00168 |         logger.info(f"    {name}: ORT vs PyTorch cosine = {cosine:.6f}")
+00169 | 
+00170 |     return results
+00171 | 
+00172 | 
+00173 | # ============================================================
+00174 | # Input Capture
+00175 | # ============================================================
+00176 | 
+00177 | 
+00178 | class DiTInputCapture:
+00179 |     """Capture DiT forward pass inputs during inference via a pre-forward hook."""
+00180 | 
+00181 |     def __init__(self):
+00182 |         self.captured = False
+00183 |         self.sa_embs = None
+00184 |         self.vl_embs = None
+00185 |         self.timestep = None
+00186 |         self.image_mask = None
+00187 |         self.backbone_attention_mask = None
+00188 | 
+00189 |     def hook_fn(self, module, args, kwargs):
+00190 |         """Pre-forward hook to capture inputs."""
+00191 |         if not self.captured:
+00192 |             self.sa_embs = kwargs["hidden_states"].detach().cpu().clone()
+00193 |             self.vl_embs = kwargs["encoder_hidden_states"].detach().cpu().clone()
+00194 |             self.timestep = kwargs["timestep"].detach().cpu().clone()
+00195 |             i_mask = kwargs.get("image_mask")
+00196 |             if i_mask is not None:
+00197 |                 self.image_mask = i_mask.detach().cpu().clone()
+00198 |             bb_mask = kwargs.get("backbone_attention_mask")
+00199 |             if bb_mask is not None:
+00200 |                 self.backbone_attention_mask = bb_mask.detach().cpu().clone()
+00201 | 
+00202 |             self.captured = True
+00203 |             logger.info("  Captured DiT inputs:")
+00204 |             logger.info(f"    sa_embs: {self.sa_embs.shape}")
+00205 |             logger.info(f"    vl_embs: {self.vl_embs.shape}")
+00206 |             logger.info(f"    timestep: {self.timestep.shape}")
+00207 |             if self.image_mask is not None:
+00208 |                 logger.info(f"    image_mask: {self.image_mask.shape}")
+00209 |             if self.backbone_attention_mask is not None:
+00210 |                 logger.info(f"    backbone_attention_mask: {self.backbone_attention_mask.shape}")
+00211 | 
+00212 | 
+00213 | class ViTInputCapture:
+00214 |     """Capture ViT (VisionModel) forward inputs/outputs during inference."""
+00215 | 
+00216 |     def __init__(self):
+00217 |         self.captured = False
+00218 |         self.pixel_values_shape = None
+00219 |         self.grid_thw = None
+00220 |         self.output_shape = None
+00221 |         self.deepstack_shapes = []
+00222 | 
+00223 |     def hook_fn(self, module, args, kwargs, output):
+00224 |         if not self.captured:
+00225 |             self.pixel_values_shape = args[0].shape
+00226 |             grid = args[1] if len(args) > 1 else kwargs.get("grid_thw")
+00227 |             self.grid_thw = grid.detach().cpu().clone()
+00228 |             if isinstance(output, tuple):
+00229 |                 self.output_shape = output[0].shape
+00230 |                 self.deepstack_shapes = [f.shape for f in output[1]]
+00231 |             else:
+00232 |                 self.output_shape = output.shape
+00233 |             self.captured = True
+00234 |             logger.info("  Captured ViT inputs:")
+00235 |             logger.info(f"    pixel_values: {self.pixel_values_shape}")
+00236 |             logger.info(f"    grid_thw: {self.grid_thw.tolist()}")
+00237 |             logger.info(f"    output: {self.output_shape}")
+00238 |             logger.info(f"    deepstack: {len(self.deepstack_shapes)} features")
+00239 | 
+00240 | 
+00241 | class LLMInputCapture:
+00242 |     """Capture LLM (Qwen3VLTextModel) inputs during inference via a pre-forward hook.
+00243 | 
+00244 |     Captures inputs_embeds, position_ids, attention_mask, visual_pos_masks,
+00245 |     and deepstack_visual_embeds — everything needed to reproduce the LLM forward.
+00246 |     """
+00247 | 
+00248 |     def __init__(self):
+00249 |         self.captured = False
+00250 |         self.inputs_embeds = None
+00251 |         self.position_ids = None
+00252 |         self.attention_mask = None
+00253 |         self.visual_pos_masks = None
+00254 |         self.deepstack_visual_embeds = None  # list of tensors
+00255 | 
+00256 |     def hook_fn(self, module, args, kwargs):
+00257 |         if not self.captured:
+00258 |             ie = kwargs.get("inputs_embeds")
+00259 |             if ie is None and len(args) > 0:
+00260 |                 ie = args[0]
+00261 |             if ie is not None:
+00262 |                 self.inputs_embeds = ie.detach().cpu().clone()
+00263 | 
+00264 |             pid = kwargs.get("position_ids")
+00265 |             if pid is not None:
+00266 |                 self.position_ids = pid.detach().cpu().clone()
+00267 | 
+00268 |             am = kwargs.get("attention_mask")
+00269 |             if am is not None:
+00270 |                 self.attention_mask = am.detach().cpu().clone()
+00271 | 
+00272 |             vpm = kwargs.get("visual_pos_masks")
+00273 |             if vpm is not None:
+00274 |                 self.visual_pos_masks = vpm.detach().cpu().clone()
+00275 | 
+00276 |             dve = kwargs.get("deepstack_visual_embeds")
+00277 |             if dve is not None:
+00278 |                 self.deepstack_visual_embeds = [d.detach().cpu().clone() for d in dve]
+00279 | 
+00280 |             self.captured = True
+00281 |             logger.info("  Captured LLM inputs:")
+00282 |             if self.inputs_embeds is not None:
+00283 |                 logger.info(f"    inputs_embeds: {self.inputs_embeds.shape}")
+00284 |             if self.position_ids is not None:
+00285 |                 logger.info(f"    position_ids: {self.position_ids.shape}")
+00286 |             if self.attention_mask is not None:
+00287 |                 logger.info(f"    attention_mask: {self.attention_mask.shape}")
+00288 |             if self.visual_pos_masks is not None:
+00289 |                 logger.info(f"    visual_pos_masks: {self.visual_pos_masks.shape}")
+00290 |             if self.deepstack_visual_embeds is not None:
+00291 |                 logger.info(
+00292 |                     f"    deepstack: {len(self.deepstack_visual_embeds)} tensors, "
+00293 |                     f"shapes: {[d.shape for d in self.deepstack_visual_embeds]}"
+00294 |                 )
+00295 | 
+00296 | 
+00297 | # ============================================================
+00298 | # ViT Export: ONNX-friendly attention + wrapper
+00299 | # ============================================================
+00300 | 
+00301 | 
+00302 | def _apply_rotary_real(x, cos, sin):
+00303 |     """Apply rotary position embeddings using only real-valued ops (no complex).
+00304 | 
+00305 |     Uses float32 internally to match transformers' apply_rotary_pos_emb_vision
+00306 |     precision, then casts back to the original dtype.
+00307 | 
+00308 |     Args:
+00309 |         x: [seq, heads, head_dim]
+00310 |         cos, sin: [seq, head_dim]
+00311 |     Returns:
+00312 |         [seq, heads, head_dim]
+00313 |     """
+00314 |     orig_dtype = x.dtype
+00315 |     x = x.float()
+00316 |     cos = cos.float().unsqueeze(1)  # [seq, 1, head_dim]
+00317 |     sin = sin.float().unsqueeze(1)
+00318 |     half = x.shape[-1] // 2
+00319 |     x1 = x[..., :half]
+00320 |     x2 = x[..., half:]
+00321 |     rotated = torch.cat((-x2, x1), dim=-1)
+00322 |     return (x * cos + rotated * sin).to(orig_dtype)
+00323 | 
+00324 | 
+00325 | def _make_onnx_vision_attention_forward(attn_module, chunk_sizes=None):
+00326 |     """Create an ONNX-exportable attention forward for a single VisionAttention.
+00327 | 
+00328 |     Three key changes from the original:
+00329 |     1. Replaces cu_seqlens-based splitting with static chunk splitting
+00330 |        (each image's patches attend only within their own chunk)
+00331 |     2. Replaces apply_rotary_pos_emb_vision (uses complex numbers) with
+00332 |        real-valued rotate_half implementation
+00333 |     3. Casts to float32 before softmax for TRT accuracy
+00334 | 
+00335 |     Args:
+00336 |         attn_module: The VisionAttention module to wrap
+00337 |         chunk_sizes: List of ints, number of patches per image.
+00338 |             e.g. [256, 256] for 2 images of 256 patches each.
+00339 |             If None or single chunk, does full-sequence attention.
+00340 |     """
+00341 | 
+00342 |     def forward(
+00343 |         hidden_states, cu_seqlens=None, rotary_pos_emb=None, position_embeddings=None, **kwargs
+00344 |     ):
+00345 |         seq_length = hidden_states.shape[0]
+00346 |         qkv = attn_module.qkv(hidden_states)
+00347 |         qkv = qkv.reshape(seq_length, 3, attn_module.num_heads, -1)
+00348 |         qkv = qkv.permute(1, 0, 2, 3)
+00349 |         q, k, v = qkv.unbind(0)
+00350 |         # q, k, v: [seq_length, num_heads, head_dim]
+00351 | 
+00352 |         cos, sin = position_embeddings
+00353 |         q = _apply_rotary_real(q, cos, sin)
+00354 |         k = _apply_rotary_real(k, cos, sin)
+00355 | 
+00356 |         # Split by image chunks (mirrors cu_seqlens-based splitting in original)
+00357 |         # Each image's patches attend only within their own chunk.
+00358 |         if chunk_sizes is not None and len(chunk_sizes) > 1:
+00359 |             q_chunks = torch.split(q, chunk_sizes, dim=0)
+00360 |             k_chunks = torch.split(k, chunk_sizes, dim=0)
+00361 |             v_chunks = torch.split(v, chunk_sizes, dim=0)
+00362 | 
+00363 |             attn_outputs = []
+00364 |             for q_c, k_c, v_c in zip(q_chunks, k_chunks, v_chunks):
+00365 |                 # q_c, k_c, v_c: [chunk_seq, num_heads, head_dim]
+00366 |                 q_c = q_c.transpose(0, 1)  # [num_heads, chunk_seq, head_dim]
+00367 |                 k_c = k_c.transpose(0, 1)
+00368 |                 v_c = v_c.transpose(0, 1)
+00369 | 
+00370 |                 w = torch.matmul(q_c, k_c.transpose(-2, -1)) * attn_module.scaling
+00371 |                 w = w.to(torch.float32)
+00372 |                 w = F.softmax(w, dim=-1)
+00373 |                 w = w.to(v_c.dtype)
+00374 |                 out = torch.matmul(w, v_c)  # [num_heads, chunk_seq, head_dim]
+00375 |                 attn_outputs.append(out.transpose(0, 1))  # [chunk_seq, num_heads, head_dim]
+00376 | 
+00377 |             attn_output = torch.cat(attn_outputs, dim=0)  # [seq, num_heads, head_dim]
+00378 |         else:
+00379 |             # Single image: full-sequence attention
+00380 |             q = q.transpose(0, 1)  # [num_heads, seq, head_dim]
+00381 |             k = k.transpose(0, 1)
+00382 |             v = v.transpose(0, 1)
+00383 | 
+00384 |             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * attn_module.scaling
+00385 |             attn_weights = attn_weights.to(torch.float32)
+00386 |             attn_weights = F.softmax(attn_weights, dim=-1)
+00387 |             attn_weights = attn_weights.to(v.dtype)
+00388 |             attn_output = torch.matmul(attn_weights, v)
+00389 |             attn_output = attn_output.transpose(0, 1)  # [seq, num_heads, head_dim]
+00390 | 
+00391 |         # [seq, num_heads, head_dim] → [seq, num_heads * head_dim]
+00392 |         attn_output = attn_output.reshape(seq_length, -1).contiguous()
+00393 |         attn_output = attn_module.proj(attn_output)
+00394 |         return attn_output
+00395 | 
+00396 |     return forward
+00397 | 
+00398 | 
+00399 | def _patch_vision_attention_for_export(vision_model, chunk_sizes=None):
+00400 |     """Monkey-patch all VisionAttention.forward with ONNX-friendly versions.
+00401 | 
+00402 |     Args:
+00403 |         vision_model: The vision model whose attention blocks to patch
+00404 |         chunk_sizes: List of ints, patches per image (from grid_thw).
+00405 |             Enables per-image attention splitting. If None, full-sequence attention.
+00406 | 
+00407 |     Returns list of original forwards for restoration after export.
+00408 |     """
+00409 |     originals = []
+00410 |     for block in vision_model.blocks:
+00411 |         attn = block.attn
+00412 |         originals.append(attn.forward)
+00413 |         attn.forward = _make_onnx_vision_attention_forward(attn, chunk_sizes=chunk_sizes)
+00414 |     info = f"  Patched {len(originals)} vision attention blocks for ONNX export"
+00415 |     if chunk_sizes and len(chunk_sizes) > 1:
+00416 |         info += f" (chunk_sizes={chunk_sizes})"
+00417 |     logger.info(info)
+00418 |     return originals
+00419 | 
+00420 | 
+00421 | def _restore_vision_attention(vision_model, originals):
+00422 |     """Restore original attention forwards after export."""
+00423 |     for block, orig in zip(vision_model.blocks, originals):
+00424 |         block.attn.forward = orig
+00425 | 
+00426 | 
+00427 | class Qwen3VisionForExport(torch.nn.Module):
+00428 |     """ONNX-exportable wrapper for Qwen3-VL Vision Model.
+00429 | 
+00430 |     Pre-computes position embeddings and rotary embeddings for a fixed grid_thw
+00431 |     to avoid ComplexDouble operations that ONNX cannot handle. Replaces the
+00432 |     dynamic VisionModel.forward with a traceable version.
+00433 | 
+00434 |     Architecture: patch_embed → add pos_embed → blocks(attn+ffn) → deepstack → merger
+00435 |     """
+00436 | 
+00437 |     def __init__(self, vision_model, grid_thw: torch.Tensor):
+00438 |         super().__init__()
+00439 |         self.patch_embed = vision_model.patch_embed
+00440 |         self.blocks = vision_model.blocks
+00441 |         self.merger = vision_model.merger
+00442 |         self.deepstack_visual_indexes = vision_model.deepstack_visual_indexes
+00443 |         self.deepstack_merger_list = vision_model.deepstack_merger_list
+00444 | 
+00445 |         # Pre-compute position embeddings (avoids grid_thw-dependent Python loops
+00446 |         # and ComplexDouble operations in rotary embedding computation)
+00447 |         with torch.no_grad():
+00448 |             pos_embeds = vision_model.fast_pos_embed_interpolate(grid_thw)
+00449 |             rotary = vision_model.rot_pos_emb(grid_thw)
+00450 |             emb = torch.cat((rotary, rotary), dim=-1)
+00451 | 
+00452 |         self.register_buffer("_pos_embeds", pos_embeds.clone().detach().contiguous())
+00453 |         self.register_buffer("_rot_cos", emb.cos().clone().detach().contiguous())
+00454 |         self.register_buffer("_rot_sin", emb.sin().clone().detach().contiguous())
+00455 | 
+00456 |     def forward(self, pixel_values):
+00457 |         hidden_states = self.patch_embed(pixel_values)
+00458 |         hidden_states = hidden_states + self._pos_embeds
+00459 | 
+00460 |         position_embeddings = (self._rot_cos, self._rot_sin)
+00461 | 
+00462 |         deepstack_features = []
+00463 |         for layer_num, blk in enumerate(self.blocks):
+00464 |             hidden_states = blk(
+00465 |                 hidden_states,
+00466 |                 cu_seqlens=None,  # not used by patched attention
+00467 |                 position_embeddings=position_embeddings,
+00468 |             )
+00469 |             if layer_num in self.deepstack_visual_indexes:
+00470 |                 idx = self.deepstack_visual_indexes.index(layer_num)
+00471 |                 deepstack_features.append(self.deepstack_merger_list[idx](hidden_states))
+00472 | 
+00473 |         image_embeds = self.merger(hidden_states)
+00474 | 
+00475 |         if deepstack_features:
+00476 |             deepstack = torch.stack(deepstack_features)  # [num_layers, N, D]
+00477 |         else:
+00478 |             deepstack = image_embeds.new_zeros(1, 1, 1)
+00479 | 
+00480 |         return image_embeds, deepstack
+00481 | 
+00482 | 
+00483 | # ============================================================
+00484 | # Export Functions: ViT
+00485 | # ============================================================
+00486 | 
+00487 | 
+00488 | def _restore_vision_rotary_inv_freq_fp32(vision, vision_config):
+00489 |     """Re-derive the ViT RoPE ``inv_freq`` in fp32 right before baking it into the engine.
+00490 | 
+00491 |     ``Gr00tPolicy`` loads the whole model in bf16 (``gr00t_policy.py``), which rounds
+00492 |     this non-persistent buffer even though the ViT itself is exported in fp32 for TRT
+00493 |     accuracy (max|delta| ~1.8e-4 for head_dim=64 -- a pure bf16 round-trip error).
+00494 |     Re-deriving the analytic fp32 value here keeps the baked rotary cos/sin at full
+00495 |     fp32 precision and lets the analytic-oracle guard verify a clean buffer instead of
+00496 |     the bf16-degraded one. Fails closed when the rotary submodule/layout is missing.
+00497 |     """
+00498 |     rotary = getattr(vision, "rotary_pos_emb", None)
+00499 |     if rotary is None or not hasattr(rotary, "inv_freq"):
+00500 |         raise RuntimeError(
+00501 |             "ViT export: vision rotary_pos_emb/inv_freq not found; cannot rebuild the "
+00502 |             "rotary buffers before baking them into the engine (transformers Qwen3-VL "
+00503 |             "layout drift). Refusing to export unverified rotary."
+00504 |         )
+00505 |     head_dim = vision_config.hidden_size // vision_config.num_heads
+00506 |     fp32_inv_freq = recompute_vision_rotary_inv_freq(rotary, head_dim // 2, rotary.inv_freq.device)
+00507 |     _assign_inv_freq(rotary, "inv_freq", fp32_inv_freq, persistent=False)
+00508 | 
+00509 | 
+00510 | def _assert_vision_rotary_matches_analytic(vision, vision_config, *, atol=1e-5, rtol=1e-4):
+00511 |     """Abort export if the loaded ViT RoPE ``inv_freq`` drifts from the analytic oracle.
+00512 | 
+00513 |     The baked rotary cos/sin derive from this non-persistent buffer; the post-export
+00514 |     cosine checks are backend-vs-backend and cannot catch a common-mode error in it.
+00515 |     """
+00516 |     rotary = getattr(vision, "rotary_pos_emb", None)
+00517 |     if rotary is None or not hasattr(rotary, "inv_freq"):
+00518 |         raise RuntimeError(
+00519 |             "ViT export: vision rotary_pos_emb/inv_freq not found; cannot verify the "
+00520 |             "rotary buffers before baking them into the engine (transformers Qwen3-VL "
+00521 |             "layout drift). Refusing to export unverified rotary."
+00522 |         )
+00523 |     head_dim = vision_config.hidden_size // vision_config.num_heads
+00524 |     baked = rotary.inv_freq.detach().float()
+00525 |     analytic = recompute_vision_rotary_inv_freq(rotary, head_dim // 2, baked.device)
+00526 |     if not torch.allclose(baked, analytic, atol=atol, rtol=rtol):
+00527 |         max_err = (baked - analytic).abs().max().item()
+00528 |         raise RuntimeError(
+00529 |             "ViT export: loaded vision RoPE inv_freq diverges from the analytic oracle "
+00530 |             f"(max|delta|={max_err:.3e}); the baked rotary cos/sin would be silently wrong "
+00531 |             "and the backend-vs-backend cosine checks cannot catch it. Ensure "
+00532 |             "Qwen3Backbone._reset_rotary_inv_freq ran at load before exporting."
+00533 |         )
+00534 | 
+00535 | 
+00536 | def export_vit_to_onnx(policy, output_dir, captured_vit, use_bf16=True, batch_size=1):
+00537 |     """Export Qwen3-VL Vision Model to ONNX.
+00538 | 
+00539 |     Pre-computes position/rotary embeddings for the captured grid_thw to avoid
+00540 |     ComplexDouble ops. Monkey-patches attention to use standard SDPA (valid for
+00541 |     single-image inference where all patches attend to all patches).
+00542 | 
+00543 |     Input: pixel_values [num_patches * batch_size, C*T*pH*pW]
+00544 |     Output: image_embeds [num_merged_patches * batch_size, hidden_dim],
+00545 |             deepstack_features [num_layers, num_merged_patches * batch_size, hidden_dim]
+00546 |     """
+00547 |     logger.info("\n" + "=" * 80)
+00548 |     logger.info("Exporting ViT (Qwen3-VL Vision) to ONNX")
+00549 |     logger.info("=" * 80)
+00550 | 
+00551 |     backbone = policy.model.backbone
+00552 |     qwen_model = backbone.model
+00553 |     vision = qwen_model.model.visual
+00554 | 
+00555 |     # Gr00tPolicy loads the model in bf16, which rounds the non-persistent RoPE
+00556 |     # inv_freq. The ViT is exported in fp32 for TRT accuracy, so re-derive the analytic
+00557 |     # fp32 inv_freq before baking cos/sin, then verify the (now fp32) buffer against the
+00558 |     # independent analytic oracle.
+00559 |     _restore_vision_rotary_inv_freq_fp32(vision, qwen_model.config.vision_config)
+00560 |     _assert_vision_rotary_matches_analytic(vision, qwen_model.config.vision_config)
+00561 | 
+00562 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+00563 |     vision = vision.to(dtype).eval().cuda()
+00564 | 
+00565 |     # Compute chunk sizes from grid_thw for per-image attention splitting
+00566 |     # grid_thw: [num_images, 3] where each row is (temporal, height, width)
+00567 |     # cu_seqlens derived as: patches_per_image = h * w, repeated t times
+00568 |     grid_thw = captured_vit.grid_thw.to(device="cuda")
+00569 |     # For batch_size > 1, repeat grid_thw to tile position embeddings for all batch elements
+00570 |     if batch_size > 1:
+00571 |         grid_thw = grid_thw.repeat(batch_size, 1)
+00572 |     chunk_sizes = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
+00573 |     logger.info(f"  grid_thw: {grid_thw.tolist()}, chunk_sizes: {chunk_sizes}")
+00574 | 
+00575 |     # Patch attention for ONNX export with per-image chunk splitting
+00576 |     originals = _patch_vision_attention_for_export(vision, chunk_sizes=chunk_sizes)
+00577 | 
+00578 |     # Build wrapper with pre-computed position embeddings
+00579 |     wrapper = Qwen3VisionForExport(vision, grid_thw)
+00580 |     wrapper = wrapper.to(dtype).eval().cuda()
+00581 | 
+00582 |     # Input: only pixel_values (grid_thw is baked into pre-computed buffers)
+00583 |     # For batch_size > 1, scale num_patches by batch_size
+00584 |     pv_shape = captured_vit.pixel_values_shape
+00585 |     if batch_size > 1:
+00586 |         pv_shape = (pv_shape[0] * batch_size, pv_shape[1])
+00587 |     pixel_values = torch.randn(pv_shape, dtype=dtype, device="cuda")
+00588 | 
+00589 |     logger.info(f"  pixel_values: {pixel_values.shape} ({pixel_values.dtype})")
+00590 | 
+00591 |     precision_tag = "bf16" if use_bf16 else "fp32"
+00592 |     output_path = os.path.join(output_dir, f"vit_{precision_tag}.onnx")
+00593 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+00594 | 
+00595 |     output_names = ["image_embeds", "deepstack_features"]
+00596 | 
+00597 |     logger.info(f"  Exporting to {output_path}...")
+00598 |     with torch.inference_mode():
+00599 |         torch.onnx.export(
+00600 |             wrapper,
+00601 |             (pixel_values,),
+00602 |             output_path,
+00603 |             input_names=["pixel_values"],
+00604 |             output_names=output_names,
+00605 |             opset_version=19,
+00606 |             do_constant_folding=True,
+00607 |             export_params=True,
+00608 |             dynamo=False,
+00609 |         )
+00610 | 
+00611 |     logger.info("  ViT exported successfully!")
+00612 |     _consolidate_external_data(output_path)
+00613 |     verify_onnx_export(output_path)
+00614 | 
+00615 |     # ORT verification: compare ONNX output against PyTorch wrapper
+00616 |     # Must run BEFORE restoring attention, since wrapper uses patched attention
+00617 |     verify_onnx_with_ort(
+00618 |         onnx_path=output_path,
+00619 |         pytorch_module=wrapper,
+00620 |         sample_inputs={"pixel_values": pixel_values},
+00621 |         output_names=output_names,
+00622 |         label="ViT",
+00623 |     )
+00624 | 
+00625 |     # Restore original attention
+00626 |     _restore_vision_attention(vision, originals)
+00627 | 
+00628 |     return output_path
+00629 | 
+00630 | 
+00631 | # ============================================================
+00632 | # LLM Export: Qwen3-VL Text Model with Deepstack
+00633 | # ============================================================
+00634 | 
+00635 | 
+00636 | def export_llm_to_onnx(policy, captured_llm, output_dir, use_bf16=True, batch_size=1):
+00637 |     """Export the Qwen3-VL text model (LLM) to ONNX.
+00638 | 
+00639 |     The LLM receives inputs_embeds (with vision tokens already scattered in),
+00640 |     pre-computed 3D position_ids, and deepstack visual embeddings. Position ID
+00641 |     computation (get_rope_index) stays in PyTorch at runtime — only the
+00642 |     transformer layers are exported to ONNX/TRT.
+00643 | 
+00644 |     Deepstack injection is handled inside the wrapper: visual features are added
+00645 |     to hidden states at the first N layers (N = number of deepstack features,
+00646 |     typically 3) at positions indicated by visual_pos_masks.
+00647 | 
+00648 |     Input:
+00649 |         inputs_embeds:  [B, seq_len, hidden_size]
+00650 |         attention_mask: [B, seq_len]  (int64, 1=attend, 0=pad)
+00651 |         position_ids:   [3, B, seq_len]  (temporal, height, width for 3D RoPE)
+00652 |         visual_pos_masks: [B, seq_len]  (bool, True at visual token positions)
+00653 |         deepstack_0:    [num_vis_tokens, hidden_size]  (deepstack feature for layer 0)
+00654 |         deepstack_1:    [num_vis_tokens, hidden_size]  (deepstack feature for layer 1)
+00655 |         deepstack_2:    [num_vis_tokens, hidden_size]  (deepstack feature for layer 2)
+00656 |     Output:
+00657 |         embeddings: [B, seq_len, hidden_size]
+00658 |     """
+00659 |     logger.info("\n" + "=" * 80)
+00660 |     logger.info("Exporting LLM (Qwen3-VL Text Model) to ONNX")
+00661 |     logger.info("=" * 80)
+00662 | 
+00663 |     backbone = policy.model.backbone
+00664 |     qwen_model = backbone.model  # Qwen3VLForConditionalGeneration
+00665 |     inner_model = qwen_model.model  # Qwen3VLModel
+00666 |     text_model = inner_model.language_model  # Qwen3VLTextModel
+00667 |     select_layer = backbone.select_layer
+00668 | 
+00669 |     # Get text config and create eager-attention copy
+00670 |     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRotaryEmbedding
+00671 | 
+00672 |     text_config = copy.deepcopy(text_model.config)
+00673 |     text_config._attn_implementation = "eager"
+00674 |     text_config.num_hidden_layers = select_layer
+00675 | 
+00676 |     logger.info(
+00677 |         f"  LLM config: hidden_size={text_config.hidden_size}, "
+00678 |         f"num_layers={text_config.num_hidden_layers}, "
+00679 |         f"attn_implementation={text_config._attn_implementation}"
+00680 |     )
+00681 | 
+00682 |     # Determine deepstack count
+00683 |     num_deepstack = 0
+00684 |     if captured_llm.deepstack_visual_embeds is not None:
+00685 |         num_deepstack = len(captured_llm.deepstack_visual_embeds)
+00686 |     logger.info(f"  Deepstack layers: {num_deepstack}")
+00687 | 
+00688 |     class LLMForExport(torch.nn.Module):
+00689 |         """ONNX-exportable wrapper for Qwen3-VL text model with deepstack.
+00690 | 
+00691 |         Key adaptations from the original Qwen3VLTextModel:
+00692 |         1. Eager attention (no flash) — avoids ONNX-incompatible flash attention
+00693 |         2. Simple causal mask — avoids COMPLEX128 ops from HuggingFace's mask
+00694 |         3. Deepstack injection via torch.where — avoids boolean indexing
+00695 |         4. Position IDs as explicit input — get_rope_index() stays in PyTorch
+00696 |         5. Deepstack features as separate tensor inputs (not a Python list)
+00697 |         """
+00698 | 
+00699 |         def __init__(self, config, n_deepstack):
+00700 |             super().__init__()
+00701 |             # Build fresh text model with eager attention
+00702 |             self.layers = nn.ModuleList(
+00703 |                 [
+00704 |                     # Import the decoder layer class
+00705 |                     __import__(
+00706 |                         "transformers.models.qwen3_vl.modeling_qwen3_vl",
+00707 |                         fromlist=["Qwen3VLTextDecoderLayer"],
+00708 |                     ).Qwen3VLTextDecoderLayer(config, layer_idx)
+00709 |                     for layer_idx in range(config.num_hidden_layers)
+00710 |                 ]
+00711 |             )
+00712 |             # NOTE: No final norm! Qwen3Backbone.forward returns
+00713 |             # hidden_states[-1] (pre-norm), not last_hidden_state (post-norm).
+00714 |             # The action head's VLLN handles normalization downstream.
+00715 |             self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
+00716 |             self.n_deepstack = n_deepstack
+00717 | 
+00718 |         def _simple_causal_mask(self, dtype, device, batch_size, seq_len, attention_mask):
+00719 |             """ONNX-compatible causal mask without complex type casts."""
+00720 |             mask_value = torch.finfo(dtype).min * 0.5
+00721 |             causal_mask = torch.triu(
+00722 |                 torch.full((seq_len, seq_len), mask_value, device=device, dtype=dtype),
+00723 |                 diagonal=1,
+00724 |             )
+00725 |             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+00726 | 
+00727 |             if attention_mask is not None and attention_mask.dim() == 2:
+00728 |                 padding_mask = attention_mask[:, None, None, :].to(dtype)
+00729 |                 padding_mask = (1.0 - padding_mask) * mask_value
+00730 |                 causal_mask = causal_mask + padding_mask
+00731 | 
+00732 |             return causal_mask
+00733 | 
+00734 |         def _deepstack_add(self, hidden_states, visual_pos_masks, visual_embeds):
+00735 |             """ONNX-friendly deepstack injection using torch.where.
+00736 | 
+00737 |             Original uses boolean indexing:
+00738 |                 hidden_states[visual_pos_masks, :] += visual_embeds
+00739 |             This is not ONNX-friendly. Instead we:
+00740 |             1. Build a full-size delta tensor (zeros except at visual positions)
+00741 |             2. Add it to hidden_states
+00742 |             """
+00743 |             # visual_pos_masks: [B, seq_len] bool
+00744 |             # visual_embeds: [num_vis_tokens, hidden_size]
+00745 |             # hidden_states: [B, seq_len, hidden_size]
+00746 |             B, S, H = hidden_states.shape
+00747 | 
+00748 |             # Scatter visual_embeds into a full [B, S, H] tensor at masked positions
+00749 |             mask_expanded = visual_pos_masks.unsqueeze(-1)  # [B, S, 1]
+00750 | 
+00751 |             # Build cumulative index for visual tokens per batch
+00752 |             # For single batch (B=1), this is straightforward
+00753 |             delta = torch.zeros_like(hidden_states)
+00754 |             # Use masked_scatter to place visual_embeds at the right positions
+00755 |             delta = delta.masked_scatter(mask_expanded.expand_as(delta), visual_embeds)
+00756 | 
+00757 |             hidden_states = hidden_states + delta
+00758 |             return hidden_states
+00759 | 
+00760 |         def forward(
+00761 |             self,
+00762 |             inputs_embeds,
+00763 |             attention_mask,
+00764 |             position_ids,
+00765 |             visual_pos_masks=None,
+00766 |             deepstack_0=None,
+00767 |             deepstack_1=None,
+00768 |             deepstack_2=None,
+00769 |         ):
+00770 |             batch_size, seq_len = inputs_embeds.shape[:2]
+00771 |             dtype = inputs_embeds.dtype
+00772 |             device = inputs_embeds.device
+00773 | 
+00774 |             # Build causal attention mask
+00775 |             attn_mask = self._simple_causal_mask(dtype, device, batch_size, seq_len, attention_mask)
+00776 | 
+00777 |             # Position IDs: [3, B, seq_len] → extract text_position_ids
+00778 |             text_position_ids = position_ids[0]  # [B, seq_len]
+00779 | 
+00780 |             # Cache position for rotary embeddings
+00781 |             cache_position = torch.arange(seq_len, device=device)
+00782 | 
+00783 |             hidden_states = inputs_embeds
+00784 | 
+00785 |             # Compute rotary position embeddings (shared across layers)
+00786 |             position_embeddings = self.rotary_emb(hidden_states, position_ids)
+00787 | 
+00788 |             # Collect deepstack features into indexable structure
+00789 |             deepstack_list = []
+00790 |             if deepstack_0 is not None:
+00791 |                 deepstack_list.append(deepstack_0)
+00792 |             if deepstack_1 is not None:
+00793 |                 deepstack_list.append(deepstack_1)
+00794 |             if deepstack_2 is not None:
+00795 |                 deepstack_list.append(deepstack_2)
+00796 | 
+00797 |             # Decoder layers
+00798 |             for layer_idx, decoder_layer in enumerate(self.layers):
+00799 |                 layer_outputs = decoder_layer(
+00800 |                     hidden_states,
+00801 |                     attention_mask=attn_mask,
+00802 |                     position_ids=text_position_ids,
+00803 |                     past_key_values=None,
+00804 |                     cache_position=cache_position,
+00805 |                     position_embeddings=position_embeddings,
+00806 |                 )
+00807 |                 hidden_states = layer_outputs
+00808 | 
+00809 |                 # Deepstack injection at first N layers
+00810 |                 if visual_pos_masks is not None and layer_idx < len(deepstack_list):
+00811 |                     hidden_states = self._deepstack_add(
+00812 |                         hidden_states, visual_pos_masks, deepstack_list[layer_idx]
+00813 |                     )
+00814 | 
+00815 |             # Return pre-norm hidden states (matching Qwen3Backbone.forward
+00816 |             # which uses hidden_states[-1], not last_hidden_state)
+00817 |             return hidden_states
+00818 | 
+00819 |     # Build wrapper and load weights
+00820 |     wrapper = LLMForExport(text_config, num_deepstack)
+00821 | 
+00822 |     # Copy weights from the existing truncated text model
+00823 |     # The text model has: embed_tokens, layers, norm, rotary_emb
+00824 |     # We only need layers, norm, rotary_emb (embed_tokens not used — we pass inputs_embeds)
+00825 |     src_state = text_model.state_dict()
+00826 |     dst_state = wrapper.state_dict()
+00827 |     loaded, skipped = 0, 0
+00828 |     for key in dst_state:
+00829 |         if key in src_state:
+00830 |             dst_state[key] = src_state[key]
+00831 |             loaded += 1
+00832 |         else:
+00833 |             skipped += 1
+00834 |             logger.warning(f"  Key not found in source: {key}")
+00835 |     wrapper.load_state_dict(dst_state)
+00836 |     logger.info(f"  Loaded {loaded} weight tensors, skipped {skipped}")
+00837 | 
+00838 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+00839 |     wrapper = wrapper.to(dtype).eval().cuda()
+00840 | 
+00841 |     # Create dummy inputs from captured shapes
+00842 |     seq_len = captured_llm.inputs_embeds.shape[1]
+00843 |     hidden_size = text_config.hidden_size
+00844 | 
+00845 |     inputs_embeds = torch.randn(batch_size, seq_len, hidden_size, dtype=dtype, device="cuda")
+00846 |     attention_mask = torch.ones(batch_size, seq_len, dtype=torch.int64, device="cuda")
+00847 |     position_ids = torch.zeros(3, batch_size, seq_len, dtype=torch.int64, device="cuda")
+00848 | 
+00849 |     export_inputs = [inputs_embeds, attention_mask, position_ids]
+00850 |     input_names = ["inputs_embeds", "attention_mask", "position_ids"]
+00851 |     # seq_len varies with tokenized input length — must be dynamic for TRT profile
+00852 |     llm_dynamic_axes = {
+00853 |         "inputs_embeds": {1: "seq_len"},
+00854 |         "attention_mask": {1: "seq_len"},
+00855 |         "position_ids": {2: "seq_len"},
+00856 |         "embeddings": {1: "seq_len"},
+00857 |     }
+00858 | 
+00859 |     if num_deepstack > 0 and captured_llm.visual_pos_masks is not None:
+00860 |         # Use actual captured mask so masked_scatter sizes match deepstack
+00861 |         vis_mask = captured_llm.visual_pos_masks.to(device="cuda")
+00862 |         if vis_mask.shape[0] == 1 and batch_size > 1:
+00863 |             vis_mask = vis_mask.expand(batch_size, -1)
+00864 |         export_inputs.append(vis_mask)
+00865 |         input_names.append("visual_pos_masks")
+00866 |         llm_dynamic_axes["visual_pos_masks"] = {1: "seq_len"}
+00867 | 
+00868 |         for i in range(num_deepstack):
+00869 |             ds = captured_llm.deepstack_visual_embeds[i]
+00870 |             # deepstack is [num_vis_tokens, hidden_size] — no batch dim.
+00871 |             # masked_scatter fills all B*num_vis_tokens positions, so repeat for batch_size > 1.
+00872 |             if batch_size > 1:
+00873 |                 ds_dummy = torch.randn(
+00874 |                     batch_size * ds.shape[0], ds.shape[1], dtype=dtype, device="cuda"
+00875 |                 )
+00876 |             else:
+00877 |                 ds_dummy = torch.randn_like(ds, dtype=dtype, device="cuda")
+00878 |             export_inputs.append(ds_dummy)
+00879 |             name = f"deepstack_{i}"
+00880 |             input_names.append(name)
+00881 | 
+00882 |     logger.info("  Export input shapes:")
+00883 |     for name, tensor in zip(input_names, export_inputs):
+00884 |         logger.info(f"    {name}: {tensor.shape} ({tensor.dtype})")
+00885 | 
+00886 |     precision_tag = "bf16" if use_bf16 else "fp32"
+00887 |     output_path = os.path.join(output_dir, f"llm_{precision_tag}.onnx")
+00888 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+00889 | 
+00890 |     logger.info(f"  Exporting to {output_path}...")
+00891 |     with torch.inference_mode():
+00892 |         torch.onnx.export(
+00893 |             wrapper,
+00894 |             tuple(export_inputs),
+00895 |             output_path,
+00896 |             input_names=input_names,
+00897 |             output_names=["embeddings"],
+00898 |             opset_version=19,
+00899 |             do_constant_folding=True,
+00900 |             dynamic_axes=llm_dynamic_axes,
+00901 |             export_params=True,
+00902 |             dynamo=False,
+00903 |         )
+00904 | 
+00905 |     logger.info("  LLM exported successfully!")
+00906 |     _consolidate_external_data(output_path)
+00907 |     verify_onnx_export(output_path)
+00908 |     return output_path
+00909 | 
+00910 | 
+00911 | # ============================================================
+00912 | # Observation Helpers
+00913 | # ============================================================
+00914 | 
+00915 | 
+00916 | def prepare_observation(policy, dataset, traj_idx=0):
+00917 |     """Prepare a single observation for inference."""
+00918 |     logger.info(f"\nPreparing observation from trajectory {traj_idx}...")
+00919 | 
+00920 |     traj = dataset[traj_idx]
+00921 |     modality_configs = policy.get_modality_config()
+00922 | 
+00923 |     if getattr(policy.model.config, "model_type", None) == "Gr00tN1d7A2A":
+00924 |         bounds = compute_a2a_window_bounds(len(traj), modality_configs)
+00925 |         if bounds.num_steps <= 0:
+00926 |             raise ValueError(
+00927 |                 f"Episode {traj_idx} has no complete A2A history/future window"
+00928 |             )
+00929 |         data_point = extract_a2a_step_data(
+00930 |             traj,
+00931 |             bounds.valid_start,
+00932 |             modality_configs=modality_configs,
+00933 |             embodiment_tag=policy.embodiment_tag,
+00934 |         )
+00935 |     else:
+00936 |         data_point = extract_step_data(
+00937 |             traj,
+00938 |             0,
+00939 |             modality_configs=modality_configs,
+00940 |             embodiment_tag=policy.embodiment_tag,
+00941 |         )
+00942 | 
+00943 |     observation = {}
+00944 |     for key, value in data_point.states.items():
+00945 |         observation[f"state.{key}"] = value
+00946 |     for key, value in data_point.images.items():
+00947 |         observation[f"video.{key}"] = np.array(value)
+00948 |     for key in modality_configs["language"].modality_keys:
+00949 |         observation[key] = data_point.text
+00950 | 
+00951 |     parsed_obs = parse_observation_gr00t(observation, modality_configs)
+00952 |     logger.info("  Observation prepared")
+00953 |     return parsed_obs
+00954 | 
+00955 | 
+00956 | # ============================================================
+00957 | # Export Functions: VL Self-Attention
+00958 | # ============================================================
+00959 | 
+00960 | 
+00961 | def export_vl_self_attention_to_onnx(policy, output_dir, vl_seq_len, use_bf16=True, batch_size=1):
+00962 |     """Export the vl_self_attention (SelfAttentionTransformer) to ONNX.
+00963 | 
+00964 |     This module sits between VLLN and the DiT, transforming backbone
+00965 |     embeddings. If the model has no vl_self_attention (nn.Identity), skip.
+00966 | 
+00967 |     Input: hidden_states [B, T, backbone_embedding_dim]  (T is dynamic)
+00968 |     Output: hidden_states [B, T, backbone_embedding_dim]
+00969 |     """
+00970 |     vl_sa = policy.model.action_head.vl_self_attention
+00971 |     if isinstance(vl_sa, nn.Identity):
+00972 |         logger.info("  vl_self_attention is Identity — skipping export")
+00973 |         return None
+00974 | 
+00975 |     logger.info("\n" + "=" * 80)
+00976 |     logger.info("Exporting VL Self-Attention to ONNX")
+00977 |     logger.info("=" * 80)
+00978 | 
+00979 |     config = policy.model.action_head.config
+00980 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+00981 |     model = vl_sa.to(dtype).eval().cuda()
+00982 | 
+00983 |     hidden_states = torch.randn(
+00984 |         batch_size, vl_seq_len, config.backbone_embedding_dim, dtype=dtype, device="cuda"
+00985 |     )
+00986 |     logger.info(f"  hidden_states: {hidden_states.shape} ({hidden_states.dtype})")
+00987 | 
+00988 |     output_path = os.path.join(output_dir, "vl_self_attention.onnx")
+00989 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+00990 | 
+00991 |     logger.info(f"  Exporting to {output_path}...")
+00992 |     with torch.inference_mode():
+00993 |         torch.onnx.export(
+00994 |             model,
+00995 |             (hidden_states,),
+00996 |             output_path,
+00997 |             input_names=["hidden_states"],
+00998 |             output_names=["output"],
+00999 |             dynamic_axes={
+01000 |                 "hidden_states": {1: "seq_len"},
+01001 |                 "output": {1: "seq_len"},
+01002 |             },
+01003 |             opset_version=19,
+01004 |             do_constant_folding=True,
+01005 |             dynamo=False,
+01006 |         )
+01007 | 
+01008 |     logger.info("  VL Self-Attention exported successfully!")
+01009 |     verify_onnx_export(output_path)
+01010 |     return output_path
+01011 | 
+01012 | 
+01013 | # ============================================================
+01014 | # Export Functions: State Encoder
+01015 | # ============================================================
+01016 | 
+01017 | 
+01018 | def export_state_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1):
+01019 |     """Export the state encoder (CategorySpecificMLP) to ONNX.
+01020 | 
+01021 |     N1.7 change: input_dim = max_state_dim * state_history_length.
+01022 |     The state is reshaped from [B, state_history_length, max_state_dim]
+01023 |     to [B, 1, state_history_length * max_state_dim] before encoding.
+01024 | 
+01025 |     Input: state [B, 1, max_state_dim * state_history_length], embodiment_id [B]
+01026 |     Output: [B, 1, input_embedding_dim]
+01027 |     """
+01028 |     logger.info("\n" + "=" * 80)
+01029 |     logger.info("Exporting State Encoder to ONNX")
+01030 |     logger.info("=" * 80)
+01031 | 
+01032 |     config = policy.model.action_head.config
+01033 |     state_encoder = policy.model.action_head.state_encoder
+01034 | 
+01035 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+01036 |     model = state_encoder.to(dtype).eval().cuda()
+01037 | 
+01038 |     # N1.7: state is flattened to [B, 1, max_state_dim * state_history_length]
+01039 |     state_input_dim = config.max_state_dim * config.state_history_length
+01040 |     state = torch.randn(batch_size, 1, state_input_dim, dtype=dtype, device="cuda")
+01041 |     embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+01042 | 
+01043 |     logger.info(f"  state: {state.shape} ({state.dtype})")
+01044 |     logger.info(f"  embodiment_id: {embodiment_id.shape} ({embodiment_id.dtype})")
+01045 |     logger.info(
+01046 |         f"  (max_state_dim={config.max_state_dim}, "
+01047 |         f"state_history_length={config.state_history_length})"
+01048 |     )
+01049 | 
+01050 |     output_path = os.path.join(output_dir, "state_encoder.onnx")
+01051 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+01052 | 
+01053 |     logger.info(f"  Exporting to {output_path}...")
+01054 |     with torch.inference_mode():
+01055 |         torch.onnx.export(
+01056 |             model,
+01057 |             (state, embodiment_id),
+01058 |             output_path,
+01059 |             input_names=["state", "embodiment_id"],
+01060 |             output_names=["output"],
+01061 |             opset_version=19,
+01062 |             do_constant_folding=True,
+01063 |             # torch 2.9 flipped torch.onnx.export's dynamo default to True, but the
+01064 |             # dynamo graph for the state/action encoder + action decoder fuses into a
+01065 |             # Myelin ForeignNode (Unsqueeze...add) that TRT 10.15's NVRTC backend can't
+01066 |             # compile at bs=2 on Blackwell. Pin the legacy exporter for these three
+01067 |             # (ViT/LLM/VL-SA stay on dynamo — legacy can't export Qwen3VL memory_format).
+01068 |             dynamo=False,
+01069 |         )
+01070 | 
+01071 |     logger.info("  State Encoder exported successfully!")
+01072 |     verify_onnx_export(output_path)
+01073 |     return output_path
+01074 | 
+01075 | 
+01076 | # ============================================================
+01077 | # Export Functions: Action Encoder
+01078 | # ============================================================
+01079 | 
+01080 | 
+01081 | def export_action_encoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1):
+01082 |     """Export the action encoder (MultiEmbodimentActionEncoder) to ONNX.
+01083 | 
+01084 |     Input: actions [B, action_horizon, max_action_dim], timesteps [B], embodiment_id [B]
+01085 |     Output: [B, action_horizon, input_embedding_dim]
+01086 |     """
+01087 |     logger.info("\n" + "=" * 80)
+01088 |     logger.info("Exporting Action Encoder to ONNX")
+01089 |     logger.info("=" * 80)
+01090 | 
+01091 |     config = policy.model.action_head.config
+01092 |     action_encoder = policy.model.action_head.action_encoder
+01093 | 
+01094 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+01095 |     model = action_encoder.to(dtype).eval().cuda()
+01096 | 
+01097 |     actions = torch.randn(
+01098 |         batch_size, config.action_horizon, config.max_action_dim, dtype=dtype, device="cuda"
+01099 |     )
+01100 |     timesteps = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+01101 |     embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+01102 | 
+01103 |     logger.info(f"  actions: {actions.shape} ({actions.dtype})")
+01104 |     logger.info(f"  timesteps: {timesteps.shape} ({timesteps.dtype})")
+01105 |     logger.info(f"  embodiment_id: {embodiment_id.shape} ({embodiment_id.dtype})")
+01106 | 
+01107 |     output_path = os.path.join(output_dir, "action_encoder.onnx")
+01108 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+01109 | 
+01110 |     logger.info(f"  Exporting to {output_path}...")
+01111 |     with torch.inference_mode():
+01112 |         torch.onnx.export(
+01113 |             model,
+01114 |             (actions, timesteps, embodiment_id),
+01115 |             output_path,
+01116 |             input_names=["actions", "timesteps", "embodiment_id"],
+01117 |             output_names=["output"],
+01118 |             opset_version=19,
+01119 |             do_constant_folding=True,
+01120 |             dynamo=False,
+01121 |         )
+01122 | 
+01123 |     logger.info("  Action Encoder exported successfully!")
+01124 |     verify_onnx_export(output_path)
+01125 |     return output_path
+01126 | 
+01127 | 
+01128 | # ============================================================
+01129 | # Export Functions: DiT
+01130 | # ============================================================
+01131 | 
+01132 | 
+01133 | def export_dit_to_onnx(policy, captured_inputs, output_path, use_bf16=True, batch_size=1):
+01134 |     """Export the DiT (AlternateVLDiT) to ONNX.
+01135 | 
+01136 |     N1.7: image_mask and backbone_attention_mask are always present
+01137 |     (from Qwen3Backbone output).
+01138 | 
+01139 |     Input: sa_embs [B, sa_seq_len, input_embedding_dim],
+01140 |            vl_embs [B, vl_seq_len, backbone_embedding_dim],
+01141 |            timestep [B], image_mask [B, vl_seq_len],
+01142 |            backbone_attention_mask [B, vl_seq_len]
+01143 |     Output: [B, sa_seq_len, hidden_size]
+01144 |     """
+01145 |     logger.info("\n" + "=" * 80)
+01146 |     logger.info("Exporting DiT to ONNX")
+01147 |     logger.info("=" * 80)
+01148 | 
+01149 |     dit_model = policy.model.action_head.model
+01150 |     dit_model.eval()
+01151 | 
+01152 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+01153 |     dit_model = dit_model.to(dtype).cuda()
+01154 | 
+01155 |     # Use captured shapes but replace batch dim (index 0) with batch_size
+01156 |     sa_shape = (batch_size,) + captured_inputs.sa_embs.shape[1:]
+01157 |     vl_shape = (batch_size,) + captured_inputs.vl_embs.shape[1:]
+01158 |     ts_shape = (batch_size,)
+01159 | 
+01160 |     sa_embs = torch.randn(sa_shape, dtype=dtype, device="cuda")
+01161 |     vl_embs = torch.randn(vl_shape, dtype=dtype, device="cuda")
+01162 |     timestep = torch.ones(ts_shape, dtype=torch.int64, device="cuda")
+01163 | 
+01164 |     export_inputs = [sa_embs, vl_embs, timestep]
+01165 |     input_names = ["sa_embs", "vl_embs", "timestep"]
+01166 |     has_image_mask = captured_inputs.image_mask is not None
+01167 |     has_backbone_mask = captured_inputs.backbone_attention_mask is not None
+01168 | 
+01169 |     if has_image_mask:
+01170 |         im_shape = (batch_size,) + captured_inputs.image_mask.shape[1:]
+01171 |         image_mask = torch.ones(im_shape, dtype=torch.bool, device="cuda")
+01172 |         export_inputs.append(image_mask)
+01173 |         input_names.append("image_mask")
+01174 | 
+01175 |     if has_backbone_mask:
+01176 |         bm_shape = (batch_size,) + captured_inputs.backbone_attention_mask.shape[1:]
+01177 |         backbone_attention_mask = torch.ones(bm_shape, dtype=torch.bool, device="cuda")
+01178 |         export_inputs.append(backbone_attention_mask)
+01179 |         input_names.append("backbone_attention_mask")
+01180 | 
+01181 |     logger.info("  Export input shapes:")
+01182 |     for name, tensor in zip(input_names, export_inputs):
+01183 |         logger.info(f"    {name}: {tensor.shape} ({tensor.dtype})")
+01184 | 
+01185 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+01186 | 
+01187 |     # Export to ONNX. Keep the legacy exporter explicit: the dynamo exporter
+01188 |     # specializes vl_seq_len here, which breaks the dynamic TensorRT profile.
+01189 |     logger.info(f"Exporting to {output_path} with legacy ONNX exporter...")
+01190 | 
+01191 |     # Create a wrapper to handle keyword arguments
+01192 |     # torch.onnx.export uses positional args: `dit.forward(arg1, arg2...)`
+01193 |     # DiT module uses keyword args: `dit.forward(hidden_states=....)`
+01194 |     # The DiTWrapper handles this translation
+01195 |     # Wrapper to convert positional args -> keyword args for DiT
+01196 |     class DiTWrapper(torch.nn.Module):
+01197 |         def __init__(self, dit, use_image_mask, use_backbone_mask):
+01198 |             super().__init__()
+01199 |             self.dit = dit
+01200 |             self.use_image_mask = use_image_mask
+01201 |             self.use_backbone_mask = use_backbone_mask
+01202 | 
+01203 |         def forward(
+01204 |             self, sa_embs, vl_embs, timestep, image_mask=None, backbone_attention_mask=None
+01205 |         ):
+01206 |             kwargs = {}
+01207 |             if self.use_image_mask and image_mask is not None:
+01208 |                 kwargs["image_mask"] = image_mask
+01209 |             if self.use_backbone_mask and backbone_attention_mask is not None:
+01210 |                 kwargs["backbone_attention_mask"] = backbone_attention_mask
+01211 |             return self.dit(sa_embs, vl_embs, timestep, **kwargs)
+01212 | 
+01213 |     wrapped_model = DiTWrapper(dit_model, has_image_mask, has_backbone_mask)
+01214 |     wrapped_model.eval()
+01215 | 
+01216 |     # vl_seq_len varies with input text length — mark it dynamic so the TRT engine
+01217 |     # can handle any sequence length seen at runtime, not just the export-time value.
+01218 |     dit_dynamic_axes = {
+01219 |         "vl_embs": {1: "vl_seq_len"},
+01220 |     }
+01221 |     if has_image_mask:
+01222 |         dit_dynamic_axes["image_mask"] = {1: "vl_seq_len"}
+01223 |     if has_backbone_mask:
+01224 |         dit_dynamic_axes["backbone_attention_mask"] = {1: "vl_seq_len"}
+01225 | 
+01226 |     logger.info(f"  Exporting to {output_path}...")
+01227 |     with torch.inference_mode():
+01228 |         torch.onnx.export(
+01229 |             wrapped_model,
+01230 |             tuple(export_inputs),
+01231 |             output_path,
+01232 |             input_names=input_names,
+01233 |             output_names=["output"],
+01234 |             opset_version=19,
+01235 |             do_constant_folding=True,
+01236 |             export_params=True,
+01237 |             dynamic_axes=dit_dynamic_axes,
+01238 |             dynamo=False,  # DiT specializes vl_seq_len under dynamo; legacy exporter needed
+01239 |         )
+01240 | 
+01241 |     logger.info("  DiT exported successfully!")
+01242 | 
+01243 |     # Consolidate scattered external data files into a single .data file.
+01244 |     # torch.onnx.export scatters large tensors into many small files (one per tensor).
+01245 |     # TensorRT's parser expects external data in a single file adjacent to the .onnx.
+01246 |     _consolidate_external_data(output_path)
+01247 | 
+01248 |     verify_onnx_export(output_path)
+01249 |     return output_path
+01250 | 
+01251 | 
+01252 | # ============================================================
+01253 | # Export Functions: Action Decoder
+01254 | # ============================================================
+01255 | 
+01256 | 
+01257 | def export_action_decoder_to_onnx(policy, output_dir, use_bf16=True, batch_size=1):
+01258 |     """Export the action decoder (CategorySpecificMLP) to ONNX.
+01259 | 
+01260 |     Input: model_output [B, sa_seq_len, hidden_size], embodiment_id [B]
+01261 |     Output: [B, sa_seq_len, max_action_dim]
+01262 |     """
+01263 |     logger.info("\n" + "=" * 80)
+01264 |     logger.info("Exporting Action Decoder to ONNX")
+01265 |     logger.info("=" * 80)
+01266 | 
+01267 |     config = policy.model.action_head.config
+01268 |     action_decoder = policy.model.action_head.action_decoder
+01269 | 
+01270 |     dtype = torch.bfloat16 if use_bf16 else torch.float32
+01271 |     model = action_decoder.to(dtype).eval().cuda()
+01272 | 
+01273 |     # sa_seq_len = 1 (state) + action_horizon
+01274 |     sa_seq_len = 1 + config.action_horizon
+01275 |     model_output = torch.randn(
+01276 |         batch_size, sa_seq_len, config.hidden_size, dtype=dtype, device="cuda"
+01277 |     )
+01278 |     embodiment_id = torch.zeros(batch_size, dtype=torch.int64, device="cuda")
+01279 | 
+01280 |     logger.info(f"  model_output: {model_output.shape} ({model_output.dtype})")
+01281 |     logger.info(f"  embodiment_id: {embodiment_id.shape} ({embodiment_id.dtype})")
+01282 | 
+01283 |     output_path = os.path.join(output_dir, "action_decoder.onnx")
+01284 |     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+01285 | 
+01286 |     logger.info(f"  Exporting to {output_path}...")
+01287 |     with torch.inference_mode():
+01288 |         torch.onnx.export(
+01289 |             model,
+01290 |             (model_output, embodiment_id),
+01291 |             output_path,
+01292 |             input_names=["model_output", "embodiment_id"],
+01293 |             output_names=["output"],
+01294 |             opset_version=19,
+01295 |             do_constant_folding=True,
+01296 |             dynamo=False,
+01297 |         )
+01298 | 
+01299 |     logger.info("  Action Decoder exported successfully!")
+01300 |     verify_onnx_export(output_path)
+01301 |     return output_path
+01302 | 
+01303 | 
+01304 | # ============================================================
+01305 | # Main
+01306 | # ============================================================
+01307 | 
+01308 | 
+01309 | def main(args):
+01310 |     args.embodiment_tag = EmbodimentTag.resolve(args.embodiment_tag)
+01311 |     logger.info("=" * 80)
+01312 |     logger.info("GR00T N1.7 ONNX Export Script")
+01313 |     logger.info("=" * 80)
+01314 |     logger.info(f"Model path: {args.model_path}")
+01315 |     logger.info(f"Dataset path: {args.dataset_path}")
+01316 |     logger.info(f"Embodiment: {args.embodiment_tag}")
+01317 |     logger.info(f"Export mode: {args.export_mode}")
+01318 |     logger.info(f"Batch size: {args.batch_size}")
+01319 |     logger.info(f"Output directory: {args.output_dir}")
+01320 |     logger.info("=" * 80)
+01321 | 
+01322 |     # Step 1: Load the policy
+01323 |     logger.info("\n[Step 1] Loading policy...")
+01324 |     policy = Gr00tPolicy(
+01325 |         embodiment_tag=args.embodiment_tag,
+01326 |         model_path=args.model_path,
+01327 |         device="cuda",
+01328 |     )
+01329 |     logger.info("  Policy loaded")
+01330 | 
+01331 |     # Step 2: Load dataset
+01332 |     logger.info("\n[Step 2] Loading dataset...")
+01333 |     dataset = LeRobotEpisodeLoader(
+01334 |         dataset_path=args.dataset_path,
+01335 |         modality_configs=policy.get_modality_config(),
+01336 |     )
+01337 |     logger.info(f"  Dataset loaded ({len(dataset)} trajectories)")
+01338 | 
+01339 |     # Step 3: Capture inputs via hooks
+01340 |     logger.info("\n[Step 3] Capturing model inputs from actual inference...")
+01341 | 
+01342 |     dit_capture = DiTInputCapture()
+01343 |     dit_hook = policy.model.action_head.model.register_forward_pre_hook(
+01344 |         dit_capture.hook_fn, with_kwargs=True
+01345 |     )
+01346 | 
+01347 |     # Also capture ViT and LLM inputs if doing full_pipeline
+01348 |     vit_capture = None
+01349 |     vit_hook = None
+01350 |     llm_capture = None
+01351 |     llm_hook = None
+01352 |     if args.export_mode == "full_pipeline":
+01353 |         vit_capture = ViTInputCapture()
+01354 |         qwen_model = policy.model.backbone.model
+01355 |         vit_hook = qwen_model.model.visual.register_forward_hook(
+01356 |             vit_capture.hook_fn, with_kwargs=True
+01357 |         )
+01358 | 
+01359 |         llm_capture = LLMInputCapture()
+01360 |         llm_hook = qwen_model.model.language_model.register_forward_pre_hook(
+01361 |             llm_capture.hook_fn, with_kwargs=True
+01362 |         )
+01363 | 
+01364 |     observation = prepare_observation(policy, dataset, traj_idx=0)
+01365 |     logger.info("  Running inference to capture shapes...")
+01366 |     with torch.inference_mode():
+01367 |         _ = policy.get_action(observation)
+01368 | 
+01369 |     dit_hook.remove()
+01370 |     if vit_hook is not None:
+01371 |         vit_hook.remove()
+01372 |     if llm_hook is not None:
+01373 |         llm_hook.remove()
+01374 | 
+01375 |     if not dit_capture.captured:
+01376 |         logger.error("  Failed to capture DiT inputs!")
+01377 |         return
+01378 |     if args.export_mode == "full_pipeline" and not vit_capture.captured:
+01379 |         logger.error("  Failed to capture ViT inputs!")
+01380 |         return
+01381 |     if args.export_mode == "full_pipeline" and not llm_capture.captured:
+01382 |         logger.error("  Failed to capture LLM inputs!")
+01383 |         return
+01384 | 
+01385 |     # Derive metadata
+01386 |     action_head_config = policy.model.action_head.config
+01387 |     sa_seq_len = 1 + action_head_config.action_horizon
+01388 |     vl_seq_len = dit_capture.vl_embs.shape[1]
+01389 | 
+01390 |     # Save export metadata
+01391 |     num_patches = vit_capture.pixel_values_shape[0] if vit_capture and vit_capture.captured else 256
+01392 |     num_merged_patches = vit_capture.output_shape[0] if vit_capture and vit_capture.captured else 64
+01393 |     # LLM metadata
+01394 |     llm_seq_len = (
+01395 |         llm_capture.inputs_embeds.shape[1] if llm_capture and llm_capture.captured else vl_seq_len
+01396 |     )
+01397 |     llm_hidden_size = (
+01398 |         llm_capture.inputs_embeds.shape[2] if llm_capture and llm_capture.captured else 0
+01399 |     )
+01400 |     num_deepstack = (
+01401 |         len(llm_capture.deepstack_visual_embeds)
+01402 |         if (llm_capture and llm_capture.deepstack_visual_embeds)
+01403 |         else 0
+01404 |     )
+01405 |     num_vis_tokens = llm_capture.deepstack_visual_embeds[0].shape[0] if num_deepstack > 0 else 0
+01406 | 
+01407 |     export_metadata = {
+01408 |         "schema_version": EXPORT_METADATA_SCHEMA_VERSION,
+01409 |         "model_version": "n1d7",
+01410 |         "sa_seq_len": int(sa_seq_len),
+01411 |         "vl_seq_len": int(vl_seq_len),
+01412 |         "llm_seq_len": int(llm_seq_len),
+01413 |         "llm_hidden_size": int(llm_hidden_size),
+01414 |         "num_deepstack": int(num_deepstack),
+01415 |         "num_vis_tokens": int(num_vis_tokens),
+01416 |         "num_patches": int(num_patches),  # ViT input seq length
+01417 |         "num_merged_patches": int(num_merged_patches),  # ViT output after merger
+01418 |         "action_horizon": int(action_head_config.action_horizon),
+01419 |         "max_action_dim": int(action_head_config.max_action_dim),
+01420 |         "max_state_dim": int(action_head_config.max_state_dim),
+01421 |         "state_history_length": int(action_head_config.state_history_length),
+01422 |         "hidden_size": int(action_head_config.hidden_size),
+01423 |         "input_embedding_dim": int(action_head_config.input_embedding_dim),
+01424 |         "backbone_embedding_dim": int(action_head_config.backbone_embedding_dim),
+01425 |         "embodiment_tag": str(args.embodiment_tag),
+01426 |         "export_mode": args.export_mode,
+01427 |         "precision": args.precision,
+01428 |         "batch_size": args.batch_size,
+01429 |     }
+01430 |     # The ViT engine bakes pos/rotary buffers for this grid_thw and takes only
+01431 |     # pixel_values as input; record the grid so the runtime can reject a
+01432 |     # mismatched image config instead of silently using wrong embeddings.
+01433 |     if vit_capture is not None and vit_capture.captured:
+01434 |         export_metadata["vit_grid_thw"] = [
+01435 |             [int(x) for x in row] for row in vit_capture.grid_thw.tolist()
+01436 |         ]
+01437 |     os.makedirs(args.output_dir, exist_ok=True)
+01438 |     metadata_path = os.path.join(args.output_dir, "export_metadata.json")
+01439 |     with open(metadata_path, "w") as f:
+01440 |         json.dump(export_metadata, f, indent=2)
+01441 |     logger.info(f"  Saved export metadata to {metadata_path}")
+01442 | 
+01443 |     # Step 4: Export
+01444 |     bs = args.batch_size
+01445 |     if args.export_mode == "dit_only":
+01446 |         logger.info("\n[Step 4] Exporting DiT to ONNX (dit_only mode)...")
+01447 |         dit_output_path = os.path.join(args.output_dir, "dit_bf16.onnx")
+01448 |         export_dit_to_onnx(
+01449 |             policy=policy,
+01450 |             captured_inputs=dit_capture,
+01451 |             output_path=dit_output_path,
+01452 |             use_bf16=True,
+01453 |             batch_size=bs,
+01454 |         )
+01455 | 
+01456 |     elif args.export_mode == "action_head":
+01457 |         logger.info("\n[Step 4] Exporting action head components to ONNX...")
+01458 | 
+01459 |         # 4a. State Encoder
+01460 |         logger.info("\n--- [4a] State Encoder ---")
+01461 |         export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+01462 | 
+01463 |         # 4b. Action Encoder
+01464 |         logger.info("\n--- [4b] Action Encoder ---")
+01465 |         export_action_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+01466 | 
+01467 |         # 4c. DiT
+01468 |         logger.info("\n--- [4c] DiT ---")
+01469 |         dit_output_path = os.path.join(args.output_dir, "dit_bf16.onnx")
+01470 |         export_dit_to_onnx(
+01471 |             policy=policy,
+01472 |             captured_inputs=dit_capture,
+01473 |             output_path=dit_output_path,
+01474 |             use_bf16=True,
+01475 |             batch_size=bs,
+01476 |         )
+01477 | 
+01478 |         # 4d. Action Decoder
+01479 |         logger.info("\n--- [4d] Action Decoder ---")
+01480 |         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+01481 | 
+01482 |     elif args.export_mode == "full_pipeline":
+01483 |         logger.info("\n[Step 4] Exporting full pipeline to ONNX...")
+01484 |         logger.info("  (ViT TRT + LLM TRT + Action Head TRT)")
+01485 | 
+01486 |         # 4a. ViT — exported in FP32 to avoid TRT BF16 kernel fusion accuracy issues
+01487 |         # ViT is patch-level: for batch_size > 1, num_patches scales by batch_size
+01488 |         logger.info("\n--- [4a] ViT (Qwen3-VL Vision, FP32 for TRT accuracy) ---")
+01489 |         export_vit_to_onnx(policy, args.output_dir, vit_capture, use_bf16=False, batch_size=bs)
+01490 | 
+01491 |         # 4b. LLM
+01492 |         logger.info("\n--- [4b] LLM (Qwen3-VL Text Model) ---")
+01493 |         export_llm_to_onnx(policy, llm_capture, args.output_dir, use_bf16=True, batch_size=bs)
+01494 | 
+01495 |         # 4c. VL Self-Attention (if present)
+01496 |         logger.info("\n--- [4c] VL Self-Attention ---")
+01497 |         export_vl_self_attention_to_onnx(
+01498 |             policy, args.output_dir, vl_seq_len=vl_seq_len, use_bf16=True, batch_size=bs
+01499 |         )
+01500 | 
+01501 |         # 4d. State Encoder
+01502 |         logger.info("\n--- [4d] State Encoder ---")
+01503 |         export_state_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+01504 | 
+01505 |         # 4e. Action Encoder
+01506 |         logger.info("\n--- [4e] Action Encoder ---")
+01507 |         export_action_encoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+01508 | 
+01509 |         # 4f. DiT
+01510 |         logger.info("\n--- [4f] DiT ---")
+01511 |         dit_output_path = os.path.join(args.output_dir, "dit_bf16.onnx")
+01512 |         export_dit_to_onnx(
+01513 |             policy=policy,
+01514 |             captured_inputs=dit_capture,
+01515 |             output_path=dit_output_path,
+01516 |             use_bf16=True,
+01517 |             batch_size=bs,
+01518 |         )
+01519 | 
+01520 |         # 4g. Action Decoder
+01521 |         logger.info("\n--- [4g] Action Decoder ---")
+01522 |         export_action_decoder_to_onnx(policy, args.output_dir, use_bf16=True, batch_size=bs)
+01523 | 
+01524 |     # Summary
+01525 |     logger.info("\n" + "=" * 80)
+01526 |     logger.info("EXPORT COMPLETE!")
+01527 |     logger.info("=" * 80)
+01528 |     logger.info(f"\nExported files in: {args.output_dir}")
+01529 | 
+01530 |     for f in sorted(os.listdir(args.output_dir)):
+01531 |         fpath = os.path.join(args.output_dir, f)
+01532 |         if os.path.isfile(fpath):
+01533 |             size_mb = os.path.getsize(fpath) / (1024 * 1024)
+01534 |             logger.info(f"  {f}: {size_mb:.2f} MB")
+01535 | 
+01536 | 
+01537 | @dataclass
+01538 | class ExportConfig:
+01539 |     """Configuration for exporting GR00T N1.7 model to ONNX."""
+01540 | 
+01541 |     model_path: str
+01542 |     """Path to the model checkpoint (required)."""
+01543 | 
+01544 |     dataset_path: str
+01545 |     """Path to the dataset (required, used to capture input shapes)."""
+01546 | 
+01547 |     embodiment_tag: Optional[EmbodimentTag] = None
+01548 |     """Embodiment tag. If not provided, auto-detected from model's processor_config.json."""
+01549 | 
+01550 |     output_dir: str = "./gr00t_trt_deployment/onnx"
+01551 |     """Output directory for ONNX models."""
+01552 | 
+01553 |     export_mode: ExportMode = ExportMode.dit_only
+01554 |     """Export mode: 'dit_only', 'action_head' (4 components), or 'full_pipeline' (ViT + action head)."""
+01555 | 
+01556 |     precision: Literal["bf16"] = "bf16"
+01557 |     """Export precision for the generated ONNX graph.
+01558 | 
+01559 |     Currently fixed to 'bf16': every Step 4 exporter passes a hardcoded
+01560 |     `use_bf16=` argument and does not read this field beyond writing it
+01561 |     into export_metadata.json. Re-introducing 'fp16'/'fp32'/'fp8' here
+01562 |     requires plumbing this field into each exporter first; until then
+01563 |     the Literal is narrowed so the CLI cannot accept a value the export
+01564 |     will ignore."""
+01565 | 
+01566 |     batch_size: int = 1
+01567 |     """Batch size baked into the exported ONNX models (default: 1)."""
+01568 | 
+01569 | 
+01570 | if __name__ == "__main__":
+01571 |     args = tyro.cli(ExportConfig)
+01572 |     if args.embodiment_tag is None:
+01573 |         # Auto-detect from model's processor_config.json
+01574 |         config_file = Path(args.model_path) / "processor_config.json"
+01575 |         if not config_file.exists():
+01576 |             raise ValueError(
+01577 |                 f"Cannot auto-detect embodiment_tag: {config_file} not found. "
+01578 |                 "Please provide --embodiment-tag explicitly."
+01579 |             )
+01580 |         with open(config_file, "r") as f:
+01581 |             processor_config = json.load(f)
+01582 |         modality_configs = processor_config.get("processor_kwargs", {}).get("modality_configs", {})
+01583 |         if len(modality_configs) == 0:
+01584 |             raise ValueError(
+01585 |                 "Cannot auto-detect embodiment_tag: no modality_configs found in processor_config.json. "
+01586 |                 "Please provide --embodiment-tag explicitly."
+01587 |             )
+01588 |         if len(modality_configs) == 1:
+01589 |             embodiment_key = next(iter(modality_configs))
+01590 |             args.embodiment_tag = EmbodimentTag.resolve(embodiment_key)
+01591 |             logger.info(
+01592 |                 f"Auto-detected embodiment tag: {args.embodiment_tag} (from {embodiment_key})"
+01593 |             )
+01594 |         else:
+01595 |             available = sorted(modality_configs.keys())
+01596 |             raise ValueError(
+01597 |                 f"Multiple embodiments found in processor_config.json: {available}. "
+01598 |                 "Please provide --embodiment-tag explicitly."
+01599 |             )
+01600 |     main(args)

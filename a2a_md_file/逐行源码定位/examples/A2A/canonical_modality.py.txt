@@ -1,0 +1,53 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Example modality registration for an already-canonical A2A dataset.
+00004 | 
+00005 | The dataset columns named below are placeholders. They must be produced by an
+00006 | offline, versioned robot/controller adapter; renaming raw controller deltas is
+00007 | not canonicalization.
+00008 | """
+00009 | 
+00010 | from gr00t.configs.data.embodiment_configs import register_modality_config
+00011 | from gr00t.data.embodiment_tags import EmbodimentTag
+00012 | from gr00t.data.types import (
+00013 |     ActionConfig,
+00014 |     ActionFormat,
+00015 |     ActionRepresentation,
+00016 |     ActionType,
+00017 |     ModalityConfig,
+00018 | )
+00019 | 
+00020 | 
+00021 | canonical_a2a_config = {
+00022 |     "video": ModalityConfig(delta_indices=[0], modality_keys=["front"]),
+00023 |     "state": ModalityConfig(
+00024 |         delta_indices=[0],
+00025 |         modality_keys=["eef_pose_canonical"],
+00026 |     ),
+00027 |     "action": ModalityConfig(
+00028 |         delta_indices=list(range(8)),
+00029 |         modality_keys=["eef_pose_canonical", "gripper_command"],
+00030 |         action_configs=[
+00031 |             ActionConfig(
+00032 |                 rep=ActionRepresentation.ABSOLUTE,
+00033 |                 type=ActionType.EEF,
+00034 |                 format=ActionFormat.XYZ_ROT6D,
+00035 |                 state_key="eef_pose_canonical",
+00036 |             ),
+00037 |             ActionConfig(
+00038 |                 rep=ActionRepresentation.ABSOLUTE,
+00039 |                 type=ActionType.NON_EEF,
+00040 |                 format=ActionFormat.DEFAULT,
+00041 |             ),
+00042 |         ],
+00043 |     ),
+00044 |     "language": ModalityConfig(
+00045 |         delta_indices=[0],
+00046 |         modality_keys=["annotation.human.task_description"],
+00047 |     ),
+00048 | }
+00049 | 
+00050 | register_modality_config(
+00051 |     canonical_a2a_config,
+00052 |     embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+00053 | )

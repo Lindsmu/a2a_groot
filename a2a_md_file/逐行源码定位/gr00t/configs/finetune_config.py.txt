@@ -1,0 +1,259 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | # Finetune config used for single node post-training.
+00017 | from dataclasses import dataclass
+00018 | import warnings
+00019 | 
+00020 | 
+00021 | @dataclass
+00022 | class FinetuneConfig:
+00023 |     """
+00024 |     Configuration for fine-tuning a Vision-Language-Action (VLA) model.
+00025 | 
+00026 |     This dataclass defines all parameters needed to launch a fine-tuning job
+00027 |     on a pretrained base model using a custom dataset and embodiment-specific
+00028 |     modality configuration. It controls model tuning options, data augmentation,
+00029 |     and training hyperparameters.
+00030 |     """
+00031 | 
+00032 |     # --- Data and Model Paths ---
+00033 |     base_model_path: str
+00034 |     """Path to the pretrained base model checkpoint (e.g., Hugging Face model hub or local directory)."""
+00035 | 
+00036 |     dataset_path: str
+00037 |     """Path to one dataset root, or an os.pathsep-separated list of dataset roots."""
+00038 | 
+00039 |     embodiment_tag: str
+00040 |     """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
+00041 | 
+00042 |     modality_config_path: str | None = None
+00043 |     """
+00044 |     Path to a Python file defining the modality configuration for the given embodiment. 
+00045 |     If None, use the pre-registered modality config in `gr00t/configs/data/embodiment_configs.py`. 
+00046 |     """
+00047 | 
+00048 |     model_type: str = "Gr00tN1d7"
+00049 |     """Registered model configuration to train. Use ``Gr00tN1d7A2A`` for latent A2A."""
+00050 | 
+00051 |     a2a_channel_specs_path: str | None = None
+00052 |     """JSON mapping embodiment names to explicit A2A channel specifications."""
+00053 | 
+00054 |     a2a_canonical_statistics_path: str | None = None
+00055 |     """Shared canonical statistics JSON produced by ``build_canonical_stats.py``."""
+00056 | 
+00057 |     a2a_expected_contract_sha256: str | None = None
+00058 |     """Expected SHA-256 of the versioned channel contract embedded in A2A statistics."""
+00059 | 
+00060 |     a2a_training_stage: str = "joint"
+00061 |     """Latent-A2A stage: ``autoencoder``, ``flow_only``, or ``joint``."""
+00062 | 
+00063 |     a2a_cold_start: str = "repeat_first_state"
+00064 |     """Latent-A2A history policy: ``repeat_first_state`` or ``require_full_history``."""
+00065 | 
+00066 |     a2a_num_inference_steps: int = 1
+00067 |     """Euler steps used by latent-A2A inference; the low-latency profile defaults to one."""
+00068 | 
+00069 |     a2a_history_noise_train_std: float = 0.02
+00070 |     """Noise standard deviation applied only to normalized valid history channels."""
+00071 | 
+00072 |     a2a_max_time_gap_s: float | None = None
+00073 |     """Optional maximum time gap between measured online proprio samples."""
+00074 | 
+00075 |     a2a_flow_backbone: str = "mlp"
+00076 |     """A2A velocity backend: paper-core ``mlp`` or temporal-token ``dit``."""
+00077 | 
+00078 |     a2a_dit_token_dim: int = 256
+00079 |     """Feature width of each relative-timestep latent token in the DiT backend."""
+00080 | 
+00081 |     a2a_dit_num_layers: int = 8
+00082 |     """Number of temporal AdaLN-DiT Transformer blocks."""
+00083 | 
+00084 |     a2a_dit_num_heads: int = 8
+00085 |     """Number of self-attention heads per DiT block."""
+00086 | 
+00087 |     a2a_dit_mlp_ratio: int = 4
+00088 |     """Feed-forward expansion ratio inside each DiT block."""
+00089 | 
+00090 |     a2a_dit_dropout: float = 0.0
+00091 |     """Dropout used by DiT attention and feed-forward layers."""
+00092 | 
+00093 |     a2a_strict_paper_architecture: bool = True
+00094 |     """Require the paper-core MLP architecture; disable explicitly for DiT ablations."""
+00095 | 
+00096 |     # --- Model Tuning Flags ---
+00097 |     tune_llm: bool = False
+00098 |     """If True, fine-tune the language model (LLM) backbone during training."""
+00099 | 
+00100 |     tune_visual: bool = False
+00101 |     """If True, fine-tune the visual encoder (e.g., ViT or CNN backbone)."""
+00102 | 
+00103 |     tune_projector: bool = True
+00104 |     """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
+00105 | 
+00106 |     tune_diffusion_model: bool = True
+00107 |     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
+00108 | 
+00109 |     state_dropout_prob: float = 0.2
+00110 |     """
+00111 |     Dropout probability applied to state inputs for regularization during training.
+00112 |     """
+00113 | 
+00114 |     # --- Data Augmentation ---
+00115 |     random_rotation_angle: int | None = None
+00116 |     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""
+00117 | 
+00118 |     color_jitter_params: dict[str, float] | None = None
+00119 |     """
+00120 |     Parameters for color jitter augmentation on images.
+00121 | 
+00122 |     Expected keys include:
+00123 |       - "brightness": float
+00124 |       - "contrast": float
+00125 |       - "saturation": float
+00126 |       - "hue": float
+00127 |     Example: {"brightness": 0.4, "contrast": 0.4, "saturation": 0.4, "hue": 0.1}
+00128 | 
+00129 |     If None, applying the default color jitter augmentation from the pretrained model.
+00130 |     """
+00131 | 
+00132 |     use_percentiles: bool = True
+00133 |     """
+00134 |     If True, use q01/q99 percentile statistics for state/action min-max normalization.
+00135 |     If False, use full min/max statistics.
+00136 |     """
+00137 | 
+00138 |     shortest_image_edge: int | None = None
+00139 |     """
+00140 |     Resize images so the shortest edge has this size before fractional cropping.
+00141 |     If set, crop_fraction must also be set and legacy image_crop_size/image_target_size
+00142 |     preprocessing is disabled.
+00143 |     """
+00144 | 
+00145 |     crop_fraction: float | None = None
+00146 |     """
+00147 |     Fraction of the resized image retained by the random/center crop.
+00148 |     If set, shortest_image_edge must also be set and legacy image_crop_size/image_target_size
+00149 |     preprocessing is disabled.
+00150 |     """
+00151 | 
+00152 |     extra_augmentation_config: str | None = None
+00153 |     """
+00154 |     JSON string for extra image augmentations (mask-based and others).
+00155 | 
+00156 |     Expected keys include:
+00157 |       - "background_noise_transforms": list of dicts for noise on mask regions
+00158 |           - "target_mask_values": list of int (e.g., [0])
+00159 |           - "p": float (probability of applying)
+00160 |       - "masked_region_transforms": list of dicts for color tint on mask regions
+00161 |           - "target_mask_values": list of int (e.g., [4] or [5])
+00162 |           - "p": float (probability of applying)
+00163 |           - "alpha_range": [min, max] for random_tint intensity
+00164 | 
+00165 |     Example: {"background_noise_transforms": [{"target_mask_values": [0], "p": 0.9}],
+00166 |               "masked_region_transforms": [{"target_mask_values": [4], "p": 1.0, "alpha_range": [0, 1]}]}
+00167 | 
+00168 |     If None, no extra augmentations are applied.
+00169 |     """
+00170 | 
+00171 |     # --- Training Configuration ---
+00172 |     global_batch_size: int = 64
+00173 |     """Total batch summed across all GPUs in one forward/backward, BEFORE
+00174 |     gradient accumulation."""
+00175 | 
+00176 |     dataloader_num_workers: int = 2
+00177 |     """Number of parallel worker processes used for data loading."""
+00178 | 
+00179 |     learning_rate: float = 1e-4
+00180 |     """Initial learning rate for optimizer."""
+00181 | 
+00182 |     gradient_accumulation_steps: int = 1
+00183 |     """Forward passes per optimizer step. Multiplies ``global_batch_size`` to
+00184 |     produce the post-accumulation per-optimizer-step batch."""
+00185 | 
+00186 |     output_dir: str = "./outputs"
+00187 |     """Directory where model checkpoints, logs, and outputs are saved."""
+00188 | 
+00189 |     experiment_name: str | None = None
+00190 |     """Optional experiment name used as the W&B run name. Defaults to the output directory basename."""
+00191 | 
+00192 |     wandb_project: str = "finetune-gr00t-n1d7"
+00193 |     """W&B project name to log runs to."""
+00194 | 
+00195 |     save_steps: int = 1000
+00196 |     """Frequency (in training steps) at which to save checkpoints."""
+00197 | 
+00198 |     save_total_limit: int = 5
+00199 |     """Maximum number of checkpoints to keep before older ones are deleted."""
+00200 | 
+00201 |     num_gpus: int = 1
+00202 |     """Number of GPUs available for distributed or single-node training."""
+00203 | 
+00204 |     use_wandb: bool = False
+00205 |     """
+00206 |     If True, log metrics and artifacts to Weights & Biases (wandb).
+00207 |     The project is `finetune-gr00t-n1d7`.
+00208 |     You need to login to wandb to view the logs.
+00209 |     """
+00210 | 
+00211 |     max_steps: int = 10000
+00212 |     """Total number of training steps to run before stopping."""
+00213 | 
+00214 |     weight_decay: float = 1e-5
+00215 |     """Weight decay coefficient for optimizer (L2 regularization)."""
+00216 | 
+00217 |     warmup_ratio: float = 0.05
+00218 |     """Proportion of total training steps used for learning rate warm-up."""
+00219 | 
+00220 |     ds_weights_alpha: float | None = None
+00221 |     """Power-law exponent for dataset soup weighting. When set, each dataset's
+00222 |     sampling weight is len(dataset)^alpha and per-dataset mix_ratio values are ignored."""
+00223 | 
+00224 |     shard_size: int = 2**10
+00225 |     """Size of the shard to use for the dataset during preloading."""
+00226 | 
+00227 |     episode_sampling_rate: float = 0.1
+00228 |     """Sampling rate for the episodes."""
+00229 | 
+00230 |     num_shards_per_epoch: int = int(1e5)
+00231 |     """Number of shards to use for the dataset. reduce this number if vram is limited."""
+00232 | 
+00233 |     save_only_model: bool = False
+00234 |     """If True, save only model weights (skip optimizer/scheduler/RNG states). Cannot resume training from these checkpoints."""
+00235 | 
+00236 |     resume_from_checkpoint: bool = False
+00237 |     """If True, resume from the latest ``checkpoint-*`` in ``output_dir``. Default
+00238 |     False so a rerun against an existing ``output_dir`` starts fresh instead of
+00239 |     silently merging with a previous experiment. Incompatible with
+00240 |     ``save_only_model=True`` (enforced by ``experiment.run``)."""
+00241 | 
+00242 |     skip_weight_loading: bool = False
+00243 |     """If True, skip loading model weights from base_model_path (architecture only).
+00244 |     The processor (tokenizer/config) is still loaded from base_model_path.
+00245 |     Useful for CI/testing to skip the slow checkpoint shard loading."""
+00246 | 
+00247 |     def __post_init__(self) -> None:
+00248 |         if self.gradient_accumulation_steps < 1:
+00249 |             raise ValueError(
+00250 |                 f"gradient_accumulation_steps must be >= 1, got {self.gradient_accumulation_steps}"
+00251 |             )
+00252 |         if self.gradient_accumulation_steps > 1:
+00253 |             accumulated_batch_size = self.global_batch_size * self.gradient_accumulation_steps
+00254 |             warnings.warn(
+00255 |                 f"global_batch_size={self.global_batch_size} is pre-accumulation; "
+00256 |                 f"accumulated_batch_size={accumulated_batch_size} "
+00257 |                 f"(× gradient_accumulation_steps={self.gradient_accumulation_steps}).",
+00258 |                 stacklevel=2,
+00259 |             )

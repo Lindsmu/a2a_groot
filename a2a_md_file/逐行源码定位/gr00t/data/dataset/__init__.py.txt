@@ -1,0 +1,35 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | from .a2a_single_step_dataset import (
+00017 |     A2AShardedSingleStepDataset,
+00018 |     A2AWindowBounds,
+00019 |     compute_a2a_window_bounds,
+00020 |     extract_a2a_step_data,
+00021 |     get_modality_delta_bounds,
+00022 |     is_a2a_model_config,
+00023 |     validate_a2a_step_index,
+00024 | )
+00025 | 
+00026 | 
+00027 | __all__ = [
+00028 |     "A2AShardedSingleStepDataset",
+00029 |     "A2AWindowBounds",
+00030 |     "compute_a2a_window_bounds",
+00031 |     "extract_a2a_step_data",
+00032 |     "get_modality_delta_bounds",
+00033 |     "is_a2a_model_config",
+00034 |     "validate_a2a_step_index",
+00035 | ]

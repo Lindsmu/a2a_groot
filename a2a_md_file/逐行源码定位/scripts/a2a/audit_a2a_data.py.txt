@@ -1,0 +1,368 @@
+00001 | #!/usr/bin/env python
+00002 | 
+00003 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00004 | # SPDX-License-Identifier: Apache-2.0
+00005 | 
+00006 | """Audit canonical A2A windows before training.
+00007 | 
+00008 | The CLI consumes the same NPZ contract as ``build_canonical_stats.py``.  It
+00009 | checks masks and finite values, reports constant channels and temporal jumps,
+00010 | and compares history-to-future distance with a standard-Gaussian source
+00011 | baseline in the shared normalized space.  Optional channel-spec JSON auditing
+00012 | verifies that every continuous action channel has an executed proprio source.
+00013 | """
+00014 | 
+00015 | import argparse
+00016 | import json
+00017 | from pathlib import Path
+00018 | from typing import Any
+00019 | 
+00020 | import numpy as np
+00021 | 
+00022 | 
+00023 | try:
+00024 |     from .build_canonical_stats import (
+00025 |         _trajectory_horizon_and_dim,
+00026 |         compute_shared_canonical_statistics,
+00027 |         load_a2a_npz,
+00028 |         load_a2a_npz_export_metadata,
+00029 |         prepare_canonical_inputs,
+00030 |     )
+00031 | except ImportError:  # Direct execution: python scripts/a2a/audit_a2a_data.py
+00032 |     from build_canonical_stats import (  # type: ignore[no-redef]
+00033 |         _trajectory_horizon_and_dim,
+00034 |         compute_shared_canonical_statistics,
+00035 |         load_a2a_npz,
+00036 |         load_a2a_npz_export_metadata,
+00037 |         prepare_canonical_inputs,
+00038 |     )
+00039 | from gr00t.data.a2a_contract import validate_channel_contract
+00040 | 
+00041 | 
+00042 | def distribution_summary(values: np.ndarray) -> dict[str, float | int | None]:
+00043 |     """Return compact finite-only distribution statistics."""
+00044 | 
+00045 |     values = np.asarray(values, dtype=np.float64)
+00046 |     values = values[np.isfinite(values)]
+00047 |     if values.size == 0:
+00048 |         return {"count": 0, "mean": None, "p50": None, "p90": None, "p95": None}
+00049 |     return {
+00050 |         "count": int(values.size),
+00051 |         "mean": float(values.mean()),
+00052 |         "p50": float(np.quantile(values, 0.50)),
+00053 |         "p90": float(np.quantile(values, 0.90)),
+00054 |         "p95": float(np.quantile(values, 0.95)),
+00055 |     }
+00056 | 
+00057 | 
+00058 | def masked_sample_rms(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+00059 |     """Compute one RMS value per batch element under ``mask``."""
+00060 | 
+00061 |     values = np.asarray(values, dtype=np.float64)
+00062 |     mask = np.asarray(mask, dtype=bool) & np.isfinite(values)
+00063 |     reduce_axes = tuple(range(1, values.ndim))
+00064 |     counts = mask.sum(axis=reduce_axes)
+00065 |     squared_sum = np.where(mask, np.square(values), 0.0).sum(axis=reduce_axes)
+00066 |     result = np.full(values.shape[0], np.nan, dtype=np.float64)
+00067 |     np.divide(squared_sum, counts, out=result, where=counts > 0)
+00068 |     return np.sqrt(result)
+00069 | 
+00070 | 
+00071 | def audit_channel_spec(
+00072 |     channels: list[dict[str, Any]],
+00073 |     available_state_keys: set[str] | list[str],
+00074 |     available_action_keys: set[str] | list[str],
+00075 | ) -> dict[str, Any]:
+00076 |     """Check explicit action-to-executed-state channel mappings."""
+00077 | 
+00078 |     state_keys = set(available_state_keys)
+00079 |     action_keys = set(available_action_keys)
+00080 |     missing_action_keys: list[str] = []
+00081 |     missing_source_state_keys: list[str] = []
+00082 |     unsupported_channels: list[str] = []
+00083 |     discrete_channels: list[str] = []
+00084 |     duplicate_action_keys: list[str] = []
+00085 |     dimension_mismatches: list[dict[str, Any]] = []
+00086 |     semantic_mismatches: list[dict[str, Any]] = []
+00087 |     seen_action_keys: set[str] = set()
+00088 | 
+00089 |     for index, channel in enumerate(channels):
+00090 |         name = str(channel.get("action_key", f"channel[{index}]"))
+00091 |         kind = channel.get("kind", "unsupported")
+00092 |         if name in seen_action_keys:
+00093 |             duplicate_action_keys.append(name)
+00094 |         seen_action_keys.add(name)
+00095 |         if name not in action_keys:
+00096 |             missing_action_keys.append(name)
+00097 |         if kind == "continuous":
+00098 |             source_key = channel.get("source_state_key")
+00099 |             if not source_key or source_key not in state_keys:
+00100 |                 missing_source_state_keys.append(name)
+00101 | 
+00102 |             source_dim = channel.get("source_dim")
+00103 |             target_dim = channel.get("target_dim", channel.get("dim"))
+00104 |             if source_dim is not None and target_dim is not None and source_dim != target_dim:
+00105 |                 dimension_mismatches.append(
+00106 |                     {"action_key": name, "source_dim": source_dim, "target_dim": target_dim}
+00107 |                 )
+00108 | 
+00109 |             for semantic in ("format", "unit", "frame"):
+00110 |                 source_value = channel.get(f"source_{semantic}")
+00111 |                 target_value = channel.get(f"target_{semantic}")
+00112 |                 if (
+00113 |                     source_value is not None
+00114 |                     and target_value is not None
+00115 |                     and source_value != target_value
+00116 |                 ):
+00117 |                     semantic_mismatches.append(
+00118 |                         {
+00119 |                             "action_key": name,
+00120 |                             "field": semantic,
+00121 |                             "source": source_value,
+00122 |                             "target": target_value,
+00123 |                         }
+00124 |                     )
+00125 |         elif kind in {"binary", "categorical"}:
+00126 |             discrete_channels.append(name)
+00127 |         else:
+00128 |             unsupported_channels.append(name)
+00129 | 
+00130 |     errors = []
+00131 |     if missing_action_keys:
+00132 |         errors.append("Channel spec references action keys absent from the dataset")
+00133 |     if missing_source_state_keys:
+00134 |         errors.append("Continuous channels are missing an executed proprio source")
+00135 |     if duplicate_action_keys:
+00136 |         errors.append("Channel spec contains duplicate action keys")
+00137 |     if dimension_mismatches:
+00138 |         errors.append("Continuous source and target dimensions do not match")
+00139 |     if semantic_mismatches:
+00140 |         errors.append("Continuous source and target physical semantics do not match")
+00141 |     return {
+00142 |         "num_channels": len(channels),
+00143 |         "missing_action_keys": sorted(set(missing_action_keys)),
+00144 |         "missing_source_state_keys": sorted(set(missing_source_state_keys)),
+00145 |         "discrete_channels": sorted(set(discrete_channels)),
+00146 |         "unsupported_channels": sorted(set(unsupported_channels)),
+00147 |         "duplicate_action_keys": sorted(set(duplicate_action_keys)),
+00148 |         "dimension_mismatches": dimension_mismatches,
+00149 |         "semantic_mismatches": semantic_mismatches,
+00150 |         "errors": errors,
+00151 |     }
+00152 | 
+00153 | 
+00154 | def _temporal_jump_report(
+00155 |     trajectory: np.ndarray,
+00156 |     mask: np.ndarray,
+00157 |     std: np.ndarray,
+00158 |     threshold: float,
+00159 | ) -> dict[str, Any]:
+00160 |     if trajectory.shape[1] < 2:
+00161 |         return {"valid_transitions": 0, "jump_count": 0, "jump_ratio": 0.0}
+00162 |     transition_mask = mask[:, 1:, :] & mask[:, :-1, :]
+00163 |     finite_pair = np.isfinite(trajectory[:, 1:, :]) & np.isfinite(trajectory[:, :-1, :])
+00164 |     transition_mask &= finite_pair
+00165 |     normalized_delta = np.abs(np.diff(trajectory, axis=1)) / std[None, None, :]
+00166 |     valid_transitions = int(transition_mask.sum())
+00167 |     jump_count = int((transition_mask & (normalized_delta > threshold)).sum())
+00168 |     return {
+00169 |         "threshold_in_shared_std": threshold,
+00170 |         "valid_transitions": valid_transitions,
+00171 |         "jump_count": jump_count,
+00172 |         "jump_ratio": jump_count / valid_transitions if valid_transitions else 0.0,
+00173 |     }
+00174 | 
+00175 | 
+00176 | def audit_a2a_arrays(
+00177 |     history: np.ndarray,
+00178 |     future: np.ndarray,
+00179 |     history_mask: np.ndarray | None = None,
+00180 |     future_mask: np.ndarray | None = None,
+00181 |     *,
+00182 |     jump_threshold: float = 5.0,
+00183 |     random_seed: int = 42,
+00184 | ) -> dict[str, Any]:
+00185 |     """Audit A2A tensors and return a JSON-serializable report."""
+00186 | 
+00187 |     if jump_threshold <= 0:
+00188 |         raise ValueError(f"jump_threshold must be positive, got {jump_threshold}")
+00189 |     history, future, history_mask, future_mask, shared_channel_mask = prepare_canonical_inputs(
+00190 |         history, future, history_mask, future_mask
+00191 |     )
+00192 |     statistics = compute_shared_canonical_statistics(
+00193 |         history,
+00194 |         future,
+00195 |         history_mask,
+00196 |         future_mask,
+00197 |         allow_nonfinite=True,
+00198 |     )
+00199 |     mean = np.asarray(statistics["mean"], dtype=np.float64)
+00200 |     std = np.asarray(statistics["std"], dtype=np.float64)
+00201 |     history_normalized = (history - mean[None, None, :]) / std[None, None, :]
+00202 |     future_normalized = (future - mean[None, None, :]) / std[None, None, :]
+00203 | 
+00204 |     history_nonfinite = int((history_mask & ~np.isfinite(history)).sum())
+00205 |     future_nonfinite = int((future_mask & ~np.isfinite(future)).sum())
+00206 |     active_channels = np.flatnonzero(shared_channel_mask).tolist()
+00207 |     constant_channels = np.flatnonzero(
+00208 |         np.asarray(statistics["constant_mask"], dtype=bool) & shared_channel_mask
+00209 |     ).tolist()
+00210 | 
+00211 |     rng = np.random.default_rng(random_seed)
+00212 |     gaussian = rng.standard_normal(size=future_normalized.shape)
+00213 |     gaussian_distance = masked_sample_rms(gaussian - future_normalized, future_mask)
+00214 | 
+00215 |     trajectory_distance: np.ndarray | None = None
+00216 |     if history.shape[1] == future.shape[1]:
+00217 |         paired_mask = history_mask & future_mask
+00218 |         trajectory_distance = masked_sample_rms(history_normalized - future_normalized, paired_mask)
+00219 | 
+00220 |     boundary_mask = history_mask[:, -1, :] & future_mask[:, 0, :]
+00221 |     boundary_distance = masked_sample_rms(
+00222 |         history_normalized[:, -1, :] - future_normalized[:, 0, :], boundary_mask
+00223 |     )
+00224 |     gaussian_summary = distribution_summary(gaussian_distance)
+00225 |     trajectory_summary = (
+00226 |         distribution_summary(trajectory_distance) if trajectory_distance is not None else None
+00227 |     )
+00228 | 
+00229 |     errors: list[str] = []
+00230 |     warnings: list[str] = []
+00231 |     if history_nonfinite or future_nonfinite:
+00232 |         errors.append("Non-finite values occur under active canonical masks")
+00233 |     if not active_channels:
+00234 |         errors.append("History and future have no shared continuous canonical channels")
+00235 |     if constant_channels:
+00236 |         warnings.append("Some active canonical channels are constant or near-constant")
+00237 | 
+00238 |     distance_ratio = None
+00239 |     distance_advantage = None
+00240 |     if trajectory_summary is not None:
+00241 |         history_mean = trajectory_summary["mean"]
+00242 |         gaussian_mean = gaussian_summary["mean"]
+00243 |         if history_mean is not None and gaussian_mean not in {None, 0.0}:
+00244 |             distance_ratio = float(history_mean / gaussian_mean)
+00245 |             distance_advantage = bool(history_mean < gaussian_mean)
+00246 |             if not distance_advantage:
+00247 |                 warnings.append(
+00248 |                     "History is not closer to future than a Gaussian source in shared normalized space"
+00249 |                 )
+00250 | 
+00251 |     return {
+00252 |         "version": 1,
+00253 |         "num_windows": history.shape[0],
+00254 |         "history_shape": list(history.shape),
+00255 |         "future_shape": list(future.shape),
+00256 |         "active_channel_indices": active_channels,
+00257 |         "constant_channel_indices": constant_channels,
+00258 |         "history_nonfinite_active_count": history_nonfinite,
+00259 |         "future_nonfinite_active_count": future_nonfinite,
+00260 |         "history_temporal_jumps": _temporal_jump_report(history, history_mask, std, jump_threshold),
+00261 |         "future_temporal_jumps": _temporal_jump_report(future, future_mask, std, jump_threshold),
+00262 |         "history_future_trajectory_rms": trajectory_summary,
+00263 |         "history_last_future_first_rms": distribution_summary(boundary_distance),
+00264 |         "gaussian_future_rms": gaussian_summary,
+00265 |         "history_to_gaussian_mean_distance_ratio": distance_ratio,
+00266 |         "history_closer_than_gaussian": distance_advantage,
+00267 |         "errors": errors,
+00268 |         "warnings": warnings,
+00269 |         "shared_statistics": statistics,
+00270 |     }
+00271 | 
+00272 | 
+00273 | def build_argument_parser() -> argparse.ArgumentParser:
+00274 |     parser = argparse.ArgumentParser(description=__doc__)
+00275 |     parser.add_argument("--input", type=Path, required=True, help="A2A windows NPZ")
+00276 |     parser.add_argument("--output", type=Path, help="Optional JSON report path")
+00277 |     parser.add_argument(
+00278 |         "--channel-spec",
+00279 |         type=Path,
+00280 |         help=(
+00281 |             "Optional JSON with channels, available_state_keys and available_action_keys for "
+00282 |             "mapping validation"
+00283 |         ),
+00284 |     )
+00285 |     parser.add_argument(
+00286 |         "--jump-threshold",
+00287 |         type=float,
+00288 |         default=5.0,
+00289 |         help="Temporal jump threshold measured in shared standard deviations",
+00290 |     )
+00291 |     parser.add_argument("--random-seed", type=int, default=42)
+00292 |     parser.add_argument(
+00293 |         "--fail-on-errors",
+00294 |         action="store_true",
+00295 |         help="Return exit code 2 when hard audit errors are present",
+00296 |     )
+00297 |     return parser
+00298 | 
+00299 | 
+00300 | def main(argv: list[str] | None = None) -> int:
+00301 |     args = build_argument_parser().parse_args(argv)
+00302 |     history, future, history_mask, future_mask = load_a2a_npz(args.input)
+00303 |     if history_mask is None or future_mask is None:
+00304 |         raise KeyError(
+00305 |             "Strict A2A audit requires both history_mask and future_mask; re-export the "
+00306 |             "windows instead of inferring validity"
+00307 |         )
+00308 |     history_horizon, history_dim = _trajectory_horizon_and_dim(history, "history")
+00309 |     future_horizon, future_dim = _trajectory_horizon_and_dim(future, "future")
+00310 |     if history_dim != future_dim:
+00311 |         raise ValueError(
+00312 |             f"history/future feature dimensions differ: {history_dim} and {future_dim}"
+00313 |         )
+00314 |     metadata = load_a2a_npz_export_metadata(args.input)
+00315 |     num_windows = 1 if np.asarray(history).ndim == 2 else int(np.asarray(history).shape[0])
+00316 |     expected_metadata = {
+00317 |         "input_space": "unnormalized_canonical_physical",
+00318 |         "num_windows": num_windows,
+00319 |         "history_horizon": history_horizon,
+00320 |         "future_horizon": future_horizon,
+00321 |         "feature_dim": history_dim,
+00322 |     }
+00323 |     mismatches = {
+00324 |         key: {"expected": expected, "actual": metadata[key]}
+00325 |         for key, expected in expected_metadata.items()
+00326 |         if metadata[key] != expected
+00327 |     }
+00328 |     if mismatches:
+00329 |         raise ValueError(f"A2A NPZ exporter metadata does not match its arrays: {mismatches}")
+00330 |     contract = validate_channel_contract(
+00331 |         metadata["contract"],
+00332 |         feature_dim=history_dim,
+00333 |         history_horizon=history_horizon,
+00334 |         future_horizon=future_horizon,
+00335 |     )
+00336 |     if contract["sha256"] != metadata["contract_sha256"]:
+00337 |         raise ValueError("A2A NPZ contract_json does not match contract_sha256")
+00338 |     report = audit_a2a_arrays(
+00339 |         history,
+00340 |         future,
+00341 |         history_mask,
+00342 |         future_mask,
+00343 |         jump_threshold=args.jump_threshold,
+00344 |         random_seed=args.random_seed,
+00345 |     )
+00346 |     report["export_contract_sha256"] = contract["sha256"]
+00347 | 
+00348 |     if args.channel_spec:
+00349 |         spec_payload = json.loads(args.channel_spec.read_text(encoding="utf-8"))
+00350 |         report["channel_spec"] = audit_channel_spec(
+00351 |             spec_payload.get("channels", []),
+00352 |             spec_payload.get("available_state_keys", []),
+00353 |             spec_payload.get("available_action_keys", []),
+00354 |         )
+00355 |         report["errors"].extend(report["channel_spec"]["errors"])
+00356 | 
+00357 |     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+00358 |     if args.output:
+00359 |         args.output.parent.mkdir(parents=True, exist_ok=True)
+00360 |         args.output.write_text(rendered, encoding="utf-8")
+00361 |         print(f"Wrote A2A data audit to {args.output}")
+00362 |     else:
+00363 |         print(rendered, end="")
+00364 |     return 2 if args.fail_on_errors and report["errors"] else 0
+00365 | 
+00366 | 
+00367 | if __name__ == "__main__":
+00368 |     raise SystemExit(main())

@@ -1,0 +1,1022 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | #
+00017 | # Licensed under the Apache License, Version 2.0 (the "License");
+00018 | # you may not use this file except in compliance with the License.
+00019 | # You may obtain a copy of the License at
+00020 | #
+00021 | # http://www.apache.org/licenses/LICENSE-2.0
+00022 | #
+00023 | # Unless required by applicable law or agreed to in writing, software
+00024 | # distributed under the License is distributed on an "AS IS" BASIS,
+00025 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00026 | # See the License for the specific language governing permissions and
+00027 | # limitations under the License.
+00028 | 
+00029 | """TensorRT forward functions for GR00T N1.7 inference.
+00030 | 
+00031 | This module provides TRT-accelerated forward functions that replace the
+00032 | PyTorch backbone and action head during inference.
+00033 | 
+00034 | Architecture (n17_full_pipeline mode):
+00035 |   Backbone: ViT (TRT) → embed_tokens + masked_scatter + get_rope_index (PyTorch)
+00036 |             → LLM (TRT, with deepstack injection)
+00037 |   Action Head: VLLN (PyTorch) → State Encoder (TRT) → denoising loop:
+00038 |                [ Action Encoder (TRT) → DiT (TRT) → Action Decoder (TRT) ]
+00039 | 
+00040 | Architecture (vit_llm_only mode):
+00041 |   Backbone: ViT (TRT) → embed_tokens + masked_scatter + get_rope_index (PyTorch)
+00042 |             → LLM (TRT, with deepstack injection)
+00043 |   Action Head: stays in PyTorch
+00044 |   Use when DiT cannot be exported with dynamic vl_seq_len (e.g. torch 2.10 / sm121).
+00045 | 
+00046 | Architecture (action_head mode):
+00047 |   Backbone: stays in PyTorch (Qwen3-VL)
+00048 |   Action Head: VLLN (PyTorch) → State Encoder (TRT) → denoising loop:
+00049 |                [ Action Encoder (TRT) → DiT (TRT) → Action Decoder (TRT) ]
+00050 | """
+00051 | 
+00052 | from contextlib import contextmanager
+00053 | from functools import partial
+00054 | import logging
+00055 | import os
+00056 | import sys
+00057 | 
+00058 | from gr00t.deployment.modes import InferenceMode
+00059 | import torch
+00060 | from transformers.feature_extraction_utils import BatchFeature
+00061 | 
+00062 | 
+00063 | logger = logging.getLogger(__name__)
+00064 | 
+00065 | 
+00066 | # Ensure sibling modules are importable (scripts/deployment is not a package)
+00067 | _deploy_dir = os.path.dirname(os.path.abspath(__file__))
+00068 | if _deploy_dir not in sys.path:
+00069 |     sys.path.insert(0, _deploy_dir)
+00070 | from _trt_contract import (  # noqa: E402
+00071 |     assert_engine_bundle_present,
+00072 |     assert_engine_matches_policy,
+00073 |     assert_grid_thw_matches,
+00074 | )
+00075 | from trt_torch import Engine  # noqa: E402
+00076 | 
+00077 | 
+00078 | def _assert_supports_trt_padding_strip(attention_mask: torch.Tensor) -> None:
+00079 |     """Hard-fail if the TRT padding-strip path would silently corrupt B>1 batches.
+00080 | 
+00081 |     transformers 4.57+ strips padding tokens before calling ``language_model``.
+00082 |     The TRT forward path replicates that with ``valid_mask = attention_mask[0] == 1``
+00083 |     so engine inputs match export-time captured shapes. With B=1 (or B>1 where
+00084 |     every sample has the same mask, e.g. tiled benchmarking via
+00085 |     ``verify_n1d7_trt.py --batch_size N``) this is correct. With B>1 *and*
+00086 |     heterogeneous masks (different valid lengths per sample), samples 1..B-1
+00087 |     would be silently mis-stripped using sample 0's padding template, producing
+00088 |     wrong inputs to the LLM TRT engine — no error, no warning, just degraded
+00089 |     output that's caught only via downstream eval drift.
+00090 | 
+00091 |     Raise rather than warn so the caller can't miss it in the multi-rank log
+00092 |     torrent. To support heterogeneous B>1, switch to the all-batch
+00093 |     common-padding mask ``(attention_mask == 1).all(dim=0)`` (only strips
+00094 |     columns padded across *all* samples) — that is a semantic change requiring
+00095 |     modeling sign-off, so we hard-fail here for now.
+00096 | 
+00097 |     Note on the build-time batch coupling: the ONNX export pipeline
+00098 |     (``scripts/deployment/export_onnx_n1d7.py``) bakes the batch dim as a
+00099 |     static shape — only ``seq_len`` is registered in ``dynamic_axes`` —
+00100 |     so a TRT engine built at ``--batch-size N`` only accepts B=N at
+00101 |     runtime. Lifting heterogeneous B>1 inference therefore requires both
+00102 |     rebuilding the engine at that batch size *and* relaxing this
+00103 |     assertion. Production today is B=1; this check covers the runtime
+00104 |     half of that contract.
+00105 |     """
+00106 |     if attention_mask.shape[0] <= 1:
+00107 |         return
+00108 |     if not (attention_mask == attention_mask[0:1]).all():
+00109 |         raise ValueError(
+00110 |             "TRT backbone padding-strip requires B=1 or homogeneous attention "
+00111 |             f"masks across the batch (got B={attention_mask.shape[0]} with "
+00112 |             "heterogeneous masks). attention_mask[0] would silently mis-strip "
+00113 |             "samples 1..B-1 using sample 0's padding template, producing wrong "
+00114 |             "inputs to the LLM TRT engine. Switch to "
+00115 |             "(attention_mask == 1).all(dim=0) to only strip columns padded "
+00116 |             "across all samples — but that is a semantic change requiring "
+00117 |             "modeling sign-off."
+00118 |         )
+00119 | 
+00120 | 
+00121 | def _resolve_vit_engine_path(trt_engine_path: str) -> str:
+00122 |     """Locate the ViT engine, tolerating the legacy filename.
+00123 | 
+00124 |     Older builds emitted ``vit_bf16.engine`` even when the source ONNX
+00125 |     was FP32 — a name that obscured the actual engine precision. New
+00126 |     builds emit ``vit.engine`` (precision-neutral; the real dtype lives
+00127 |     in ``export_metadata.json`` and the ONNX tensor types). Existing
+00128 |     engine directories with the legacy name are still accepted with a
+00129 |     warning emitted on each call (no per-process suppression: the
+00130 |     warning content is path-dependent and call sites are few), to
+00131 |     encourage migration to the precision-neutral name. When no engine
+00132 |     is present we return the canonical name so the caller can put it
+00133 |     in any "not found" error.
+00134 |     """
+00135 |     new = os.path.join(trt_engine_path, "vit.engine")
+00136 |     legacy = os.path.join(trt_engine_path, "vit_bf16.engine")
+00137 |     if os.path.exists(new):
+00138 |         return new
+00139 |     if os.path.exists(legacy):
+00140 |         logger.warning(
+00141 |             f"Loading ViT engine from legacy path {legacy}; new builds "
+00142 |             f"emit vit.engine. Rebuild the pipeline to drop the misleading "
+00143 |             f"precision tag from the filename."
+00144 |         )
+00145 |         return legacy
+00146 |     return new
+00147 | 
+00148 | 
+00149 | # ============================================================
+00150 | # N1.7 Backbone TRT Forward (ViT TRT + LLM TRT)
+00151 | # ============================================================
+00152 | 
+00153 | 
+00154 | def _qwen3_vit_and_scatter(self, vl_input):
+00155 |     """Shared logic: ViT TRT + embed_tokens + scatter + get_rope_index.
+00156 | 
+00157 |     Returns all inputs needed by either PyTorch LLM or LLM TRT engine.
+00158 |     These ops stay in PyTorch because they involve dynamic Python logic
+00159 |     (get_rope_index, masked_scatter, get_placeholder_mask).
+00160 |     """
+00161 |     qwen_model = self.model  # Qwen3VLForConditionalGeneration
+00162 |     inner_model = qwen_model.model  # Qwen3VLModel
+00163 | 
+00164 |     pixel_values = vl_input["pixel_values"]
+00165 |     grid_thw = vl_input["image_grid_thw"]
+00166 |     engine_dtype = torch.bfloat16
+00167 | 
+00168 |     # The ViT engine baked pos/rotary buffers for the export-time grid; a
+00169 |     # different runtime grid would silently corrupt vision features.
+00170 |     assert_grid_thw_matches(
+00171 |         getattr(self, "_vit_baked_grid_thw", None), grid_thw, source="ViT TRT forward"
+00172 |     )
+00173 | 
+00174 |     # --- ViT TRT Engine ---
+00175 |     # Detect ViT engine dtype (FP32 for accuracy or BF16 for speed)
+00176 |     vit_dtype = self.vit_engine.dtype_of("pixel_values")
+00177 |     if isinstance(pixel_values, (list, tuple)):
+00178 |         pv = torch.cat(pixel_values, dim=0)
+00179 |     else:
+00180 |         pv = pixel_values
+00181 |     if pv.dtype != vit_dtype:
+00182 |         pv = pv.to(vit_dtype)
+00183 | 
+00184 |     self.vit_engine.set_runtime_tensor_shape("pixel_values", pv.shape)
+00185 |     vit_result = self.vit_engine(pv)
+00186 |     image_embeds = vit_result["image_embeds"]
+00187 |     deepstack_features = vit_result.get("deepstack_features")
+00188 | 
+00189 |     # Unpack deepstack: [num_layers, N, D] → list of [N, D]
+00190 |     deepstack_list = []
+00191 |     if deepstack_features is not None and deepstack_features.numel() > 1:
+00192 |         deepstack_list = list(deepstack_features.unbind(0))
+00193 | 
+00194 |     # --- PyTorch: embed_tokens + scatter ---
+00195 |     input_ids = vl_input["input_ids"]
+00196 |     inputs_embeds = self._embedding_layer(input_ids)
+00197 | 
+00198 |     if inputs_embeds.dtype != engine_dtype:
+00199 |         inputs_embeds = inputs_embeds.to(engine_dtype)
+00200 |     if image_embeds.dtype != engine_dtype:
+00201 |         image_embeds = image_embeds.to(engine_dtype)
+00202 | 
+00203 |     image_embeds_cat = torch.cat([image_embeds], dim=0)
+00204 |     image_mask, _ = inner_model.get_placeholder_mask(
+00205 |         input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds_cat
+00206 |     )
+00207 |     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds_cat)
+00208 | 
+00209 |     visual_pos_masks = image_mask[..., 0] if image_mask is not None else None
+00210 | 
+00211 |     # Compute 3D position IDs (stays in PyTorch — complex Python logic)
+00212 |     attention_mask = vl_input["attention_mask"]
+00213 |     position_ids, rope_deltas = inner_model.get_rope_index(
+00214 |         input_ids, grid_thw, video_grid_thw=None, attention_mask=attention_mask
+00215 |     )
+00216 |     inner_model.rope_deltas = rope_deltas
+00217 | 
+00218 |     image_mask_out = input_ids == self._image_token_id
+00219 |     backbone_attention_mask = attention_mask == 1
+00220 | 
+00221 |     # transformers 4.57+ strips padding tokens before calling language_model internally.
+00222 |     # Apply the same stripping so TRT engine inputs match export-time captured shapes.
+00223 |     _assert_supports_trt_padding_strip(attention_mask)
+00224 |     valid_mask = attention_mask[0] == 1  # [full_seq_len]
+00225 |     if not valid_mask.all():
+00226 |         inputs_embeds = inputs_embeds[:, valid_mask, :]
+00227 |         attention_mask = attention_mask[:, valid_mask]
+00228 |         position_ids = position_ids[:, :, valid_mask]
+00229 |         if visual_pos_masks is not None:
+00230 |             visual_pos_masks = visual_pos_masks[:, valid_mask]
+00231 |         image_mask_out = image_mask_out[:, valid_mask]
+00232 |         backbone_attention_mask = backbone_attention_mask[:, valid_mask]
+00233 | 
+00234 |     return {
+00235 |         "inputs_embeds": inputs_embeds,
+00236 |         "attention_mask": attention_mask,
+00237 |         "position_ids": position_ids,
+00238 |         "visual_pos_masks": visual_pos_masks,
+00239 |         "deepstack_list": deepstack_list,
+00240 |         "image_mask_out": image_mask_out,
+00241 |         "backbone_attention_mask": backbone_attention_mask,
+00242 |     }
+00243 | 
+00244 | 
+00245 | def qwen3_backbone_tensorrt_forward(self, vl_input):
+00246 |     """Replace Qwen3Backbone.forward() with ViT TRT + PyTorch LLM.
+00247 | 
+00248 |     ViT is replaced with a TRT engine. The LLM stays in PyTorch.
+00249 |     Used when LLM TRT engine is not available.
+00250 | 
+00251 |     Args:
+00252 |         self: Qwen3Backbone instance (monkey-patched)
+00253 |         vl_input: BatchFeature with keys: input_ids, attention_mask, pixel_values, image_grid_thw
+00254 |     """
+00255 |     self.set_frozen_modules_to_eval_mode()
+00256 | 
+00257 |     keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
+00258 |     vl_input = {k: vl_input[k] for k in keys_to_use}
+00259 | 
+00260 |     prepared = _qwen3_vit_and_scatter(self, vl_input)
+00261 | 
+00262 |     qwen_model = self.model
+00263 |     inner_model = qwen_model.model
+00264 | 
+00265 |     # LLM forward (PyTorch)
+00266 |     outputs = inner_model.language_model(
+00267 |         input_ids=None,
+00268 |         position_ids=prepared["position_ids"],
+00269 |         attention_mask=prepared["attention_mask"],
+00270 |         inputs_embeds=prepared["inputs_embeds"],
+00271 |         visual_pos_masks=prepared["visual_pos_masks"],
+00272 |         deepstack_visual_embeds=prepared["deepstack_list"] or None,
+00273 |         output_hidden_states=True,
+00274 |     )
+00275 | 
+00276 |     return BatchFeature(
+00277 |         data={
+00278 |             "backbone_features": outputs.last_hidden_state,
+00279 |             "backbone_attention_mask": prepared["backbone_attention_mask"],
+00280 |             "image_mask": prepared["image_mask_out"],
+00281 |         }
+00282 |     )
+00283 | 
+00284 | 
+00285 | def qwen3_backbone_llm_trt_forward(self, vl_input):
+00286 |     """Replace Qwen3Backbone.forward() with PyTorch ViT + LLM TRT.
+00287 | 
+00288 |     ViT stays in PyTorch. LLM is replaced with a TRT engine.
+00289 |     Used when ViT TRT has accuracy issues but LLM TRT is accurate.
+00290 |     """
+00291 |     self.set_frozen_modules_to_eval_mode()
+00292 | 
+00293 |     keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
+00294 |     vl_input = {k: vl_input[k] for k in keys_to_use}
+00295 | 
+00296 |     # Run PyTorch ViT + scatter + rope (original backbone logic up to LLM)
+00297 |     qwen_model = self.model
+00298 |     inner_model = qwen_model.model
+00299 | 
+00300 |     # ViT forward (PyTorch — kept for accuracy)
+00301 |     pixel_values = vl_input["pixel_values"]
+00302 |     grid_thw = vl_input["image_grid_thw"]
+00303 |     image_embeds_split, deepstack_image_embeds = inner_model.get_image_features(
+00304 |         pixel_values, grid_thw
+00305 |     )
+00306 |     # get_image_features returns a tuple of per-image tensors; concat for scatter
+00307 |     image_embeds = torch.cat(list(image_embeds_split), dim=0)
+00308 | 
+00309 |     # Scatter image embeddings into text embeddings
+00310 |     input_ids = vl_input["input_ids"]
+00311 |     inputs_embeds = qwen_model.get_input_embeddings()(input_ids)
+00312 |     image_mask, _ = inner_model.get_placeholder_mask(
+00313 |         input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+00314 |     )
+00315 |     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+00316 | 
+00317 |     visual_pos_masks = image_mask[..., 0] if image_mask is not None else None
+00318 |     deepstack_list = list(deepstack_image_embeds) if deepstack_image_embeds else []
+00319 | 
+00320 |     # Compute position IDs
+00321 |     attention_mask = vl_input["attention_mask"]
+00322 |     position_ids, rope_deltas = inner_model.get_rope_index(
+00323 |         input_ids, grid_thw, video_grid_thw=None, attention_mask=attention_mask
+00324 |     )
+00325 |     inner_model.rope_deltas = rope_deltas
+00326 | 
+00327 |     image_mask_out = input_ids == qwen_model.config.image_token_id
+00328 |     backbone_attention_mask = attention_mask == 1
+00329 | 
+00330 |     # Strip padding tokens (transformers 4.57+)
+00331 |     _assert_supports_trt_padding_strip(attention_mask)
+00332 |     valid_mask = attention_mask[0] == 1
+00333 |     if not valid_mask.all():
+00334 |         inputs_embeds = inputs_embeds[:, valid_mask, :]
+00335 |         attention_mask = attention_mask[:, valid_mask]
+00336 |         position_ids = position_ids[:, :, valid_mask]
+00337 |         if visual_pos_masks is not None:
+00338 |             visual_pos_masks = visual_pos_masks[:, valid_mask]
+00339 |         image_mask_out = image_mask_out[:, valid_mask]
+00340 |         backbone_attention_mask = backbone_attention_mask[:, valid_mask]
+00341 | 
+00342 |     # LLM forward (TRT)
+00343 |     llm_float_dtype = self.llm_engine.dtype_of("inputs_embeds")
+00344 | 
+00345 |     if inputs_embeds.dtype != llm_float_dtype:
+00346 |         inputs_embeds = inputs_embeds.to(llm_float_dtype)
+00347 |     if attention_mask.dtype != torch.int64:
+00348 |         attention_mask = attention_mask.to(torch.int64)
+00349 |     if position_ids.dtype != torch.int64:
+00350 |         position_ids = position_ids.to(torch.int64)
+00351 | 
+00352 |     self.llm_engine.set_runtime_tensor_shape("inputs_embeds", inputs_embeds.shape)
+00353 |     self.llm_engine.set_runtime_tensor_shape("attention_mask", attention_mask.shape)
+00354 |     self.llm_engine.set_runtime_tensor_shape("position_ids", position_ids.shape)
+00355 | 
+00356 |     llm_kwargs = {}
+00357 |     if visual_pos_masks is not None and deepstack_list:
+00358 |         self.llm_engine.set_runtime_tensor_shape("visual_pos_masks", visual_pos_masks.shape)
+00359 |         llm_kwargs["visual_pos_masks"] = visual_pos_masks
+00360 |         for i, ds in enumerate(deepstack_list):
+00361 |             name = f"deepstack_{i}"
+00362 |             if ds.dtype != llm_float_dtype:
+00363 |                 ds = ds.to(llm_float_dtype)
+00364 |             self.llm_engine.set_runtime_tensor_shape(name, ds.shape)
+00365 |             llm_kwargs[name] = ds
+00366 | 
+00367 |     backbone_features = self.llm_engine(inputs_embeds, attention_mask, position_ids, **llm_kwargs)[
+00368 |         "embeddings"
+00369 |     ]
+00370 | 
+00371 |     if backbone_features.dtype != torch.bfloat16:
+00372 |         backbone_features = backbone_features.to(torch.bfloat16)
+00373 | 
+00374 |     return BatchFeature(
+00375 |         data={
+00376 |             "backbone_features": backbone_features,
+00377 |             "backbone_attention_mask": backbone_attention_mask,
+00378 |             "image_mask": image_mask_out,
+00379 |         }
+00380 |     )
+00381 | 
+00382 | 
+00383 | def qwen3_backbone_full_trt_forward(self, vl_input):
+00384 |     """Replace Qwen3Backbone.forward() with ViT TRT + LLM TRT.
+00385 | 
+00386 |     Both ViT and LLM are replaced with TRT engines.
+00387 |     PyTorch ops kept: embed_tokens, masked_scatter, get_rope_index (lightweight).
+00388 | 
+00389 |     Args:
+00390 |         self: Qwen3Backbone instance (monkey-patched)
+00391 |         vl_input: BatchFeature with keys: input_ids, attention_mask, pixel_values, image_grid_thw
+00392 |     """
+00393 |     self.set_frozen_modules_to_eval_mode()
+00394 | 
+00395 |     keys_to_use = ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
+00396 |     vl_input = {k: vl_input[k] for k in keys_to_use}
+00397 | 
+00398 |     prepared = _qwen3_vit_and_scatter(self, vl_input)
+00399 | 
+00400 |     inputs_embeds = prepared["inputs_embeds"]
+00401 |     attention_mask = prepared["attention_mask"]
+00402 |     position_ids = prepared["position_ids"]
+00403 | 
+00404 |     # Detect LLM engine's expected float dtype from its first input binding.
+00405 |     # Handles both BF16 engines (default) and FP32 engines gracefully.
+00406 |     llm_float_dtype = self.llm_engine.dtype_of("inputs_embeds")
+00407 | 
+00408 |     if inputs_embeds.dtype != llm_float_dtype:
+00409 |         inputs_embeds = inputs_embeds.to(llm_float_dtype)
+00410 |     if attention_mask.dtype != torch.int64:
+00411 |         attention_mask = attention_mask.to(torch.int64)
+00412 |     if position_ids.dtype != torch.int64:
+00413 |         position_ids = position_ids.to(torch.int64)
+00414 | 
+00415 |     # Set LLM engine input shapes
+00416 |     self.llm_engine.set_runtime_tensor_shape("inputs_embeds", inputs_embeds.shape)
+00417 |     self.llm_engine.set_runtime_tensor_shape("attention_mask", attention_mask.shape)
+00418 |     self.llm_engine.set_runtime_tensor_shape("position_ids", position_ids.shape)
+00419 | 
+00420 |     llm_kwargs = {}
+00421 | 
+00422 |     # Visual pos masks and deepstack features
+00423 |     visual_pos_masks = prepared["visual_pos_masks"]
+00424 |     deepstack_list = prepared["deepstack_list"]
+00425 | 
+00426 |     if visual_pos_masks is not None and deepstack_list:
+00427 |         self.llm_engine.set_runtime_tensor_shape("visual_pos_masks", visual_pos_masks.shape)
+00428 |         llm_kwargs["visual_pos_masks"] = visual_pos_masks
+00429 | 
+00430 |         for i, ds in enumerate(deepstack_list):
+00431 |             name = f"deepstack_{i}"
+00432 |             if ds.dtype != llm_float_dtype:
+00433 |                 ds = ds.to(llm_float_dtype)
+00434 |             self.llm_engine.set_runtime_tensor_shape(name, ds.shape)
+00435 |             llm_kwargs[name] = ds
+00436 | 
+00437 |     backbone_features = self.llm_engine(inputs_embeds, attention_mask, position_ids, **llm_kwargs)[
+00438 |         "embeddings"
+00439 |     ]
+00440 | 
+00441 |     # Cast LLM output back to BF16 — downstream (vl_self_attention, DiT) expect BF16.
+00442 |     if backbone_features.dtype != torch.bfloat16:
+00443 |         backbone_features = backbone_features.to(torch.bfloat16)
+00444 | 
+00445 |     return BatchFeature(
+00446 |         data={
+00447 |             "backbone_features": backbone_features,
+00448 |             "backbone_attention_mask": prepared["backbone_attention_mask"],
+00449 |             "image_mask": prepared["image_mask_out"],
+00450 |         }
+00451 |     )
+00452 | 
+00453 | 
+00454 | # ============================================================
+00455 | # Action Head TRT Forward
+00456 | # ============================================================
+00457 | 
+00458 | 
+00459 | def action_head_tensorrt_forward(self, backbone_output, action_input, options=None):
+00460 |     """Replace ActionHead.get_action() with TRT-accelerated inference.
+00461 |     VLLN (LayerNorm) stays in PyTorch. State Encoder, Action Encoder,
+00462 |     DiT, and Action Decoder are replaced with TRT engines.
+00463 | 
+00464 |     N1.7 change: state is reshaped from [B, state_history_length, max_state_dim]
+00465 |     to [B, 1, state_history_length * max_state_dim] before the state encoder.
+00466 | 
+00467 |     Args:
+00468 |         self: ActionHead instance (monkey-patched)
+00469 |         backbone_output: BatchFeature with backbone_features, backbone_attention_mask, image_mask
+00470 |         action_input: BatchFeature with state, embodiment_id
+00471 |     """
+00472 |     # --- VLLN (PyTorch) + vl_self_attention (TRT if available, else PyTorch) ---
+00473 |     backbone_features = backbone_output.backbone_features
+00474 |     backbone_features = self.vlln(backbone_features)
+00475 |     if hasattr(self, "vl_sa_engine") and self.vl_sa_engine is not None:
+00476 |         engine_dtype = torch.bfloat16
+00477 |         if backbone_features.dtype != engine_dtype:
+00478 |             backbone_features = backbone_features.to(engine_dtype)
+00479 |         self.vl_sa_engine.set_runtime_tensor_shape("hidden_states", backbone_features.shape)
+00480 |         backbone_features = self.vl_sa_engine(backbone_features)["output"]
+00481 |     else:
+00482 |         backbone_features = self.vl_self_attention(backbone_features)
+00483 |     vl_embs = backbone_features
+00484 | 
+00485 |     embodiment_id = action_input.embodiment_id
+00486 |     batch_size = vl_embs.shape[0]
+00487 |     device = vl_embs.device
+00488 | 
+00489 |     engine_dtype = torch.bfloat16
+00490 | 
+00491 |     # Ensure consistent dtypes
+00492 |     if vl_embs.dtype != engine_dtype:
+00493 |         vl_embs = vl_embs.to(engine_dtype)
+00494 |     if action_input.state.dtype != engine_dtype:
+00495 |         action_input.state = action_input.state.to(engine_dtype)
+00496 |     if embodiment_id.dtype != torch.int64:
+00497 |         embodiment_id = embodiment_id.to(torch.int64)
+00498 | 
+00499 |     # --- State history reshape (N1.7) ---
+00500 |     # N1.7: state comes as [B, state_history_length, max_state_dim]
+00501 |     # Flatten to [B, 1, state_history_length * max_state_dim] for the encoder
+00502 |     state = action_input.state
+00503 |     if state.ndim == 3 and state.shape[1] > 1:
+00504 |         state = state.view(state.shape[0], 1, -1)
+00505 |     elif state.ndim == 3 and state.shape[1] == 1:
+00506 |         # Already [B, 1, dim] — state_history_length=1
+00507 |         pass
+00508 |     else:
+00509 |         # Unexpected shape, pass through
+00510 |         logger.warning(f"Unexpected state shape: {state.shape}")
+00511 | 
+00512 |     # --- State Encoder TRT ---
+00513 |     self.state_encoder_engine.set_runtime_tensor_shape("state", state.shape)
+00514 |     self.state_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+00515 |     state_features = self.state_encoder_engine(state, embodiment_id)["output"]
+00516 | 
+00517 |     # --- Initialize actions as random noise ---
+00518 |     if hasattr(self, "init_actions"):
+00519 |         actions = self.init_actions.expand((batch_size, -1, -1))
+00520 |     else:
+00521 |         actions = torch.randn(
+00522 |             size=(batch_size, self.config.action_horizon, self.action_dim),
+00523 |             dtype=engine_dtype,
+00524 |             device=device,
+00525 |         )
+00526 | 
+00527 |     num_steps = self.num_inference_timesteps
+00528 |     dt = 1.0 / num_steps
+00529 | 
+00530 |     # --- Denoising loop ---
+00531 |     for t in range(num_steps):
+00532 |         t_cont = t / float(num_steps)
+00533 |         t_discretized = int(t_cont * self.num_timestep_buckets)
+00534 | 
+00535 |         timesteps_tensor = torch.full(
+00536 |             size=(batch_size,), fill_value=t_discretized, device=device, dtype=torch.int64
+00537 |         )
+00538 | 
+00539 |         # Action Encoder TRT
+00540 |         self.action_encoder_engine.set_runtime_tensor_shape("actions", actions.shape)
+00541 |         self.action_encoder_engine.set_runtime_tensor_shape("timesteps", timesteps_tensor.shape)
+00542 |         self.action_encoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+00543 |         action_features = self.action_encoder_engine(
+00544 |             actions.to(engine_dtype), timesteps_tensor, embodiment_id
+00545 |         )["output"]
+00546 | 
+00547 |         # Maybe add position embedding (stays in PyTorch)
+00548 |         if self.config.add_pos_embed:
+00549 |             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+00550 |             pos_embs = self.position_embedding(pos_ids).unsqueeze(0).to(engine_dtype)
+00551 |             action_features = action_features + pos_embs
+00552 | 
+00553 |         # Concatenate state + action embeddings
+00554 |         sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
+00555 | 
+00556 |         # DiT TRT
+00557 |         self.dit_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
+00558 |         self.dit_engine.set_runtime_tensor_shape("vl_embs", vl_embs.shape)
+00559 |         self.dit_engine.set_runtime_tensor_shape("timestep", timesteps_tensor.shape)
+00560 | 
+00561 |         dit_kwargs = {}
+00562 |         if hasattr(backbone_output, "image_mask") and backbone_output.image_mask is not None:
+00563 |             image_mask = backbone_output.image_mask
+00564 |             self.dit_engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
+00565 |             dit_kwargs["image_mask"] = image_mask
+00566 | 
+00567 |         if (
+00568 |             hasattr(backbone_output, "backbone_attention_mask")
+00569 |             and backbone_output.backbone_attention_mask is not None
+00570 |         ):
+00571 |             bb_mask = backbone_output.backbone_attention_mask
+00572 |             self.dit_engine.set_runtime_tensor_shape("backbone_attention_mask", bb_mask.shape)
+00573 |             dit_kwargs["backbone_attention_mask"] = bb_mask
+00574 | 
+00575 |         model_output = self.dit_engine(sa_embs, vl_embs, timesteps_tensor, **dit_kwargs)["output"]
+00576 | 
+00577 |         # Action Decoder TRT
+00578 |         self.action_decoder_engine.set_runtime_tensor_shape("model_output", model_output.shape)
+00579 |         self.action_decoder_engine.set_runtime_tensor_shape("embodiment_id", embodiment_id.shape)
+00580 |         pred = self.action_decoder_engine(model_output, embodiment_id)["output"]
+00581 |         pred_velocity = pred[:, -self.action_horizon :]
+00582 | 
+00583 |         # Euler integration
+00584 |         actions = actions + dt * pred_velocity
+00585 | 
+00586 |     return BatchFeature(data={"action_pred": actions})
+00587 | 
+00588 | 
+00589 | # ============================================================
+00590 | # Engine Setup
+00591 | # ============================================================
+00592 | 
+00593 | 
+00594 | # Engines each mode swaps in with no PyTorch fallback: their absence must fail
+00595 | # fast with a build hint rather than a bare FileNotFoundError from Engine.load.
+00596 | _ACTION_HEAD_ENGINES = (
+00597 |     "state_encoder.engine",
+00598 |     "action_encoder.engine",
+00599 |     "dit_bf16.engine",
+00600 |     "action_decoder.engine",
+00601 | )
+00602 | _MANDATORY_ENGINES = {
+00603 |     InferenceMode.n17_full_pipeline: _ACTION_HEAD_ENGINES,
+00604 |     InferenceMode.action_head: _ACTION_HEAD_ENGINES,
+00605 | }
+00606 | 
+00607 | 
+00608 | def setup_tensorrt_engines(policy, trt_engine_path, mode=InferenceMode.n17_full_pipeline):
+00609 |     """Load TRT engines, delete PyTorch modules, and monkey-patch forward methods.
+00610 | 
+00611 |     Args:
+00612 |         policy: Gr00tPolicy instance
+00613 |         trt_engine_path: Path to directory containing TRT engine files
+00614 |         mode: an :class:`~gr00t.deployment.modes.InferenceMode` (or its string
+00615 |             value) selecting which engine subset to swap in. Invalid values raise.
+00616 |     """
+00617 |     mode = InferenceMode(mode)
+00618 |     if mode == InferenceMode.a2a_action_head:
+00619 |         if getattr(policy.model.config, "model_type", None) != "Gr00tN1d7A2A":
+00620 |             raise ValueError(
+00621 |                 "a2a_action_head inference mode requires a Gr00tN1d7A2A policy"
+00622 |             )
+00623 |         # The A2A engine is a single fused, fixed-step action head and has its
+00624 |         # own metadata/SHA contract. Route it before the original N1.7
+00625 |         # multi-engine bundle checks below.
+00626 |         return _setup_a2a_action_head(policy, trt_engine_path)
+00627 |     required = _MANDATORY_ENGINES.get(mode)
+00628 |     if required is not None:
+00629 |         assert_engine_bundle_present(
+00630 |             trt_engine_path,
+00631 |             required,
+00632 |             mode=mode.value,
+00633 |             source=f"setup_tensorrt_engines({mode})",
+00634 |         )
+00635 |     _meta = assert_engine_matches_policy(
+00636 |         policy, trt_engine_path, source=f"setup_tensorrt_engines({mode})"
+00637 |     )
+00638 | 
+00639 |     # Stash the ViT engine's baked grid_thw so the runtime ViT path can reject a
+00640 |     # mismatched image config. None for older bundles (no recorded grid).
+00641 |     policy.model.backbone._vit_baked_grid_thw = _meta.get("vit_grid_thw") if _meta else None
+00642 | 
+00643 |     _INFERENCE_MODE_DISPATCH[mode](policy, trt_engine_path)
+00644 | 
+00645 | 
+00646 | def close_tensorrt_engines(policy):
+00647 |     """Release every TRT ``Engine`` attached to ``policy`` (best-effort).
+00648 | 
+00649 |     setup_tensorrt_engines stashes engines as plain attributes on the backbone
+00650 |     and action head (which subset depends on the mode), so walk the model's
+00651 |     submodules and close each. Needed because the sim-eval entrypoint hard-exits
+00652 |     via os._exit, which skips ``Engine.__del__`` and would otherwise leak GPU
+00653 |     memory into the next eval shard.
+00654 |     """
+00655 |     # The sim wrapper exposes the inner Gr00tPolicy as ``.policy``; a remote
+00656 |     # PolicyClient has no model and no engines to close.
+00657 |     model = getattr(getattr(policy, "policy", policy), "model", None)
+00658 |     if model is None:
+00659 |         return
+00660 |     closed = set()
+00661 |     for module in model.modules():
+00662 |         # Snapshot the attribute values: close() runs C++ destructors, so avoid
+00663 |         # iterating a live __dict__ view.
+00664 |         for value in list(vars(module).values()):
+00665 |             if isinstance(value, Engine) and id(value) not in closed:
+00666 |                 closed.add(id(value))
+00667 |                 try:
+00668 |                     value.close()
+00669 |                 except Exception as e:
+00670 |                     print(f"Failed to close TRT engine: {e}")
+00671 | 
+00672 | 
+00673 | @contextmanager
+00674 | def closing_tensorrt_engines(policy):
+00675 |     """``with`` form of :func:`close_tensorrt_engines`, scoped to ``policy``.
+00676 | 
+00677 |     Closes only the engines attached to ``policy`` on block exit (including the
+00678 |     exception path), so it never touches engines owned by another live policy.
+00679 |     """
+00680 |     try:
+00681 |         yield policy
+00682 |     finally:
+00683 |         close_tensorrt_engines(policy)
+00684 | 
+00685 | 
+00686 | def _setup_n17_full_pipeline(policy, trt_engine_path):
+00687 |     """Set up TRT engines for N1.7: ViT TRT + LLM TRT + Action Head TRT.
+00688 | 
+00689 |     The Qwen3-VL backbone's vision encoder and text model are both replaced
+00690 |     with TRT engines. PyTorch ops kept: embed_tokens, masked_scatter,
+00691 |     get_rope_index (lightweight, <1ms).
+00692 | 
+00693 |     Falls back to PyTorch LLM if llm_bf16.engine is not found.
+00694 |     """
+00695 |     backbone = policy.model.backbone
+00696 |     qwen_model = backbone.model  # Qwen3VLForConditionalGeneration
+00697 |     action_head = policy.model.action_head
+00698 | 
+00699 |     # --- Backbone setup ---
+00700 |     # Save references needed by the TRT forward
+00701 |     backbone._embedding_layer = qwen_model.model.language_model.get_input_embeddings()
+00702 |     backbone._image_token_id = qwen_model.config.image_token_id
+00703 | 
+00704 |     # Load ViT TRT engine (optional — PyTorch ViT used as fallback for accuracy)
+00705 |     vit_engine_path = _resolve_vit_engine_path(trt_engine_path)
+00706 |     use_vit_trt = os.path.exists(vit_engine_path)
+00707 |     if use_vit_trt:
+00708 |         print(f"Loading ViT engine: {vit_engine_path}")
+00709 |         backbone.vit_engine = Engine(vit_engine_path)
+00710 |         del qwen_model.model.visual
+00711 |         torch.cuda.empty_cache()
+00712 |         print("  Deleted PyTorch ViT (replaced by TRT engine)")
+00713 |     else:
+00714 |         backbone.vit_engine = None
+00715 |         print(f"  ViT engine not found at {vit_engine_path}, keeping PyTorch ViT")
+00716 | 
+00717 |     # Load LLM TRT engine (if available)
+00718 |     llm_engine_path = os.path.join(trt_engine_path, "llm_bf16.engine")
+00719 |     use_llm_trt = os.path.exists(llm_engine_path)
+00720 | 
+00721 |     if use_llm_trt:
+00722 |         print(f"Loading LLM engine: {llm_engine_path}")
+00723 |         backbone.llm_engine = Engine(llm_engine_path)
+00724 | 
+00725 |         # Delete PyTorch LLM layers to free GPU memory
+00726 |         # Keep embed_tokens (needed for token embedding before TRT)
+00727 |         # Keep get_rope_index via inner_model (needed for position IDs)
+00728 |         del qwen_model.model.language_model.layers
+00729 |         del qwen_model.model.language_model.norm
+00730 |         torch.cuda.empty_cache()
+00731 |         print("  Deleted PyTorch LLM layers (replaced by TRT engine)")
+00732 |     else:
+00733 |         backbone.llm_engine = None
+00734 |         print(f"  LLM engine not found at {llm_engine_path}, using PyTorch LLM")
+00735 | 
+00736 |     # Monkey-patch backbone forward
+00737 |     if use_vit_trt and use_llm_trt:
+00738 |         backbone.forward = partial(qwen3_backbone_full_trt_forward, backbone)
+00739 |     elif use_vit_trt and not use_llm_trt:
+00740 |         backbone.forward = partial(qwen3_backbone_tensorrt_forward, backbone)
+00741 |     elif not use_vit_trt and use_llm_trt:
+00742 |         # PyTorch ViT + LLM TRT (best accuracy when ViT TRT has issues)
+00743 |         backbone.forward = partial(qwen3_backbone_llm_trt_forward, backbone)
+00744 |     else:
+00745 |         print("  No backbone TRT engines loaded, backbone remains in PyTorch")
+00746 | 
+00747 |     # --- Action head setup ---
+00748 |     # Load vl_self_attention TRT engine (if available)
+00749 |     vl_sa_engine_path = os.path.join(trt_engine_path, "vl_self_attention.engine")
+00750 |     if os.path.exists(vl_sa_engine_path):
+00751 |         print(f"Loading VL Self-Attention engine: {vl_sa_engine_path}")
+00752 |         action_head.vl_sa_engine = Engine(vl_sa_engine_path)
+00753 |         # Delete PyTorch module — TRT engine replaces it
+00754 |         if hasattr(action_head, "vl_self_attention"):
+00755 |             del action_head.vl_self_attention
+00756 |             torch.cuda.empty_cache()
+00757 |         print("  Deleted PyTorch vl_self_attention (replaced by TRT engine)")
+00758 |     else:
+00759 |         action_head.vl_sa_engine = None
+00760 |         print(f"  VL Self-Attention engine not found at {vl_sa_engine_path}, using PyTorch")
+00761 | 
+00762 |     if hasattr(action_head, "model"):
+00763 |         del action_head.model
+00764 |     if hasattr(action_head, "state_encoder"):
+00765 |         del action_head.state_encoder
+00766 |     if hasattr(action_head, "action_encoder"):
+00767 |         del action_head.action_encoder
+00768 |     if hasattr(action_head, "action_decoder"):
+00769 |         del action_head.action_decoder
+00770 |     torch.cuda.empty_cache()
+00771 | 
+00772 |     assert action_head.action_dim == action_head.config.max_action_dim
+00773 | 
+00774 |     print(f"Loading action head engines from: {trt_engine_path}")
+00775 |     action_head.state_encoder_engine = Engine(os.path.join(trt_engine_path, "state_encoder.engine"))
+00776 |     action_head.action_encoder_engine = Engine(
+00777 |         os.path.join(trt_engine_path, "action_encoder.engine")
+00778 |     )
+00779 |     action_head.dit_engine = Engine(os.path.join(trt_engine_path, "dit_bf16.engine"))
+00780 |     action_head.action_decoder_engine = Engine(
+00781 |         os.path.join(trt_engine_path, "action_decoder.engine")
+00782 |     )
+00783 | 
+00784 |     action_head.get_action = partial(action_head_tensorrt_forward, action_head)
+00785 | 
+00786 |     llm_status = "TRT" if use_llm_trt else "PyTorch"
+00787 |     vit_status = "TRT" if backbone.vit_engine else "PyTorch"
+00788 |     print("N1.7 full-pipeline TRT engines loaded.")
+00789 |     print(f"  ViT: {vit_status} | LLM: {llm_status} | Action Head: TRT")
+00790 | 
+00791 | 
+00792 | def _setup_vit_llm_only(policy, trt_engine_path):
+00793 |     """Set up TRT engines for ViT + LLM only; action head stays in PyTorch.
+00794 | 
+00795 |     Use this on platforms where DiT cannot be exported with dynamic vl_seq_len
+00796 |     (e.g. DGX Spark / torch 2.10 dynamo exporter bakes seq_len as static).
+00797 |     The backbone (ViT TRT + LLM TRT) still gets TRT acceleration; the PyTorch
+00798 |     action head receives the LLM embeddings at the actual runtime seq_len
+00799 |     without any shape constraint.
+00800 |     """
+00801 |     backbone = policy.model.backbone
+00802 |     qwen_model = backbone.model  # Qwen3VLForConditionalGeneration
+00803 | 
+00804 |     # Save references needed by the TRT forward
+00805 |     backbone._embedding_layer = qwen_model.model.language_model.get_input_embeddings()
+00806 |     backbone._image_token_id = qwen_model.config.image_token_id
+00807 | 
+00808 |     # Load ViT TRT engine
+00809 |     vit_engine_path = _resolve_vit_engine_path(trt_engine_path)
+00810 |     if not os.path.exists(vit_engine_path):
+00811 |         raise FileNotFoundError(
+00812 |             f"ViT TRT engine not found: {vit_engine_path}\n"
+00813 |             f"Run export_onnx_n1d7.py + build_tensorrt_engine.py first."
+00814 |         )
+00815 |     print(f"Loading ViT engine: {vit_engine_path}")
+00816 |     backbone.vit_engine = Engine(vit_engine_path)
+00817 |     del qwen_model.model.visual
+00818 |     torch.cuda.empty_cache()
+00819 |     print("  Deleted PyTorch ViT (replaced by TRT engine)")
+00820 | 
+00821 |     # Load LLM TRT engine
+00822 |     llm_engine_path = os.path.join(trt_engine_path, "llm_bf16.engine")
+00823 |     if not os.path.exists(llm_engine_path):
+00824 |         raise FileNotFoundError(
+00825 |             f"LLM TRT engine not found: {llm_engine_path}\n"
+00826 |             f"Run export_onnx_n1d7.py + build_tensorrt_engine.py first."
+00827 |         )
+00828 |     print(f"Loading LLM engine: {llm_engine_path}")
+00829 |     backbone.llm_engine = Engine(llm_engine_path)
+00830 |     del qwen_model.model.language_model.layers
+00831 |     del qwen_model.model.language_model.norm
+00832 |     torch.cuda.empty_cache()
+00833 |     print("  Deleted PyTorch LLM layers (replaced by TRT engine)")
+00834 | 
+00835 |     # Patch backbone forward to use ViT TRT + LLM TRT
+00836 |     backbone.forward = partial(qwen3_backbone_full_trt_forward, backbone)
+00837 | 
+00838 |     print("vit_llm_only TRT engines loaded.")
+00839 |     print("  ViT: TRT | LLM: TRT | Action Head: PyTorch")
+00840 | 
+00841 | 
+00842 | def _setup_action_head(policy, trt_engine_path):
+00843 |     """Set up TRT engines for action head only (N1.7 mode).
+00844 | 
+00845 |     Backbone (Qwen3-VL) stays in PyTorch. Only the 4 action head components
+00846 |     (State Encoder, Action Encoder, DiT, Action Decoder) are replaced with
+00847 |     TRT engines.
+00848 |     """
+00849 |     action_head = policy.model.action_head
+00850 | 
+00851 |     # Delete PyTorch modules that are replaced by TRT
+00852 |     if hasattr(action_head, "model"):
+00853 |         del action_head.model
+00854 |     if hasattr(action_head, "state_encoder"):
+00855 |         del action_head.state_encoder
+00856 |     if hasattr(action_head, "action_encoder"):
+00857 |         del action_head.action_encoder
+00858 |     if hasattr(action_head, "action_decoder"):
+00859 |         del action_head.action_decoder
+00860 |     torch.cuda.empty_cache()
+00861 | 
+00862 |     # Verify action_dim consistency
+00863 |     assert action_head.action_dim == action_head.config.max_action_dim, (
+00864 |         f"action_dim mismatch: action_head.action_dim={action_head.action_dim} "
+00865 |         f"!= config.max_action_dim={action_head.config.max_action_dim}"
+00866 |     )
+00867 | 
+00868 |     # Load action head TRT engines
+00869 |     print(f"Loading action head engines from: {trt_engine_path}")
+00870 |     action_head.state_encoder_engine = Engine(os.path.join(trt_engine_path, "state_encoder.engine"))
+00871 |     action_head.action_encoder_engine = Engine(
+00872 |         os.path.join(trt_engine_path, "action_encoder.engine")
+00873 |     )
+00874 |     action_head.dit_engine = Engine(os.path.join(trt_engine_path, "dit_bf16.engine"))
+00875 |     action_head.action_decoder_engine = Engine(
+00876 |         os.path.join(trt_engine_path, "action_decoder.engine")
+00877 |     )
+00878 | 
+00879 |     # Monkey-patch: backbone.forward stays original, only action head is replaced
+00880 |     action_head.get_action = partial(action_head_tensorrt_forward, action_head)
+00881 | 
+00882 |     print("Action head TRT engines loaded and forward method patched.")
+00883 |     print("  Backbone remains in PyTorch (Qwen3-VL).")
+00884 | 
+00885 | 
+00886 | def _setup_dit_only(policy, trt_engine_path):
+00887 |     """Set up TRT engine for DiT-only acceleration (backward compatible).
+00888 | 
+00889 |     Only replaces the DiT model in the action head. The backbone and other
+00890 |     action head components remain in PyTorch.
+00891 |     """
+00892 |     action_head = policy.model.action_head
+00893 | 
+00894 |     # Delete the PyTorch DiT model
+00895 |     if hasattr(action_head, "model"):
+00896 |         del action_head.model
+00897 |     torch.cuda.empty_cache()
+00898 | 
+00899 |     # Load DiT TRT engine
+00900 |     # Support both naming conventions
+00901 |     dit_path = os.path.join(trt_engine_path, "dit_bf16.engine")
+00902 |     if not os.path.exists(dit_path):
+00903 |         dit_path = os.path.join(trt_engine_path, "dit_model_bf16.engine")
+00904 |     if not os.path.exists(dit_path):
+00905 |         # Try the old naming convention
+00906 |         dit_path = os.path.join(trt_engine_path, "dit_model_bf16.trt")
+00907 | 
+00908 |     print(f"Loading DiT engine: {dit_path}")
+00909 |     action_head.dit_engine = Engine(dit_path)
+00910 | 
+00911 |     # Monkey-patch only the get_action method
+00912 |     # We need a simpler forward that only replaces the DiT call
+00913 |     @torch.no_grad()
+00914 |     def dit_only_get_action_with_features(
+00915 |         backbone_features,
+00916 |         state_features,
+00917 |         embodiment_id,
+00918 |         backbone_output,
+00919 |         action_input=None,
+00920 |         options=None,
+00921 |     ):
+00922 |         """get_action_with_features with DiT replaced by TRT.
+00923 | 
+00924 |         ``action_input``/``options`` are accepted (and unused) so the patched
+00925 |         method matches the ``Gr00tN1d7.get_action_with_features`` contract that
+00926 |         ``get_action`` calls with these keywords; the DiT-only path needs neither.
+00927 |         """
+00928 |         vl_embs = backbone_features
+00929 |         batch_size = vl_embs.shape[0]
+00930 |         device = vl_embs.device
+00931 |         engine_dtype = torch.bfloat16
+00932 | 
+00933 |         actions = torch.randn(
+00934 |             size=(batch_size, action_head.config.action_horizon, action_head.action_dim),
+00935 |             dtype=vl_embs.dtype,
+00936 |             device=device,
+00937 |         )
+00938 | 
+00939 |         dt = 1.0 / action_head.num_inference_timesteps
+00940 | 
+00941 |         for t in range(action_head.num_inference_timesteps):
+00942 |             t_cont = t / float(action_head.num_inference_timesteps)
+00943 |             t_discretized = int(t_cont * action_head.num_timestep_buckets)
+00944 | 
+00945 |             timesteps_tensor = torch.full(
+00946 |                 size=(batch_size,), fill_value=t_discretized, device=device
+00947 |             )
+00948 |             action_features = action_head.action_encoder(actions, timesteps_tensor, embodiment_id)
+00949 | 
+00950 |             if action_head.config.add_pos_embed:
+00951 |                 pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
+00952 |                 pos_embs = action_head.position_embedding(pos_ids).unsqueeze(0)
+00953 |                 action_features = action_features + pos_embs
+00954 | 
+00955 |             sa_embs = torch.cat((state_features, action_features), dim=1).to(engine_dtype)
+00956 | 
+00957 |             # Use TRT for DiT
+00958 |             vl_embs_trt = vl_embs.to(engine_dtype)
+00959 |             timesteps_trt = timesteps_tensor.to(torch.int64)
+00960 | 
+00961 |             action_head.dit_engine.set_runtime_tensor_shape("sa_embs", sa_embs.shape)
+00962 |             action_head.dit_engine.set_runtime_tensor_shape("vl_embs", vl_embs_trt.shape)
+00963 |             action_head.dit_engine.set_runtime_tensor_shape("timestep", timesteps_trt.shape)
+00964 | 
+00965 |             dit_kwargs = {}
+00966 |             if hasattr(backbone_output, "image_mask") and backbone_output.image_mask is not None:
+00967 |                 image_mask = backbone_output.image_mask
+00968 |                 action_head.dit_engine.set_runtime_tensor_shape("image_mask", image_mask.shape)
+00969 |                 dit_kwargs["image_mask"] = image_mask
+00970 | 
+00971 |             if (
+00972 |                 hasattr(backbone_output, "backbone_attention_mask")
+00973 |                 and backbone_output.backbone_attention_mask is not None
+00974 |             ):
+00975 |                 bb_mask = backbone_output.backbone_attention_mask
+00976 |                 action_head.dit_engine.set_runtime_tensor_shape(
+00977 |                     "backbone_attention_mask", bb_mask.shape
+00978 |                 )
+00979 |                 dit_kwargs["backbone_attention_mask"] = bb_mask
+00980 | 
+00981 |             model_output = action_head.dit_engine(
+00982 |                 sa_embs, vl_embs_trt, timesteps_trt, **dit_kwargs
+00983 |             )["output"]
+00984 | 
+00985 |             pred = action_head.action_decoder(model_output, embodiment_id)
+00986 |             pred_velocity = pred[:, -action_head.action_horizon :]
+00987 |             actions = actions + dt * pred_velocity
+00988 | 
+00989 |         return BatchFeature(
+00990 |             data={
+00991 |                 "action_pred": actions,
+00992 |                 "backbone_features": vl_embs,
+00993 |                 "state_features": state_features,
+00994 |             }
+00995 |         )
+00996 | 
+00997 |     action_head.get_action_with_features = dit_only_get_action_with_features
+00998 |     print("DiT-only TRT engine loaded and forward method patched.")
+00999 | 
+01000 | 
+01001 | def _setup_a2a_action_head(policy, trt_engine_path):
+01002 |     """Install the fused A2A head without importing TensorRT until selected."""
+01003 |     try:
+01004 |         from scripts.deployment.a2a_trt_model_forward import setup_a2a_tensorrt_engine
+01005 |     except ModuleNotFoundError:
+01006 |         # Direct execution places scripts/deployment, rather than the repository
+01007 |         # root, on sys.path.
+01008 |         from a2a_trt_model_forward import setup_a2a_tensorrt_engine
+01009 | 
+01010 |     return setup_a2a_tensorrt_engine(policy, trt_engine_path)
+01011 | 
+01012 | 
+01013 | # Maps each InferenceMode to its engine-swap routine. setup_tensorrt_engines
+01014 | # dispatches through this; a deployment test asserts the keys equal InferenceMode
+01015 | # exactly, so a new mode can't be added without a matching setup branch.
+01016 | _INFERENCE_MODE_DISPATCH = {
+01017 |     InferenceMode.a2a_action_head: _setup_a2a_action_head,
+01018 |     InferenceMode.n17_full_pipeline: _setup_n17_full_pipeline,
+01019 |     InferenceMode.vit_llm_only: _setup_vit_llm_only,
+01020 |     InferenceMode.action_head: _setup_action_head,
+01021 |     InferenceMode.dit_only: _setup_dit_only,
+01022 | }

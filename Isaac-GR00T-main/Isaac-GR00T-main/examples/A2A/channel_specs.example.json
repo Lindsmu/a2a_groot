@@ -1,0 +1,24 @@
+{
+  "new_embodiment": [
+    {
+      "action_key": "eef_pose_canonical",
+      "source_state_key": "eef_pose_canonical",
+      "kind": "continuous",
+      "canonical_format": "xyz_rot6d",
+      "source_format": "xyz_rot6d",
+      "target_format": "xyz_rot6d",
+      "source_unit": "meter_plus_dimensionless_rotation6d",
+      "target_unit": "meter_plus_dimensionless_rotation6d",
+      "source_frame": "robot_base",
+      "target_frame": "robot_base",
+      "dim": 9
+    },
+    {
+      "action_key": "gripper_command",
+      "source_state_key": "gripper_command",
+      "kind": "binary",
+      "canonical_format": "scalar",
+      "dim": 1
+    }
+  ]
+}

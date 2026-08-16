@@ -1,0 +1,100 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | from __future__ import annotations
+00004 | 
+00005 | import hashlib
+00006 | import json
+00007 | from pathlib import Path
+00008 | from types import SimpleNamespace
+00009 | 
+00010 | from gr00t.deployment.modes import BenchmarkMode, BuildEngineMode, InferenceMode, VerifyMode
+00011 | import pytest
+00012 | from scripts.deployment.a2a_trt_model_forward import (
+00013 |     A2A_ENGINE_INPUT_NAMES,
+00014 |     setup_a2a_tensorrt_engine,
+00015 | )
+00016 | 
+00017 | 
+00018 | _REPO_ROOT = Path(__file__).resolve().parents[3]
+00019 | 
+00020 | 
+00021 | def _policy(
+00022 |     model_type: str = "Gr00tN1d7A2A",
+00023 |     *,
+00024 |     data_contract_sha256: str = "a" * 64,
+00025 | ) -> SimpleNamespace:
+00026 |     config = SimpleNamespace(
+00027 |         model_type=model_type,
+00028 |         a2a_history_horizon=8,
+00029 |         a2a_future_horizon=8,
+00030 |         a2a_num_inference_steps=1,
+00031 |         a2a_latent_dim=512,
+00032 |         a2a_flow_backbone="mlp",
+00033 |         a2a_dit_token_dim=256,
+00034 |         a2a_dit_num_layers=8,
+00035 |         a2a_dit_num_heads=8,
+00036 |         a2a_dit_mlp_ratio=4,
+00037 |         a2a_dit_dropout=0.0,
+00038 |         a2a_expected_contract_sha256=data_contract_sha256,
+00039 |         max_action_dim=64,
+00040 |     )
+00041 |     processor = SimpleNamespace(a2a_canonical_statistics={"version": 1, "value": [1.0]})
+00042 |     return SimpleNamespace(
+00043 |         model=SimpleNamespace(config=config),
+00044 |         processor=processor,
+00045 |         model_path=Path("unused-for-early-validation-test"),
+00046 |     )
+00047 | 
+00048 | 
+00049 | def test_a2a_modes_are_registered() -> None:
+00050 |     assert InferenceMode("a2a_action_head") is InferenceMode.a2a_action_head
+00051 |     assert BuildEngineMode("a2a_action_head") is BuildEngineMode.a2a_action_head
+00052 |     assert BenchmarkMode("a2a_action_head") is BenchmarkMode.a2a_action_head
+00053 |     assert VerifyMode("a2a_action_head") is VerifyMode.a2a_action_head
+00054 | 
+00055 | 
+00056 | def test_a2a_setup_rejects_non_a2a_policy_before_loading_engine(tmp_path: Path) -> None:
+00057 |     with pytest.raises(ValueError, match="Gr00tN1d7A2A"):
+00058 |         setup_a2a_tensorrt_engine(_policy("Gr00tN1d7"), tmp_path)
+00059 | 
+00060 | 
+00061 | def test_a2a_setup_checks_engine_sha_before_importing_tensorrt(tmp_path: Path) -> None:
+00062 |     engine_path = tmp_path / "a2a_action_head.engine"
+00063 |     engine_path.write_bytes(b"engine-under-test")
+00064 |     metadata = {
+00065 |         "model_type": "Gr00tN1d7A2A",
+00066 |         "engine": engine_path.name,
+00067 |         "flow_backbone": "mlp",
+00068 |         "history_horizon": 8,
+00069 |         "future_horizon": 8,
+00070 |         "action_dim": 64,
+00071 |         "num_inference_steps": 1,
+00072 |         "inputs": list(A2A_ENGINE_INPUT_NAMES),
+00073 |         "engine_sha256": hashlib.sha256(b"different-engine").hexdigest(),
+00074 |     }
+00075 |     (tmp_path / "a2a_export_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+00076 | 
+00077 |     with pytest.raises(ValueError, match="SHA256 mismatch"):
+00078 |         setup_a2a_tensorrt_engine(_policy(), tmp_path)
+00079 | 
+00080 | 
+00081 | def test_a2a_builder_declares_fp32_profile_and_sha_contract() -> None:
+00082 |     source = (_REPO_ROOT / "scripts" / "deployment" / "build_tensorrt_engine.py").read_text(
+00083 |         encoding="utf-8"
+00084 |     )
+00085 |     assert 'dim_name in {"batch", "batch_size"}' in source
+00086 |     assert "def build_a2a_action_head_engine(" in source
+00087 |     assert 'opt_seq_lens={"vl_sequence": int(vl_sequence_length)}' in source
+00088 |     assert 'precision="fp32"' in source
+00089 |     assert '"engine_sha256": digest.hexdigest()' in source
+00090 |     assert 'metadata["onnx_sha256"] != actual_onnx_sha256' in source
+00091 | 
+00092 | 
+00093 | def test_standard_setup_routes_a2a_before_n17_bundle_contract() -> None:
+00094 |     source = (_REPO_ROOT / "scripts" / "deployment" / "trt_model_forward.py").read_text(
+00095 |         encoding="utf-8"
+00096 |     )
+00097 |     route = source.index("if mode == InferenceMode.a2a_action_head:")
+00098 |     n17_contract = source.index("assert_engine_bundle_present", route)
+00099 |     assert route < n17_contract
+00100 |     assert "InferenceMode.a2a_action_head: _setup_a2a_action_head" in source

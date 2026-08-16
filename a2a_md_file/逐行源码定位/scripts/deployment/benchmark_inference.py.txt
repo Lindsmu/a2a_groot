@@ -1,0 +1,698 @@
+00001 | #!/usr/bin/env python3
+00002 | 
+00003 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00004 | # SPDX-License-Identifier: Apache-2.0
+00005 | #
+00006 | # Licensed under the Apache License, Version 2.0 (the "License");
+00007 | # you may not use this file except in compliance with the License.
+00008 | # You may obtain a copy of the License at
+00009 | #
+00010 | # http://www.apache.org/licenses/LICENSE-2.0
+00011 | #
+00012 | # Unless required by applicable law or agreed to in writing, software
+00013 | # distributed under the License is distributed on an "AS IS" BASIS,
+00014 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00015 | # See the License for the specific language governing permissions and
+00016 | # limitations under the License.
+00017 | 
+00018 | """
+00019 | Benchmark script for GR00T inference timing.
+00020 | 
+00021 | Measures component-wise timing for:
+00022 | - Data Processing: VLAStepData preparation and collation
+00023 | - Backbone (VLM): Qwen3-VL forward pass
+00024 | - Action Head (DiT): Flow-matching diffusion model
+00025 | - E2E: Full end-to-end inference
+00026 | 
+00027 | Supports five inference modes:
+00028 | 1. PyTorch Eager: Standard PyTorch execution
+00029 | 2. torch.compile: PyTorch 2.0+ JIT compilation with max-autotune
+00030 | 3. TensorRT (DiT-only): Optimized DiT action head using TensorRT engine
+00031 | 4. TensorRT (Full Pipeline): All 6 components in TRT (ViT + LLM + Action Head)
+00032 | 5. TensorRT (vit_llm_only): ViT + LLM in TRT, action head in PyTorch (use on Spark/sm121)
+00033 | 
+00034 | Usage:
+00035 |     # Basic benchmark (Eager + torch.compile)
+00036 |     python scripts/deployment/benchmark_inference.py \
+00037 |         --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10
+00038 | 
+00039 |     # With DiT-only TRT
+00040 |     python scripts/deployment/benchmark_inference.py \
+00041 |         --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+00042 |         --trt-engine-path ./gr00t_trt_deployment/engines/dit_bf16.engine
+00043 | 
+00044 |     # With full-pipeline TRT (6 engines)
+00045 |     python scripts/deployment/benchmark_inference.py \
+00046 |         --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10 \
+00047 |         --trt-engine-path ./gr00t_trt_deployment/engines \
+00048 |         --trt-mode n17_full_pipeline
+00049 | """
+00050 | 
+00051 | from dataclasses import dataclass
+00052 | import gc
+00053 | import os
+00054 | import sys
+00055 | import time
+00056 | 
+00057 | import gr00t
+00058 | from gr00t.data.dataset.a2a_single_step_dataset import (
+00059 |     compute_a2a_window_bounds,
+00060 |     extract_a2a_step_data,
+00061 | )
+00062 | from gr00t.data.dataset.lerobot_episode_loader import LeRobotEpisodeLoader
+00063 | from gr00t.data.dataset.sharded_single_step_dataset import extract_step_data
+00064 | from gr00t.data.embodiment_tags import EmbodimentTag
+00065 | from gr00t.data.types import MessageType, VLAStepData
+00066 | from gr00t.deployment.modes import BenchmarkMode
+00067 | from gr00t.policy.gr00t_policy import Gr00tPolicy
+00068 | import numpy as np
+00069 | import torch
+00070 | import tyro
+00071 | 
+00072 | 
+00073 | # Ensure scripts/deployment/ is on sys.path for sibling module imports
+00074 | _DEPLOY_DIR = os.path.dirname(os.path.abspath(__file__))
+00075 | if _DEPLOY_DIR not in sys.path:
+00076 |     sys.path.insert(0, _DEPLOY_DIR)
+00077 | from _trt_contract import resolve_batch_size  # noqa: E402
+00078 | 
+00079 | 
+00080 | def set_seed(seed: int = 42):
+00081 |     """Set random seed for reproducibility."""
+00082 |     import random
+00083 | 
+00084 |     random.seed(seed)
+00085 |     np.random.seed(seed)
+00086 |     torch.manual_seed(seed)
+00087 |     if torch.cuda.is_available():
+00088 |         torch.cuda.manual_seed_all(seed)
+00089 | 
+00090 | 
+00091 | def _rec_to_dtype(x, dtype):
+00092 |     """Recursively convert all floating point tensors to the given dtype."""
+00093 |     if isinstance(x, torch.Tensor) and torch.is_floating_point(x):
+00094 |         return x.to(dtype=dtype)
+00095 |     elif isinstance(x, dict) or hasattr(x, "items"):
+00096 |         return {k: _rec_to_dtype(v, dtype) for k, v in x.items()}
+00097 |     elif isinstance(x, list):
+00098 |         return [_rec_to_dtype(v, dtype) for v in x]
+00099 |     else:
+00100 |         return x
+00101 | 
+00102 | 
+00103 | def prepare_model_inputs(policy, observation, return_states=False):
+00104 |     """
+00105 |     Prepare inputs for the model, mimicking what happens inside _get_action.
+00106 |     Returns collated_inputs that can be passed to model.get_action()
+00107 | 
+00108 |     Args:
+00109 |         policy: The Gr00tPolicy instance
+00110 |         observation: Dict with "video", "state", "language" keys
+00111 |         return_states: If True, also return the states list (for action denormalization)
+00112 | 
+00113 |     Returns:
+00114 |         collated_inputs if return_states=False, else (collated_inputs, states)
+00115 |     """
+00116 |     unbatched_obs = []
+00117 |     batch_size = observation["video"][list(observation["video"].keys())[0]].shape[0]
+00118 |     for i in range(batch_size):
+00119 |         unbatched_value = {
+00120 |             "video": {k: v[i] for k, v in observation["video"].items()},
+00121 |             "state": {k: v[i] for k, v in observation["state"].items()},
+00122 |             "language": {k: v[i] for k, v in observation["language"].items()},
+00123 |         }
+00124 |         unbatched_obs.append(unbatched_value)
+00125 | 
+00126 |     processed_inputs = []
+00127 |     states = []
+00128 |     for obs in unbatched_obs:
+00129 |         vla_step_data = VLAStepData(
+00130 |             images=obs["video"],
+00131 |             states=obs["state"],
+00132 |             actions={},
+00133 |             text=obs["language"][policy.language_key][0],
+00134 |             embodiment=policy.embodiment_tag,
+00135 |         )
+00136 |         states.append(vla_step_data.states)
+00137 |         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+00138 |         processed_inputs.append(policy.processor(messages))
+00139 | 
+00140 |     collated_inputs = policy.collate_fn(processed_inputs)
+00141 |     collated_inputs = collated_inputs["inputs"]
+00142 |     collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+00143 | 
+00144 |     if return_states:
+00145 |         return collated_inputs, states
+00146 |     return collated_inputs
+00147 | 
+00148 | 
+00149 | def get_device_name():
+00150 |     """Get short device name for table."""
+00151 |     if torch.cuda.is_available():
+00152 |         name = torch.cuda.get_device_name(0)
+00153 |         # Shorten common names
+00154 |         if "H100" in name:
+00155 |             return "H100"
+00156 |         elif "A100" in name:
+00157 |             return "A100"
+00158 |         elif "RTX 5090" in name:
+00159 |             return "RTX 5090"
+00160 |         elif "RTX 4090" in name:
+00161 |             return "RTX 4090"
+00162 |         elif "RTX 3090" in name:
+00163 |             return "RTX 3090"
+00164 |         elif "Orin" in name:
+00165 |             return "Jetson Orin"
+00166 |         else:
+00167 |             # Return first meaningful part
+00168 |             return name.split()[1] if len(name.split()) > 1 else name
+00169 |     return "CPU"
+00170 | 
+00171 | 
+00172 | def compute_e2e_from_components(components):
+00173 |     """Compute E2E timing as sum of components (more stable than separate measurement)."""
+00174 |     return components["data_processing"] + components["backbone"] + components["action_head"]
+00175 | 
+00176 | 
+00177 | def benchmark_data_processing(policy, observation, num_iterations=20, warmup=10):
+00178 |     """
+00179 |     Benchmark data processing separately with proper warmup.
+00180 |     Data processing is CPU-bound and needs more warmup iterations.
+00181 | 
+00182 |     Args:
+00183 |         policy: The Gr00tPolicy instance
+00184 |         observation: Either a single observation dict OR a list of observation dicts (trajectory)
+00185 |         num_iterations: Number of benchmark iterations
+00186 |         warmup: Number of warmup iterations
+00187 | 
+00188 |     If observation is a list (trajectory), cycles through observations during benchmarking.
+00189 |     """
+00190 |     import gc
+00191 | 
+00192 |     # Handle both single observation and trajectory (list of observations)
+00193 |     if isinstance(observation, list):
+00194 |         observations = observation
+00195 |     else:
+00196 |         observations = [observation]
+00197 | 
+00198 |     num_obs = len(observations)
+00199 | 
+00200 |     # Force GC before warmup to reduce variance
+00201 |     gc.collect()
+00202 | 
+00203 |     # Warmup - helps with CPU caching and JIT for consistent benchmarks
+00204 |     # For trajectory mode, warmup benefit is reduced since each observation is different
+00205 |     if warmup > 0:
+00206 |         for i in range(warmup):
+00207 |             obs = observations[i % num_obs]
+00208 |             _ = prepare_model_inputs(policy, obs)
+00209 |         # Force GC after warmup
+00210 |         gc.collect()
+00211 | 
+00212 |     # Benchmark
+00213 |     times = []
+00214 |     for i in range(num_iterations):
+00215 |         obs = observations[i % num_obs]
+00216 |         start = time.perf_counter()
+00217 |         _ = prepare_model_inputs(policy, obs)
+00218 |         end = time.perf_counter()
+00219 |         times.append(end - start)
+00220 | 
+00221 |     return np.array(times) * 1000
+00222 | 
+00223 | 
+00224 | def benchmark_components(policy, observation, num_iterations=20, warmup=3):
+00225 |     """
+00226 |     Benchmark component-wise timing.
+00227 |     Returns dict with times for: data_processing, backbone, action_head
+00228 | 
+00229 |     Args:
+00230 |         policy: The Gr00tPolicy instance
+00231 |         observation: Either a single observation dict OR a list of observation dicts (trajectory)
+00232 |         num_iterations: Number of benchmark iterations
+00233 |         warmup: Number of warmup iterations
+00234 | 
+00235 |     If observation is a list (trajectory), cycles through observations during benchmarking.
+00236 |     """
+00237 |     import gc
+00238 | 
+00239 |     # Handle both single observation and trajectory (list of observations)
+00240 |     if isinstance(observation, list):
+00241 |         observations = observation
+00242 |     else:
+00243 |         observations = [observation]
+00244 | 
+00245 |     num_obs = len(observations)
+00246 | 
+00247 |     # Prepare inputs once for backbone/action_head warmup
+00248 |     collated_inputs = prepare_model_inputs(policy, observations[0])
+00249 | 
+00250 |     # Warmup backbone + action head
+00251 |     for i in range(warmup):
+00252 |         obs = observations[i % num_obs]
+00253 |         collated_inputs = prepare_model_inputs(policy, obs)
+00254 |         with torch.inference_mode():
+00255 |             backbone_inputs, action_inputs = policy.model.prepare_input(collated_inputs)
+00256 |             backbone_outputs = policy.model.backbone(backbone_inputs)
+00257 |             _ = policy.model.action_head.get_action(backbone_outputs, action_inputs)
+00258 |     torch.cuda.synchronize()
+00259 | 
+00260 |     # Force GC before timing
+00261 |     gc.collect()
+00262 | 
+00263 |     # Benchmark backbone and action head (GPU-bound)
+00264 |     backbone_times = []
+00265 |     action_head_times = []
+00266 | 
+00267 |     for i in range(num_iterations):
+00268 |         obs = observations[i % num_obs]
+00269 |         collated_inputs = prepare_model_inputs(policy, obs)
+00270 | 
+00271 |         # Backbone timing
+00272 |         torch.cuda.synchronize()
+00273 |         start = time.perf_counter()
+00274 |         with torch.inference_mode():
+00275 |             backbone_inputs, action_inputs = policy.model.prepare_input(collated_inputs)
+00276 |             backbone_outputs = policy.model.backbone(backbone_inputs)
+00277 |         torch.cuda.synchronize()
+00278 |         end = time.perf_counter()
+00279 |         backbone_times.append(end - start)
+00280 | 
+00281 |         # Action head timing
+00282 |         torch.cuda.synchronize()
+00283 |         start = time.perf_counter()
+00284 |         with torch.inference_mode():
+00285 |             _ = policy.model.action_head.get_action(backbone_outputs, action_inputs)
+00286 |         torch.cuda.synchronize()
+00287 |         end = time.perf_counter()
+00288 |         action_head_times.append(end - start)
+00289 | 
+00290 |     # Benchmark data processing separately with proper warmup
+00291 |     data_processing_times = benchmark_data_processing(
+00292 |         policy, observation, num_iterations, warmup=10
+00293 |     )
+00294 | 
+00295 |     return {
+00296 |         "data_processing": data_processing_times,
+00297 |         "backbone": np.array(backbone_times) * 1000,
+00298 |         "action_head": np.array(action_head_times) * 1000,
+00299 |     }
+00300 | 
+00301 | 
+00302 | def print_markdown_table(results, device_name, denoising_steps):
+00303 |     """Print results as a markdown table using median for robustness."""
+00304 |     print("\n" + "=" * 100)
+00305 |     print("MARKDOWN TABLE (copy/paste into README)")
+00306 |     print("=" * 100)
+00307 |     print(f"\nGR00T N1.7 Inference Timing ({denoising_steps} denoising steps):\n")
+00308 | 
+00309 |     # Component breakdown table (using median for robustness against outliers)
+00310 |     print("### Component-wise Breakdown\n")
+00311 |     print("| Device | Mode | Data Processing | Backbone | Action Head | E2E | Frequency |")
+00312 |     print("|--------|------|-----------------|----------|-------------|-----|-----------|")
+00313 | 
+00314 |     for mode, data in results.items():
+00315 |         dp_median = np.median(data["data_processing"])
+00316 |         bb_median = np.median(data["backbone"])
+00317 |         ah_median = np.median(data["action_head"])
+00318 |         e2e_median = np.median(data["e2e"])
+00319 |         freq = 1000 / e2e_median
+00320 |         print(
+00321 |             f"| {device_name} | {mode} | {dp_median:.0f} ms | {bb_median:.0f} ms | {ah_median:.0f} ms | {e2e_median:.0f} ms | {freq:.1f} Hz |"
+00322 |         )
+00323 | 
+00324 |     # Speedup table
+00325 |     if "PyTorch Eager" in results and len(results) > 1:
+00326 |         print("\n### Speedup vs PyTorch Eager\n")
+00327 |         print("| Device | Mode | E2E Speedup | Action Head Speedup |")
+00328 |         print("|--------|------|-------------|---------------------|")
+00329 | 
+00330 |         baseline_e2e = np.median(results["PyTorch Eager"]["e2e"])
+00331 |         baseline_ah = np.median(results["PyTorch Eager"]["action_head"])
+00332 | 
+00333 |         for mode, data in results.items():
+00334 |             e2e_median = np.median(data["e2e"])
+00335 |             ah_median = np.median(data["action_head"])
+00336 |             e2e_speedup = baseline_e2e / e2e_median
+00337 |             ah_speedup = baseline_ah / ah_median
+00338 |             print(f"| {device_name} | {mode} | {e2e_speedup:.2f}x | {ah_speedup:.2f}x |")
+00339 | 
+00340 |     print("\n" + "=" * 100)
+00341 | 
+00342 | 
+00343 | @dataclass
+00344 | class BenchmarkConfig:
+00345 |     """Configuration for GR00T inference benchmarking."""
+00346 | 
+00347 |     model_path: str = "checkpoints/GR00T-N1.7-LIBERO/libero_10"
+00348 |     """Path to model checkpoint (local path, e.g. checkpoints/GR00T-N1.7-LIBERO/libero_10)."""
+00349 | 
+00350 |     dataset_path: str | None = None
+00351 |     """Path to dataset. Defaults to demo_data/libero_demo."""
+00352 | 
+00353 |     embodiment_tag: str = "libero_sim"
+00354 |     """Embodiment tag to use."""
+00355 | 
+00356 |     trt_engine_path: str | None = None
+00357 |     """Path to TensorRT engine. If not provided, TensorRT benchmark is skipped."""
+00358 | 
+00359 |     num_iterations: int = 20
+00360 |     """Number of benchmark iterations."""
+00361 | 
+00362 |     warmup: int = 5
+00363 |     """Number of warmup iterations."""
+00364 | 
+00365 |     seed: int = 42
+00366 |     """Random seed for reproducibility."""
+00367 | 
+00368 |     trt_mode: BenchmarkMode = BenchmarkMode.dit_only
+00369 |     """TRT mode: 'dit_only' (DiT engine only), 'n17_full_pipeline' (all 6 engines), or 'vit_llm_only' (ViT+LLM TRT, action head in PyTorch — use on Spark/sm121)."""
+00370 | 
+00371 |     skip_compile: bool = False
+00372 |     """Skip torch.compile benchmark (can take a while due to JIT compilation)."""
+00373 | 
+00374 |     batch_size: int = 1
+00375 |     """Batch size for TRT inference. Must match the batch size used during ONNX export."""
+00376 | 
+00377 |     use_trajectory: bool = False
+00378 |     """Benchmark on full trajectory instead of single data point. This cycles through all steps in an episode for more realistic benchmarking."""
+00379 | 
+00380 | 
+00381 | def main(args: BenchmarkConfig | None = None):
+00382 |     if args is None:
+00383 |         args = tyro.cli(BenchmarkConfig)
+00384 | 
+00385 |     set_seed(args.seed)
+00386 |     device = "cuda" if torch.cuda.is_available() else "cpu"
+00387 |     if device == "cpu":
+00388 |         print("ERROR: No CUDA GPU detected. Benchmarking requires a GPU.")
+00389 |         sys.exit(1)
+00390 |     device_name = get_device_name()
+00391 | 
+00392 |     # Default dataset path
+00393 |     if args.dataset_path is None:
+00394 |         repo_path = os.path.dirname(os.path.dirname(gr00t.__file__))
+00395 |         args.dataset_path = os.path.join(repo_path, "demo_data/libero_demo")
+00396 | 
+00397 |     print("=" * 100)
+00398 |     print("GR00T INFERENCE BENCHMARK")
+00399 |     print("=" * 100)
+00400 |     print(
+00401 |         f"Device: {device_name} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})"
+00402 |     )
+00403 |     print(f"Model: {args.model_path}")
+00404 |     print(f"Dataset: {args.dataset_path}")
+00405 |     print(f"Iterations: {args.num_iterations}")
+00406 |     print(f"Warmup: {args.warmup}")
+00407 |     print(f"Use Trajectory: {args.use_trajectory}")
+00408 |     print()
+00409 | 
+00410 |     # Load dataset and prepare observation
+00411 |     print("Loading policy...")
+00412 |     policy = Gr00tPolicy(
+00413 |         model_path=args.model_path,
+00414 |         embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
+00415 |         device=device,
+00416 |         strict=True,
+00417 |     )
+00418 | 
+00419 |     denoising_steps = policy.model.action_head.num_inference_timesteps
+00420 |     action_horizon = policy.model.action_head.action_horizon
+00421 |     print(f"Action Horizon: {action_horizon}")
+00422 |     print(f"Denoising Steps: {denoising_steps}")
+00423 | 
+00424 |     if args.trt_engine_path:
+00425 |         resolve_batch_size(args.trt_engine_path, args.batch_size, source="benchmark_inference")
+00426 | 
+00427 |     modality_config = policy.get_modality_config()
+00428 |     dataset = LeRobotEpisodeLoader(
+00429 |         dataset_path=args.dataset_path,
+00430 |         modality_configs=modality_config,
+00431 |     )
+00432 | 
+00433 |     episode_data = dataset[0]
+00434 |     is_a2a = getattr(policy.model.config, "model_type", None) == "Gr00tN1d7A2A"
+00435 |     a2a_bounds = (
+00436 |         compute_a2a_window_bounds(len(episode_data), modality_config) if is_a2a else None
+00437 |     )
+00438 |     if a2a_bounds is not None and a2a_bounds.num_steps <= 0:
+00439 |         raise ValueError("Benchmark episode has no complete A2A temporal window")
+00440 | 
+00441 |     def extract_benchmark_step(step_idx):
+00442 |         if is_a2a:
+00443 |             return extract_a2a_step_data(
+00444 |                 episode_data,
+00445 |                 step_index=step_idx,
+00446 |                 modality_configs=modality_config,
+00447 |                 embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
+00448 |             )
+00449 |         return extract_step_data(
+00450 |             episode_data,
+00451 |             step_index=step_idx,
+00452 |             modality_configs=modality_config,
+00453 |             embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
+00454 |             allow_padding=False,
+00455 |         )
+00456 | 
+00457 |     if args.use_trajectory:
+00458 |         # Load all steps from the episode for trajectory-based benchmarking
+00459 |         # episode_data is a pandas DataFrame, so len() gives the number of steps
+00460 |         trajectory_length = len(episode_data)
+00461 | 
+00462 |         observations = []
+00463 |         step_indices = (
+00464 |             range(a2a_bounds.valid_start, a2a_bounds.valid_end + 1)
+00465 |             if a2a_bounds is not None
+00466 |             else range(trajectory_length)
+00467 |         )
+00468 |         for step_idx in step_indices:
+00469 |             try:
+00470 |                 step_data = extract_benchmark_step(step_idx)
+00471 |                 obs = {
+00472 |                     "video": {k: np.stack(step_data.images[k])[None] for k in step_data.images},
+00473 |                     "state": {k: step_data.states[k][None] for k in step_data.states},
+00474 |                     "language": {modality_config["language"].modality_keys[0]: [[step_data.text]]},
+00475 |                 }
+00476 |                 observations.append(obs)
+00477 |             except Exception:
+00478 |                 # Stop if we can't extract more steps (e.g., due to video frame requirements)
+00479 |                 break
+00480 | 
+00481 |         print(f"Loaded trajectory with {len(observations)} steps")
+00482 |         observation = observations  # Pass list to benchmark functions
+00483 |     else:
+00484 |         step_index = a2a_bounds.valid_start if a2a_bounds is not None else 0
+00485 |         step_data = extract_benchmark_step(step_index)
+00486 | 
+00487 |         observation = {
+00488 |             "video": {k: np.stack(step_data.images[k])[None] for k in step_data.images},
+00489 |             "state": {k: step_data.states[k][None] for k in step_data.states},
+00490 |             "language": {modality_config["language"].modality_keys[0]: [[step_data.text]]},
+00491 |         }
+00492 | 
+00493 |     # Tile observations to match the batch size baked into TRT engines
+00494 |     if args.batch_size > 1:
+00495 |         from verify_n1d7_trt import _tile_observation
+00496 | 
+00497 |         print(f"Tiling observations to batch_size={args.batch_size}")
+00498 |         if isinstance(observation, list):
+00499 |             observation = [_tile_observation(obs, args.batch_size) for obs in observation]
+00500 |         else:
+00501 |             observation = _tile_observation(observation, args.batch_size)
+00502 | 
+00503 |     results = {}
+00504 | 
+00505 |     # ========================================
+00506 |     # 0. Benchmark Data Processing (shared across all modes)
+00507 |     # ========================================
+00508 |     # Data processing is the same regardless of inference mode (PyTorch/compile/TensorRT)
+00509 |     # so we benchmark it once with proper warmup to get consistent measurements
+00510 |     print("\n" + "-" * 50)
+00511 |     print("Benchmarking Data Processing (shared across all modes)...")
+00512 |     print("-" * 50)
+00513 | 
+00514 |     shared_data_processing_times = benchmark_data_processing(
+00515 |         policy, observation, args.num_iterations, warmup=10
+00516 |     )
+00517 |     print(
+00518 |         f"  Data Processing: {np.mean(shared_data_processing_times):.2f} ± {np.std(shared_data_processing_times):.2f} ms"
+00519 |     )
+00520 | 
+00521 |     # ========================================
+00522 |     # 1. PyTorch Eager
+00523 |     # ========================================
+00524 |     print("\n" + "-" * 50)
+00525 |     print("Benchmarking PyTorch Eager...")
+00526 |     print("-" * 50)
+00527 | 
+00528 |     times_components = benchmark_components(policy, observation, args.num_iterations, args.warmup)
+00529 | 
+00530 |     components = {
+00531 |         "data_processing": shared_data_processing_times,
+00532 |         "backbone": times_components["backbone"],
+00533 |         "action_head": times_components["action_head"],
+00534 |     }
+00535 |     components["e2e"] = compute_e2e_from_components(components)
+00536 |     results["PyTorch Eager"] = components
+00537 | 
+00538 |     e2e_median = np.median(components["e2e"])
+00539 |     print(f"  E2E:             {e2e_median:.0f} ms ({1000 / e2e_median:.1f} Hz)")
+00540 |     print(f"  Data Processing: {np.median(components['data_processing']):.0f} ms")
+00541 |     print(f"  Backbone:        {np.median(components['backbone']):.0f} ms")
+00542 |     print(f"  Action Head:     {np.median(components['action_head']):.0f} ms")
+00543 | 
+00544 |     # ========================================
+00545 |     # 2. torch.compile
+00546 |     # ========================================
+00547 |     if not args.skip_compile:
+00548 |         print("\n" + "-" * 50)
+00549 |         print("Benchmarking torch.compile (mode='max-autotune')...")
+00550 |         print("(This may take a while due to JIT compilation on first run)")
+00551 |         print("-" * 50)
+00552 | 
+00553 |         # Free the eager policy before loading the compiled instance to avoid
+00554 |         # holding two full model copies in GPU memory simultaneously (OOM on Orin).
+00555 |         del policy
+00556 |         torch.cuda.empty_cache()
+00557 |         gc.collect()
+00558 | 
+00559 |         policy_compiled = Gr00tPolicy(
+00560 |             model_path=args.model_path,
+00561 |             embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
+00562 |             device=device,
+00563 |             strict=True,
+00564 |         )
+00565 |         policy_compiled.model.action_head.model.forward = torch.compile(
+00566 |             policy_compiled.model.action_head.model.forward, mode="max-autotune"
+00567 |         )
+00568 | 
+00569 |         # Enable cuDNN benchmark for additional optimization
+00570 |         if torch.cuda.is_available():
+00571 |             torch.backends.cudnn.benchmark = True
+00572 | 
+00573 |         # Extra warmup for torch.compile JIT
+00574 |         times_components = benchmark_components(
+00575 |             policy_compiled, observation, args.num_iterations, warmup=args.warmup + 2
+00576 |         )
+00577 | 
+00578 |         components = {
+00579 |             "data_processing": shared_data_processing_times,
+00580 |             "backbone": times_components["backbone"],
+00581 |             "action_head": times_components["action_head"],
+00582 |         }
+00583 |         components["e2e"] = compute_e2e_from_components(components)
+00584 |         results["torch.compile"] = components
+00585 | 
+00586 |         e2e_median = np.median(components["e2e"])
+00587 |         print(f"  E2E:             {e2e_median:.0f} ms ({1000 / e2e_median:.1f} Hz)")
+00588 |         print(f"  Data Processing: {np.median(components['data_processing']):.0f} ms")
+00589 |         print(f"  Backbone:        {np.median(components['backbone']):.0f} ms")
+00590 |         print(f"  Action Head:     {np.median(components['action_head']):.0f} ms")
+00591 | 
+00592 |     # ========================================
+00593 |     # 3. TensorRT (if available)
+00594 |     # ========================================
+00595 |     if args.trt_engine_path and os.path.exists(args.trt_engine_path):
+00596 |         trt_label = f"TensorRT ({args.trt_mode})"
+00597 |         print("\n" + "-" * 50)
+00598 |         print(f"Benchmarking {trt_label}...")
+00599 |         print("-" * 50)
+00600 | 
+00601 |         # Free whichever policy is still in memory before loading TRT, to avoid
+00602 |         # holding two full model copies in GPU memory simultaneously (OOM on Orin).
+00603 |         try:
+00604 |             del policy_compiled
+00605 |         except NameError:
+00606 |             pass
+00607 |         try:
+00608 |             del policy
+00609 |         except NameError:
+00610 |             pass
+00611 |         torch.cuda.empty_cache()
+00612 |         gc.collect()
+00613 | 
+00614 |         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+00615 |         from standalone_inference_script import replace_dit_with_tensorrt
+00616 | 
+00617 |         policy_trt = Gr00tPolicy(
+00618 |             model_path=args.model_path,
+00619 |             embodiment_tag=EmbodimentTag.resolve(args.embodiment_tag),
+00620 |             device=device,
+00621 |             strict=True,
+00622 |         )
+00623 | 
+00624 |         if args.trt_mode in ("a2a_action_head", "n17_full_pipeline", "vit_llm_only"):
+00625 |             from trt_model_forward import setup_tensorrt_engines
+00626 | 
+00627 |             setup_tensorrt_engines(policy_trt, args.trt_engine_path, mode=args.trt_mode)
+00628 |         else:
+00629 |             from standalone_inference_script import replace_dit_with_tensorrt
+00630 | 
+00631 |             # dit_only mode: trt_engine_path may be a directory; resolve the engine file
+00632 |             dit_engine_path = args.trt_engine_path
+00633 |             if os.path.isdir(dit_engine_path):
+00634 |                 dit_engine_path = os.path.join(dit_engine_path, "dit_bf16.engine")
+00635 |             replace_dit_with_tensorrt(policy_trt, dit_engine_path)
+00636 | 
+00637 |         # TensorRT needs extra warmup for engine initialization and CUDA context setup
+00638 |         trt_warmup = max(args.warmup + 5, 10)
+00639 |         times_components = benchmark_components(
+00640 |             policy_trt, observation, args.num_iterations, warmup=trt_warmup
+00641 |         )
+00642 | 
+00643 |         components = {
+00644 |             "data_processing": shared_data_processing_times,
+00645 |             "backbone": times_components["backbone"],
+00646 |             "action_head": times_components["action_head"],
+00647 |         }
+00648 |         components["e2e"] = compute_e2e_from_components(components)
+00649 |         results[trt_label] = components
+00650 | 
+00651 |         e2e_median = np.median(components["e2e"])
+00652 |         print(f"  E2E:             {e2e_median:.0f} ms ({1000 / e2e_median:.1f} Hz)")
+00653 |         print(f"  Data Processing: {np.median(components['data_processing']):.0f} ms")
+00654 |         print(f"  Backbone:        {np.median(components['backbone']):.0f} ms")
+00655 |         print(f"  Action Head:     {np.median(components['action_head']):.0f} ms")
+00656 |     elif args.trt_engine_path:
+00657 |         print(f"\nTensorRT engine not found: {args.trt_engine_path}")
+00658 |         print("To build engines for full pipeline, run:")
+00659 |         print(
+00660 |             "  python scripts/deployment/export_onnx_n1d7.py --model-path checkpoints/GR00T-N1.7-LIBERO/libero_10"
+00661 |             " --dataset-path demo_data/libero_demo --output-dir ./gr00t_trt_deployment/onnx --export-mode full_pipeline"
+00662 |         )
+00663 |         print(
+00664 |             "  python scripts/deployment/build_tensorrt_engine.py --mode full_pipeline"
+00665 |             " --onnx-dir ./gr00t_trt_deployment/onnx --engine-dir ./gr00t_trt_deployment/engines --precision bf16"
+00666 |         )
+00667 | 
+00668 |     # ========================================
+00669 |     # Print Summary Tables
+00670 |     # ========================================
+00671 |     print_markdown_table(results, device_name, denoising_steps)
+00672 | 
+00673 |     # Detailed summary
+00674 |     print("\n" + "=" * 100)
+00675 |     print("DETAILED SUMMARY")
+00676 |     print("=" * 100)
+00677 |     print(f"\nHardware: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+00678 |     print(f"Model: {args.model_path}")
+00679 |     print(f"Action Horizon: {action_horizon}")
+00680 |     print(f"Denoising Steps: {denoising_steps}")
+00681 | 
+00682 |     for mode, data in results.items():
+00683 |         print(f"\n{mode}:")
+00684 |         e2e = data["e2e"]
+00685 |         print(
+00686 |             f"  E2E:             median={np.median(e2e):.1f} ms, mean={np.mean(e2e):.1f} ± {np.std(e2e):.1f} ms, "
+00687 |             f"min={np.min(e2e):.1f}, max={np.max(e2e):.1f} ({1000 / np.median(e2e):.1f} Hz)"
+00688 |         )
+00689 |         print(f"  Data Processing: {np.median(data['data_processing']):.2f} ms (median)")
+00690 |         print(f"  Backbone:        {np.median(data['backbone']):.2f} ms (median)")
+00691 |         print(f"  Action Head:     {np.median(data['action_head']):.2f} ms (median)")
+00692 | 
+00693 |     print("\n" + "=" * 100)
+00694 | 
+00695 | 
+00696 | if __name__ == "__main__":
+00697 |     config = tyro.cli(BenchmarkConfig)
+00698 |     main(config)

@@ -1,0 +1,387 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """Custom Trainer with simple profiling utilities.
+00017 | 
+00018 | This subclass of HuggingFace's ``Trainer`` measures:
+00019 | 1. Data loading latency (time between the end of the previous ``training_step`` and
+00020 |    the start of the current ``training_step``).
+00021 | 2. Forward-pass latency (time spent inside the base ``training_step`` implementation,
+00022 |    which essentially wraps the model's forward / loss computation).
+00023 | 
+00024 | The statistics are logged via ``self.log`` every ``profile_log_interval`` steps and
+00025 | also sent to the standard ``logging`` logger.  This is *not* meant to be a fully
+00026 | fledged profiler – it is a quick, lightweight way to confirm whether the training
+00027 | pipeline is bottlenecked by data loading or by the model's computation.
+00028 | """
+00029 | 
+00030 | from __future__ import annotations
+00031 | 
+00032 | import logging
+00033 | import os
+00034 | import queue
+00035 | import threading
+00036 | from typing import Any, Optional
+00037 | 
+00038 | import torch
+00039 | from transformers.trainer import TRAINER_STATE_NAME, Trainer, TrainerState, get_last_checkpoint
+00040 | from transformers.trainer_callback import TrainerCallback
+00041 | 
+00042 | 
+00043 | class ProfCallback(TrainerCallback):
+00044 |     def __init__(self, prof):
+00045 |         self.prof = prof
+00046 | 
+00047 |     def on_step_end(self, args, state, control, **kwargs):
+00048 |         self.prof.step()
+00049 | 
+00050 | 
+00051 | class _BatchIterator:
+00052 |     """Lightweight iterator that yields pre-collated batches."""
+00053 | 
+00054 |     def __init__(self, buffer, bs, collator, total_steps):
+00055 |         self._buffer = buffer
+00056 |         self._bs = bs
+00057 |         self._collate = collator
+00058 |         self._total_steps = total_steps
+00059 |         self._produced = 0
+00060 | 
+00061 |     def __iter__(self):
+00062 |         return self
+00063 | 
+00064 |     def __len__(self):
+00065 |         return self._total_steps
+00066 | 
+00067 |     def __next__(self):
+00068 |         if self._produced >= self._total_steps:
+00069 |             raise StopIteration
+00070 | 
+00071 |         # Fast path – single lock acquisition inside ``sample_batch``.
+00072 |         batch_samples = self._buffer.sample_batch(self._bs)  # type: ignore[attr-defined]
+00073 |         self._produced += 1
+00074 |         return self._collate(batch_samples)
+00075 | 
+00076 | 
+00077 | class _PrefetchIterator:
+00078 |     def __init__(self, buffer, bs, collate_fn, total_steps):
+00079 |         self.buffer = buffer
+00080 |         self.bs = bs
+00081 |         self.collate = collate_fn
+00082 |         self.total = total_steps
+00083 |         self.produced = 0
+00084 | 
+00085 |         self._q = queue.Queue(maxsize=4)
+00086 |         self._stop = False
+00087 | 
+00088 |         # Start background worker
+00089 |         self._worker = threading.Thread(target=self._fill)
+00090 |         self._worker.daemon = True
+00091 |         self._worker.start()
+00092 | 
+00093 |     def _fill(self):
+00094 |         while not self._stop:
+00095 |             if self.produced + self._q.qsize() >= self.total:
+00096 |                 break
+00097 |             # block if queue is full
+00098 |             samples = self.buffer.sample_batch(self.bs)
+00099 |             batch = self.collate(samples)
+00100 |             self._q.put(batch)
+00101 | 
+00102 |     def __iter__(self):
+00103 |         return self
+00104 | 
+00105 |     def __len__(self):
+00106 |         return self.total
+00107 | 
+00108 |     def __next__(self):
+00109 |         if self.produced >= self.total:
+00110 |             self._stop = True
+00111 |             # in case worker is blocked on put()
+00112 |             raise StopIteration
+00113 |         batch = self._q.get()  # this will block until the next batch is ready
+00114 |         self.produced += 1
+00115 |         return batch
+00116 | 
+00117 | 
+00118 | def _batch_accuracy(
+00119 |     preds: torch.Tensor, labels: torch.Tensor, action_offset: Optional[int] = None
+00120 | ) -> torch.Tensor:  # noqa: D401
+00121 |     """Compute token-level accuracy, ignoring ``-100`` label positions.
+00122 | 
+00123 |     Args:
+00124 |         preds: Predicted token ids of shape ``(batch, seq_len)``.
+00125 |         labels: Ground-truth label ids with the same shape as ``preds``.
+00126 | 
+00127 |     Returns:
+00128 |         Scalar tensor with the fraction of correctly predicted labels in the
+00129 |         current batch.
+00130 |     """
+00131 |     # casual prediction
+00132 |     # Shift so that tokens < n predict n
+00133 |     # https://github.com/huggingface/transformers/blob/main/src/transformers/loss/loss_utils.py#L60
+00134 |     preds = preds[:, :-1]
+00135 |     labels = labels[:, 1:]
+00136 | 
+00137 |     # Ignore positions with label == -100 (HF convention)
+00138 |     mask = labels != -100
+00139 | 
+00140 |     if action_offset is not None:
+00141 |         # we offset the labels to the action tokens range, with normal tokens in the negatives
+00142 |         labels = labels - action_offset
+00143 | 
+00144 |     correct = (preds == labels) & mask
+00145 | 
+00146 |     # Avoid division by zero for empty masks (should not happen in practice)
+00147 |     denom = mask.sum().clamp(min=1)
+00148 |     accuracy = correct.sum().float() / denom.float()
+00149 |     return accuracy
+00150 | 
+00151 | 
+00152 | def _should_log_step_metrics(
+00153 |     global_step: int,
+00154 |     logging_steps: int | float | None,
+00155 |     last_logged_step: int | None,
+00156 | ) -> bool:
+00157 |     """Return whether per-step metrics should be emitted exactly once.
+00158 | 
+00159 |     ``compute_loss`` may run several times at one optimizer step under gradient
+00160 |     accumulation. Step zero is likewise visited once per micro-batch, so it is
+00161 |     deliberately excluded.
+00162 |     """
+00163 |     if global_step <= 0 or global_step == last_logged_step:
+00164 |         return False
+00165 |     try:
+00166 |         interval = int(logging_steps) if logging_steps is not None else 0
+00167 |     except (TypeError, ValueError, OverflowError):
+00168 |         return False
+00169 |     return interval > 0 and global_step % interval == 0
+00170 | 
+00171 | 
+00172 | class Gr00tTrainer(Trainer):
+00173 |     """Trainer that bypasses torch dataloader and makes data collator async."""
+00174 | 
+00175 |     def __init__(
+00176 |         self,
+00177 |         *args: Any,
+00178 |         **kwargs: Any,
+00179 |     ) -> None:  # noqa: D401 – simple description above
+00180 |         """Initialize the trainer.
+00181 | 
+00182 |         Args:
+00183 |             *args: Positional arguments forwarded to ``Trainer``.
+00184 |         """
+00185 |         self.action_offset = kwargs.pop("action_offset", None)
+00186 |         self.multiprocessing_context = kwargs.pop("multiprocessing_context", "fork")
+00187 |         self._last_a2a_log_step: int | None = None
+00188 |         super().__init__(*args, **kwargs)
+00189 | 
+00190 |     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+00191 |         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
+00192 |         epoch = self.state.epoch
+00193 |         self.state.epoch = None
+00194 |         super().log(logs, start_time=start_time)
+00195 |         self.state.epoch = epoch
+00196 | 
+00197 |     def get_train_dataloader(self):  # noqa: D401
+00198 |         """Return a iterable dataloader without skipping the data during resume, but reseed the dataset instead."""
+00199 | 
+00200 |         # Fall back to default behaviour if not using the custom buffer.
+00201 |         # During resume, don't skip the data
+00202 |         self.args.ignore_data_skip = True
+00203 |         curr_global_step = self.state.global_step
+00204 |         print(f"Current global step: {curr_global_step}")
+00205 |         if curr_global_step > 0:
+00206 |             # ``new_seed`` MUST be the same on every rank: ``ShardedMixtureDataset``
+00207 |             # builds its shard schedule from this seed and partitions disjointly
+00208 |             # by index, so a per-rank delta here would cause sample duplication
+00209 |             # / loss across ranks. Both inputs are rank-symmetric (the dataset's
+00210 |             # own seed was set rank-symmetrically at __init__, and global_step
+00211 |             # is read from TrainerState which is broadcast via rendezvous).
+00212 |             new_seed = self.train_dataset.seed + curr_global_step
+00213 |             self.train_dataset.reset_seed(new_seed)
+00214 |             print(
+00215 |                 f"Resetting seed to {new_seed}. Please note that this will make the experiment non-reproducible."
+00216 |             )
+00217 | 
+00218 |         print("Creating custom train dataloader")
+00219 |         # Handle the case where the dataset is an IterableDataset
+00220 |         data_collator = self.data_collator
+00221 |         data_collator = self._get_collator_with_removed_columns(
+00222 |             data_collator, description="training"
+00223 |         )
+00224 |         # Use persistent workers for sharded dataset if num_workers is greater than 0
+00225 |         persistent_workers = self.args.dataloader_num_workers > 0
+00226 | 
+00227 |         dataloader_params = {
+00228 |             "batch_size": self._train_batch_size,
+00229 |             "collate_fn": data_collator,
+00230 |             "num_workers": self.args.dataloader_num_workers,
+00231 |             "pin_memory": self.args.dataloader_pin_memory,
+00232 |             "persistent_workers": persistent_workers,
+00233 |         }
+00234 | 
+00235 |         # multiprocessing_context can only be used with num_workers > 0
+00236 |         if self.args.dataloader_num_workers > 0:
+00237 |             dataloader_params["multiprocessing_context"] = self.multiprocessing_context
+00238 | 
+00239 |         return torch.utils.data.DataLoader(self.train_dataset, **dataloader_params)
+00240 | 
+00241 |     def train(
+00242 |         self,
+00243 |         resume_from_checkpoint=None,
+00244 |         **kwargs,
+00245 |     ):
+00246 |         """Pre-load TrainerState before super().train() so get_train_dataloader
+00247 |         can read self.state.global_step (stateful samplers rely on this).
+00248 |         ``resume_from_checkpoint=True`` with no checkpoint raises rather than
+00249 |         silently starting fresh.
+00250 |         """
+00251 |         if resume_from_checkpoint is True:
+00252 |             latest_checkpoint = get_last_checkpoint(self.args.output_dir)
+00253 |             if latest_checkpoint is None:
+00254 |                 raise ValueError(
+00255 |                     f"No valid checkpoint found in output directory ({self.args.output_dir})"
+00256 |                 )
+00257 |         elif resume_from_checkpoint in (False, None):
+00258 |             latest_checkpoint = None
+00259 |         else:
+00260 |             latest_checkpoint = resume_from_checkpoint  # caller passed an explicit path
+00261 | 
+00262 |         if latest_checkpoint is not None:
+00263 |             logging.info(f"Resuming from checkpoint {latest_checkpoint}")
+00264 |             # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
+00265 |             self.state = TrainerState.load_from_json(
+00266 |                 os.path.join(latest_checkpoint, TRAINER_STATE_NAME)
+00267 |             )
+00268 | 
+00269 |         return super().train(resume_from_checkpoint=latest_checkpoint, **kwargs)
+00270 | 
+00271 |     # ------------------------------------------------------------------
+00272 |     # Loss / accuracy computation override
+00273 |     # ------------------------------------------------------------------
+00274 | 
+00275 |     def compute_loss(
+00276 |         self,
+00277 |         model,
+00278 |         inputs,
+00279 |         return_outputs: bool = False,
+00280 |         num_items_in_batch: int | None = None,
+00281 |     ):  # type: ignore[override]
+00282 |         """Compute loss *and* log token-level accuracy every training step.
+00283 | 
+00284 |         We delegate the heavy-lifting (including label smoothing, custom loss
+00285 |         functions, etc.) to the parent ``Trainer.compute_loss`` implementation
+00286 |         by calling it with ``return_outputs=True``.  After obtaining the loss
+00287 |         *and* model outputs, we calculate accuracy and push it to the logger.
+00288 |         """
+00289 | 
+00290 |         # Use parent implementation to preserve built-in functionality.
+00291 |         loss, outputs = super().compute_loss(
+00292 |             model,
+00293 |             inputs,
+00294 |             return_outputs=True,
+00295 |             num_items_in_batch=num_items_in_batch,
+00296 |         )
+00297 |         # import ipdb; ipdb.set_trace()
+00298 |         # # save the model's embedding for the first step
+00299 |         # input_embeddings = model.get_input_embeddings().weight.data.cpu()
+00300 |         # output_embeddings = model.get_output_embeddings().weight.data.cpu()
+00301 |         # torch.save(input_embeddings, f"input_embeddings_{self.state.global_step}.pt")
+00302 |         # torch.save(output_embeddings, f"output_embeddings_{self.state.global_step}.pt")
+00303 | 
+00304 |         # Record last loss for testing purposes.
+00305 |         self.loss = loss
+00306 | 
+00307 |         # Latent A2A exposes its component losses and collapse diagnostics as
+00308 |         # scalar tensors. Keep this generic so the original GR00T output path is
+00309 |         # unchanged when those keys are absent.
+00310 |         current_step = int(self.state.global_step)
+00311 |         resolved_logging_steps = getattr(self.state, "logging_steps", self.args.logging_steps)
+00312 |         should_log_a2a = model.training and _should_log_step_metrics(
+00313 |             current_step,
+00314 |             resolved_logging_steps,
+00315 |             self._last_a2a_log_step,
+00316 |         )
+00317 |         if should_log_a2a:
+00318 |             a2a_metric_keys = (
+00319 |                 "loss_fm",
+00320 |                 "loss_ae",
+00321 |                 "loss_ic",
+00322 |                 "loss_ic_latent",
+00323 |                 "loss_ic_action",
+00324 |                 "loss_aux",
+00325 |                 "loss_aux_regression",
+00326 |                 "loss_aux_binary",
+00327 |                 "loss_aux_categorical",
+00328 |                 "latent_std",
+00329 |                 "latent_pair_distance",
+00330 |             )
+00331 |             a2a_logs = {}
+00332 |             for key in a2a_metric_keys:
+00333 |                 if key not in outputs:
+00334 |                     continue
+00335 |                 value = outputs[key]
+00336 |                 if torch.is_tensor(value) and value.numel() == 1:
+00337 |                     gathered = self._nested_gather(value.detach()).mean().item()
+00338 |                     a2a_logs[f"a2a/{key}"] = gathered
+00339 |             # Every rank advances the marker so future micro-batches make the
+00340 |             # same collective/no-collective decision. Only global rank zero
+00341 |             # writes the record, avoiding one duplicate per node.
+00342 |             self._last_a2a_log_step = current_step
+00343 |             if a2a_logs and self.is_world_process_zero():
+00344 |                 self.log(a2a_logs)
+00345 | 
+00346 |         # --------------------------------------------------------------
+00347 |         # Accuracy calculation
+00348 |         # --------------------------------------------------------------
+00349 |         if (
+00350 |             self.state.global_step % self.args.logging_steps == 0
+00351 |             and model.training
+00352 |             and "labels" in inputs
+00353 |         ):
+00354 |             if self.action_offset is not None:
+00355 |                 preds = outputs.logits.detach()[:, :, self.action_offset :].argmax(dim=-1).cpu()
+00356 |             else:
+00357 |                 preds = outputs.logits.detach().argmax(dim=-1).cpu()
+00358 |             with torch.no_grad():
+00359 |                 acc_local = _batch_accuracy(
+00360 |                     preds, inputs["labels"].to(device=preds.device), self.action_offset
+00361 |                 )
+00362 |             acc_tensor = torch.tensor(acc_local.item(), device=loss.device)
+00363 |             acc_mean = self._nested_gather(acc_tensor).mean().item()
+00364 | 
+00365 |             if self.args.local_rank in (-1, 0):
+00366 |                 self.log({"train_accuracy": acc_mean})
+00367 | 
+00368 |                 # Log a sample of ground-truth vs predicted action tokens from
+00369 |                 # the first batch element so users can verify the model is
+00370 |                 # learning the right behaviors.
+00371 |                 shifted_labels = inputs["labels"][:1, 1:].cpu()
+00372 |                 shifted_preds = preds[:1, :-1]
+00373 |                 mask_0 = shifted_labels[0] != -100
+00374 |                 gt_tokens = shifted_labels[0][mask_0][:20]
+00375 |                 if self.action_offset is not None:
+00376 |                     gt_tokens = gt_tokens - self.action_offset
+00377 |                 gt_sample = gt_tokens.tolist()
+00378 |                 pred_sample = shifted_preds[0][mask_0[: shifted_preds.shape[1]]][:20].tolist()
+00379 |                 logging.info(
+00380 |                     "Step %d — GT vs Pred (first 20 action tokens, batch[0]):\n"
+00381 |                     "  GT:   %s\n  Pred: %s",
+00382 |                     self.state.global_step,
+00383 |                     gt_sample,
+00384 |                     pred_sample,
+00385 |                 )
+00386 | 
+00387 |         return (loss, outputs) if return_outputs else loss

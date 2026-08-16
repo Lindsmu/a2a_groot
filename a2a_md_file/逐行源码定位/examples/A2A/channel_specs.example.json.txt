@@ -1,0 +1,24 @@
+00001 | {
+00002 |   "new_embodiment": [
+00003 |     {
+00004 |       "action_key": "eef_pose_canonical",
+00005 |       "source_state_key": "eef_pose_canonical",
+00006 |       "kind": "continuous",
+00007 |       "canonical_format": "xyz_rot6d",
+00008 |       "source_format": "xyz_rot6d",
+00009 |       "target_format": "xyz_rot6d",
+00010 |       "source_unit": "meter_plus_dimensionless_rotation6d",
+00011 |       "target_unit": "meter_plus_dimensionless_rotation6d",
+00012 |       "source_frame": "robot_base",
+00013 |       "target_frame": "robot_base",
+00014 |       "dim": 9
+00015 |     },
+00016 |     {
+00017 |       "action_key": "gripper_command",
+00018 |       "source_state_key": "gripper_command",
+00019 |       "kind": "binary",
+00020 |       "canonical_format": "scalar",
+00021 |       "dim": 1
+00022 |     }
+00023 |   ]
+00024 | }

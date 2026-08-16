@@ -1,0 +1,47 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | from pathlib import Path
+00004 | import sys
+00005 | from types import SimpleNamespace
+00006 | 
+00007 | from gr00t.data.embodiment_tags import EmbodimentTag
+00008 | from gr00t.data.types import ModalityConfig
+00009 | import numpy as np
+00010 | import pandas as pd
+00011 | 
+00012 | 
+00013 | _DEPLOYMENT_DIRECTORY = Path(__file__).resolve().parents[3] / "scripts" / "deployment"
+00014 | if str(_DEPLOYMENT_DIRECTORY) not in sys.path:
+00015 |     sys.path.insert(0, str(_DEPLOYMENT_DIRECTORY))
+00016 | 
+00017 | from scripts.deployment.export_onnx_n1d7 import prepare_observation  # noqa: E402
+00018 | 
+00019 | 
+00020 | def test_a2a_prepare_observation_uses_first_complete_history_anchor():
+00021 |     config = {
+00022 |         "video": ModalityConfig(delta_indices=[0], modality_keys=["front"]),
+00023 |         "state": ModalityConfig(delta_indices=list(range(-2, 1)), modality_keys=["joint"]),
+00024 |         "action": ModalityConfig(delta_indices=[0, 1], modality_keys=["joint"]),
+00025 |         "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+00026 |     }
+00027 |     episode = pd.DataFrame(
+00028 |         {
+00029 |             "video.front": [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(6)],
+00030 |             "state.joint": [np.asarray([value], dtype=np.float32) for value in range(6)],
+00031 |             "action.joint": [np.asarray([value + 10], dtype=np.float32) for value in range(6)],
+00032 |             "language.task": ["move"] * 6,
+00033 |         }
+00034 |     )
+00035 | 
+00036 |     class Dataset:
+00037 |         def __getitem__(self, index):
+00038 |             assert index == 0
+00039 |             return episode
+00040 | 
+00041 |     policy = SimpleNamespace(
+00042 |         model=SimpleNamespace(config=SimpleNamespace(model_type="Gr00tN1d7A2A")),
+00043 |         embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+00044 |         get_modality_config=lambda: config,
+00045 |     )
+00046 |     observation = prepare_observation(policy, Dataset(), traj_idx=0)
+00047 |     assert observation["state"]["joint"].reshape(-1).tolist() == [0.0, 1.0, 2.0]

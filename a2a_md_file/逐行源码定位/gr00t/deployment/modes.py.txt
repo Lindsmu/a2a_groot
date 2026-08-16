@@ -1,0 +1,171 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """Single source of truth for the deployment CLIs' shared mode-flag value sets.
+00017 | 
+00018 | ``scripts/deployment`` is not an importable package, so every value set
+00019 | shared across the CLIs lives here and is imported via ``gr00t.*``. A CLI
+00020 | never re-authors these strings — it imports the enum or fails on a name
+00021 | that does not exist, so cross-file drift is not expressible.
+00022 | 
+00023 | Each mode flag is one enum here, imported by its CLI. The enums hold the
+00024 | legitimate *subset* each tool supports (the tools really do run different
+00025 | subsets — that is genuine capability, not duplication):
+00026 | 
+00027 | - :class:`ExportMode` — the two ``export_mode`` CLIs (``export_onnx_n1d7``,
+00028 |   ``build_trt_pipeline``).
+00029 | - :class:`VerifyMode` — ``verify_n1d7_trt`` ``--mode``.
+00030 | - :class:`BenchmarkMode` — ``benchmark_inference`` ``--trt-mode``.
+00031 | - :class:`BuildEngineMode` — ``build_tensorrt_engine`` ``--mode``.
+00032 | - :class:`InferenceMode` — ``setup_tensorrt_engines(mode=...)``, shared by the
+00033 |   sim-eval rollout ``--trt-mode`` and ``standalone_inference_script``.
+00034 | 
+00035 | Each member's value equals its name (via :func:`_generate_next_value_`), so
+00036 | ``tyro`` keeps the value-form CLI surface unchanged (``--mode full_pipeline``,
+00037 | not ``--mode FULL_PIPELINE``) — no CLI/README/docstring edits needed when
+00038 | switching from a ``Literal``.
+00039 | """
+00040 | 
+00041 | from __future__ import annotations
+00042 | 
+00043 | from dataclasses import dataclass
+00044 | import enum
+00045 | 
+00046 | 
+00047 | class _StrEnum(str, enum.Enum):
+00048 |     """``enum.StrEnum`` stand-in for Python 3.10 (dGPU/Orin).
+00049 | 
+00050 |     Members are ``str`` subclasses whose value equals their name, so ``==``,
+00051 |     ``in``, dict-keying, JSON, f-strings, and ``tyro`` choices all see the bare
+00052 |     value. ``__str__`` is restored to ``str``'s so ``str()``/``%s`` yield the
+00053 |     value rather than ``ClassName.member``.
+00054 |     """
+00055 | 
+00056 |     @staticmethod
+00057 |     def _generate_next_value_(name, start, count, last_values):
+00058 |         return name
+00059 | 
+00060 |     __str__ = str.__str__
+00061 | 
+00062 | 
+00063 | class ExportMode(_StrEnum):
+00064 |     """Allowed values for the ``--export-mode`` flag, shared by the two
+00065 |     ``export_mode`` CLIs."""
+00066 | 
+00067 |     dit_only = enum.auto()
+00068 |     action_head = enum.auto()
+00069 |     full_pipeline = enum.auto()
+00070 | 
+00071 | 
+00072 | class VerifyMode(_StrEnum):
+00073 |     """Allowed values for ``verify_n1d7_trt`` ``--mode``."""
+00074 | 
+00075 |     dit_only = enum.auto()
+00076 |     action_head = enum.auto()
+00077 |     a2a_action_head = enum.auto()
+00078 |     n17_full_pipeline = enum.auto()
+00079 |     vit_llm_only = enum.auto()
+00080 | 
+00081 | 
+00082 | class BenchmarkMode(_StrEnum):
+00083 |     """Allowed values for ``benchmark_inference`` ``--trt-mode``."""
+00084 | 
+00085 |     dit_only = enum.auto()
+00086 |     a2a_action_head = enum.auto()
+00087 |     n17_full_pipeline = enum.auto()
+00088 |     vit_llm_only = enum.auto()
+00089 | 
+00090 | 
+00091 | class InferenceMode(_StrEnum):
+00092 |     """Engine subset ``setup_tensorrt_engines`` swaps onto a policy at inference
+00093 |     time. Shared by the sim-eval rollout CLI (``--trt-mode``) and
+00094 |     ``standalone_inference_script``; its members are exactly the modes
+00095 |     ``setup_tensorrt_engines`` dispatches on."""
+00096 | 
+00097 |     dit_only = enum.auto()
+00098 |     action_head = enum.auto()
+00099 |     a2a_action_head = enum.auto()
+00100 |     vit_llm_only = enum.auto()
+00101 |     n17_full_pipeline = enum.auto()
+00102 | 
+00103 | 
+00104 | class BuildEngineMode(_StrEnum):
+00105 |     """Allowed values for ``build_tensorrt_engine`` ``--mode``."""
+00106 | 
+00107 |     single = enum.auto()
+00108 |     a2a_action_head = enum.auto()
+00109 |     full_pipeline = enum.auto()
+00110 | 
+00111 | 
+00112 | # ---------------------------------------------------------------------------
+00113 | # Pipeline component table (shared by the build + pipeline CLIs)
+00114 | # ---------------------------------------------------------------------------
+00115 | 
+00116 | 
+00117 | @dataclass(frozen=True)
+00118 | class PipelineComponent:
+00119 |     """One N1.7 pipeline component: its display name, the ONNX filename
+00120 |     candidates the exporter may write for it, and the built engine filename."""
+00121 | 
+00122 |     name: str
+00123 |     onnx_candidates: tuple[str, ...]
+00124 |     engine: str
+00125 | 
+00126 | 
+00127 | # One row per N1.7 pipeline component, in build order. ``build_full_pipeline``
+00128 | # builds from this; ``build_trt_pipeline`` derives the per-export-mode expected
+00129 | # subset from it; the deployment tests bind it against the verify-side loaders.
+00130 | FULL_PIPELINE_COMPONENTS: tuple[PipelineComponent, ...] = (
+00131 |     PipelineComponent("ViT", ("vit_fp32.onnx", "vit_bf16.onnx"), "vit.engine"),
+00132 |     PipelineComponent("LLM", ("llm_bf16.onnx",), "llm_bf16.engine"),
+00133 |     PipelineComponent("VL Self-Attention", ("vl_self_attention.onnx",), "vl_self_attention.engine"),
+00134 |     PipelineComponent("State Encoder", ("state_encoder.onnx",), "state_encoder.engine"),
+00135 |     PipelineComponent("Action Encoder", ("action_encoder.onnx",), "action_encoder.engine"),
+00136 |     PipelineComponent("DiT", ("dit_bf16.onnx",), "dit_bf16.engine"),
+00137 |     PipelineComponent("Action Decoder", ("action_decoder.onnx",), "action_decoder.engine"),
+00138 | )
+00139 | 
+00140 | # Components each ``ExportMode`` writes ONNX for — must stay in sync with the
+00141 | # export branches in ``export_onnx_n1d7.main`` (Step 4). The build stage must
+00142 | # require *exactly* this subset: ``action_head`` keeps ViT/LLM/VL-SA in PyTorch,
+00143 | # so demanding the full 7 makes its build fail with a misleading "missing ONNX".
+00144 | EXPORT_MODE_COMPONENTS: dict[ExportMode, frozenset[str]] = {
+00145 |     ExportMode.dit_only: frozenset({"DiT"}),
+00146 |     ExportMode.action_head: frozenset({"State Encoder", "Action Encoder", "DiT", "Action Decoder"}),
+00147 |     ExportMode.full_pipeline: frozenset(c.name for c in FULL_PIPELINE_COMPONENTS),
+00148 | }
+00149 | 
+00150 | # Per ``export_mode``, the (build, verify, benchmark) mode each downstream stage
+00151 | # runs in ``build_trt_pipeline``. One selector fans out to three sibling
+00152 | # stage-modes that each consume a *different* engine set; the binding between
+00153 | # this table and the component sets above is enforced by
+00154 | # ``tests/scripts/deployment/test_trt_pipeline_modes.py``.
+00155 | PIPELINE_STAGE_MODES: dict[ExportMode, tuple[BuildEngineMode, VerifyMode, BenchmarkMode]] = {
+00156 |     ExportMode.full_pipeline: (
+00157 |         BuildEngineMode.full_pipeline,
+00158 |         VerifyMode.n17_full_pipeline,
+00159 |         BenchmarkMode.n17_full_pipeline,
+00160 |     ),
+00161 |     ExportMode.action_head: (
+00162 |         BuildEngineMode.full_pipeline,
+00163 |         VerifyMode.action_head,
+00164 |         BenchmarkMode.dit_only,
+00165 |     ),
+00166 |     ExportMode.dit_only: (
+00167 |         BuildEngineMode.single,
+00168 |         VerifyMode.dit_only,
+00169 |         BenchmarkMode.dit_only,
+00170 |     ),
+00171 | }

@@ -1,0 +1,57 @@
+00001 | {
+00002 |   "version": 1,
+00003 |   "embodiment": "new_embodiment",
+00004 |   "feature_dim": 132,
+00005 |   "history_horizon": 8,
+00006 |   "future_horizon": 8,
+00007 |   "channels": [
+00008 |     {
+00009 |       "action_key": "eef_pose_canonical",
+00010 |       "source_state_key": "eef_pose_canonical",
+00011 |       "kind": "continuous",
+00012 |       "start": 0,
+00013 |       "end": 9,
+00014 |       "canonical_format": "xyz_rot6d",
+00015 |       "source_format": "xyz_rot6d",
+00016 |       "target_format": "xyz_rot6d",
+00017 |       "source_unit": "meter_plus_dimensionless_rotation6d",
+00018 |       "target_unit": "meter_plus_dimensionless_rotation6d",
+00019 |       "source_frame": "robot_base",
+00020 |       "target_frame": "robot_base"
+00021 |     },
+00022 |     {
+00023 |       "action_key": "gripper_command",
+00024 |       "source_state_key": "gripper_command",
+00025 |       "kind": "binary",
+00026 |       "start": 9,
+00027 |       "end": 10,
+00028 |       "canonical_format": "scalar",
+00029 |       "source_format": null,
+00030 |       "target_format": null,
+00031 |       "source_unit": null,
+00032 |       "target_unit": null,
+00033 |       "source_frame": null,
+00034 |       "target_frame": null
+00035 |     }
+00036 |   ],
+00037 |   "provenance": {
+00038 |     "dataset": "REPLACE_WITH_IMMUTABLE_DATASET_ID",
+00039 |     "dataset_revision": "REPLACE_WITH_IMMUTABLE_REVISION",
+00040 |     "dataset_fingerprint_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+00041 |     "source_schema_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+00042 |     "canonicalizer": "identity_preprocessed",
+00043 |     "canonicalizer_version": "REPLACE_WITH_PREPROCESSOR_VERSION",
+00044 |     "canonicalizer_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+00045 |     "exporter_version": "1",
+00046 |     "target_definition": "absolute_eef_controller_target",
+00047 |     "time_alignment": "history_t_minus_7_to_t__future_t_to_t_plus_7"
+00048 |   },
+00049 |   "controller": {
+00050 |     "type": "REPLACE_WITH_ABSOLUTE_CONTROLLER_TYPE",
+00051 |     "version": "REPLACE_WITH_CONTROLLER_VERSION",
+00052 |     "frame": "robot_base",
+00053 |     "control_delta": false,
+00054 |     "rotation_composition": "rotation6d_to_matrix",
+00055 |     "scale": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+00056 |   }
+00057 | }

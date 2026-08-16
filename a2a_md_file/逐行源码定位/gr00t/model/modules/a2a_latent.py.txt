@@ -1,0 +1,853 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """Building blocks for latent action-to-action (A2A) flow matching.
+00017 | 
+00018 | The modules in this file deliberately do not depend on a particular GR00T action
+00019 | head.  They provide the trajectory autoencoder, VLM condition pooling, latent
+00020 | velocity field, and differentiable ODE integration needed by an A2A head while
+00021 | remaining small enough to unit test independently.
+00022 | """
+00023 | 
+00024 | from __future__ import annotations
+00025 | 
+00026 | from collections.abc import Callable
+00027 | import math
+00028 | 
+00029 | import torch
+00030 | from torch import Tensor, nn
+00031 | import torch.nn.functional as F
+00032 | 
+00033 | from gr00t.model.modules.embodiment_conditioned_mlp import CategorySpecificLinear
+00034 | 
+00035 | 
+00036 | def _trajectory_mask(mask: Tensor | None, reference: Tensor) -> Tensor:
+00037 |     """Return a boolean mask broadcast to ``[batch, time, dimension]``."""
+00038 |     if mask is None:
+00039 |         return torch.ones_like(reference, dtype=torch.bool)
+00040 |     if mask.ndim == reference.ndim - 1:
+00041 |         mask = mask.unsqueeze(-1)
+00042 |     try:
+00043 |         return torch.broadcast_to(
+00044 |             mask.to(device=reference.device, dtype=torch.bool), reference.shape
+00045 |         )
+00046 |     except RuntimeError as error:
+00047 |         raise ValueError(
+00048 |             f"mask with shape {tuple(mask.shape)} is not broadcastable to "
+00049 |             f"trajectory shape {tuple(reference.shape)}"
+00050 |         ) from error
+00051 | 
+00052 | 
+00053 | def _token_mask(mask: Tensor | None, reference: Tensor) -> Tensor:
+00054 |     """Return a boolean token mask for a ``[batch, sequence, feature]`` tensor."""
+00055 |     shape = reference.shape[:2]
+00056 |     if mask is None:
+00057 |         return torch.ones(shape, dtype=torch.bool, device=reference.device)
+00058 |     if mask.ndim == 3 and mask.shape[-1] == 1:
+00059 |         mask = mask.squeeze(-1)
+00060 |     if mask.ndim != 2:
+00061 |         raise ValueError(f"expected a [batch, sequence] mask, got shape {tuple(mask.shape)}")
+00062 |     try:
+00063 |         return torch.broadcast_to(mask.to(device=reference.device, dtype=torch.bool), shape)
+00064 |     except RuntimeError as error:
+00065 |         raise ValueError(
+00066 |             f"mask with shape {tuple(mask.shape)} is not broadcastable to token shape {shape}"
+00067 |         ) from error
+00068 | 
+00069 | 
+00070 | def _masked_token_mean(hidden_states: Tensor, mask: Tensor) -> Tensor:
+00071 |     weights = mask.to(dtype=hidden_states.dtype).unsqueeze(-1)
+00072 |     masked_states = torch.where(mask.unsqueeze(-1), hidden_states, torch.zeros_like(hidden_states))
+00073 |     total = masked_states.sum(dim=1)
+00074 |     count = weights.sum(dim=1).clamp_min(1.0)
+00075 |     return total / count
+00076 | 
+00077 | 
+00078 | def masked_l1_loss(
+00079 |     prediction: Tensor,
+00080 |     target: Tensor,
+00081 |     mask: Tensor | None = None,
+00082 | ) -> Tensor:
+00083 |     """Compute elementwise L1 averaged only over valid entries.
+00084 | 
+00085 |     An all-false mask produces a differentiable zero instead of a NaN.  Masks
+00086 |     may omit trailing singleton dimensions as long as they are broadcastable to
+00087 |     the prediction.
+00088 |     """
+00089 |     if prediction.shape != target.shape:
+00090 |         raise ValueError(
+00091 |             f"prediction and target must have the same shape, got "
+00092 |             f"{tuple(prediction.shape)} and {tuple(target.shape)}"
+00093 |         )
+00094 |     if mask is None:
+00095 |         return (prediction - target).abs().mean()
+00096 |     while mask.ndim < prediction.ndim:
+00097 |         mask = mask.unsqueeze(-1)
+00098 |     try:
+00099 |         valid = torch.broadcast_to(
+00100 |             mask.to(device=prediction.device, dtype=torch.bool), prediction.shape
+00101 |         )
+00102 |     except RuntimeError as runtime_error:
+00103 |         raise ValueError(
+00104 |             f"mask with shape {tuple(mask.shape)} is not broadcastable to loss shape "
+00105 |             f"{tuple(prediction.shape)}"
+00106 |         ) from runtime_error
+00107 |     difference = torch.where(valid, prediction - target, torch.zeros_like(prediction))
+00108 |     weights = valid.to(dtype=prediction.dtype)
+00109 |     return difference.abs().sum() / weights.sum().clamp_min(1.0)
+00110 | 
+00111 | 
+00112 | class SinusoidalTimeEmbedding(nn.Module):
+00113 |     """Continuous sinusoidal embedding for flow times in ``[0, 1]``."""
+00114 | 
+00115 |     def __init__(self, embedding_dim: int, max_period: float = 10_000.0):
+00116 |         super().__init__()
+00117 |         if embedding_dim <= 0:
+00118 |             raise ValueError("embedding_dim must be positive")
+00119 |         if max_period <= 0:
+00120 |             raise ValueError("max_period must be positive")
+00121 |         self.embedding_dim = embedding_dim
+00122 |         self.max_period = max_period
+00123 | 
+00124 |     def forward(self, timesteps: Tensor) -> Tensor:
+00125 |         if timesteps.ndim == 2 and timesteps.shape[-1] == 1:
+00126 |             timesteps = timesteps.squeeze(-1)
+00127 |         if timesteps.ndim != 1:
+00128 |             raise ValueError(
+00129 |                 f"expected one continuous timestep per batch item, got {tuple(timesteps.shape)}"
+00130 |             )
+00131 | 
+00132 |         half_dim = self.embedding_dim // 2
+00133 |         if half_dim == 0:
+00134 |             return timesteps.float().unsqueeze(-1)
+00135 |         exponent = (
+00136 |             -math.log(self.max_period)
+00137 |             * torch.arange(half_dim, device=timesteps.device, dtype=torch.float32)
+00138 |             / max(half_dim, 1)
+00139 |         )
+00140 |         angles = timesteps.float().unsqueeze(-1) * exponent.exp().unsqueeze(0)
+00141 |         embedding = torch.cat((angles.sin(), angles.cos()), dim=-1)
+00142 |         if self.embedding_dim % 2:
+00143 |             embedding = F.pad(embedding, (0, 1))
+00144 |         return embedding
+00145 | 
+00146 | 
+00147 | class ActionTrajectoryEncoder(nn.Module):
+00148 |     """Encode a masked action/proprioception trajectory into one latent vector.
+00149 | 
+00150 |     The same encoder instance is intended to encode both the executed history
+00151 |     ``z0`` and future demonstration trajectory ``z1``.  A category-specific
+00152 |     input projection accommodates different embodiment semantics while the
+00153 |     three temporal convolutions and latent projection are shared.
+00154 |     """
+00155 | 
+00156 |     def __init__(
+00157 |         self,
+00158 |         action_dim: int,
+00159 |         latent_dim: int = 512,
+00160 |         num_embodiments: int = 1,
+00161 |         conv_channels: tuple[int, int, int] = (128, 256, 512),
+00162 |         kernel_size: int = 5,
+00163 |     ):
+00164 |         super().__init__()
+00165 |         if action_dim <= 0 or latent_dim <= 0 or num_embodiments <= 0:
+00166 |             raise ValueError("action_dim, latent_dim, and num_embodiments must be positive")
+00167 |         if len(conv_channels) != 3 or any(channel <= 0 for channel in conv_channels):
+00168 |             raise ValueError("conv_channels must contain exactly three positive channel sizes")
+00169 |         if kernel_size <= 0 or kernel_size % 2 == 0:
+00170 |             raise ValueError("kernel_size must be a positive odd integer")
+00171 | 
+00172 |         self.action_dim = action_dim
+00173 |         self.latent_dim = latent_dim
+00174 |         self.num_embodiments = num_embodiments
+00175 |         self.input_adapter = CategorySpecificLinear(num_embodiments, action_dim, conv_channels[0])
+00176 |         in_channels = (conv_channels[0], *conv_channels[:-1])
+00177 |         padding = kernel_size // 2
+00178 |         self.convolutions = nn.ModuleList(
+00179 |             nn.Conv1d(input_channel, output_channel, kernel_size, padding=padding)
+00180 |             for input_channel, output_channel in zip(in_channels, conv_channels, strict=True)
+00181 |         )
+00182 |         # Per-token normalization does not let synthetic/masked timesteps alter
+00183 |         # the statistics of valid timesteps (unlike a temporal GroupNorm).
+00184 |         self.normalizations = nn.ModuleList(nn.LayerNorm(channel) for channel in conv_channels)
+00185 |         self.latent_projection = nn.Linear(conv_channels[-1], latent_dim)
+00186 | 
+00187 |     def forward(
+00188 |         self,
+00189 |         trajectory: Tensor,
+00190 |         embodiment_ids: Tensor,
+00191 |         trajectory_mask: Tensor | None = None,
+00192 |     ) -> Tensor:
+00193 |         if trajectory.ndim != 3 or trajectory.shape[-1] != self.action_dim:
+00194 |             raise ValueError(
+00195 |                 f"expected trajectory [batch, time, {self.action_dim}], got "
+00196 |                 f"{tuple(trajectory.shape)}"
+00197 |             )
+00198 |         batch_size = trajectory.shape[0]
+00199 |         if embodiment_ids.shape != (batch_size,):
+00200 |             raise ValueError(
+00201 |                 f"expected embodiment_ids shape ({batch_size},), got {tuple(embodiment_ids.shape)}"
+00202 |             )
+00203 | 
+00204 |         element_mask = _trajectory_mask(trajectory_mask, trajectory)
+00205 |         time_mask = element_mask.any(dim=-1)
+00206 |         masked_trajectory = torch.where(element_mask, trajectory, torch.zeros_like(trajectory))
+00207 | 
+00208 |         hidden_states = self.input_adapter(masked_trajectory, embodiment_ids)
+00209 |         time_weights = time_mask.to(dtype=hidden_states.dtype).unsqueeze(1)
+00210 |         hidden_states = hidden_states.transpose(1, 2) * time_weights
+00211 |         for convolution, normalization in zip(self.convolutions, self.normalizations, strict=True):
+00212 |             hidden_states = convolution(hidden_states).transpose(1, 2)
+00213 |             hidden_states = normalization(hidden_states).transpose(1, 2)
+00214 |             hidden_states = F.silu(hidden_states) * time_weights
+00215 | 
+00216 |         pooled = hidden_states.sum(dim=-1) / time_weights.sum(dim=-1).clamp_min(1.0)
+00217 |         latent = self.latent_projection(pooled)
+00218 |         has_valid_token = time_mask.any(dim=-1, keepdim=True)
+00219 |         return latent * has_valid_token.to(dtype=latent.dtype)
+00220 | 
+00221 | 
+00222 | class ActionTrajectoryTokenEncoder(nn.Module):
+00223 |     """Encode a trajectory into one latent token per relative action timestep.
+00224 | 
+00225 |     This is the sequence-latent alternative to :class:`ActionTrajectoryEncoder`.
+00226 |     The original paper-style MLP backend pools the three Conv1d outputs into one
+00227 |     vector.  A Transformer needs more than one token for temporal attention to
+00228 |     be useful, so this encoder keeps the time axis and projects every timestep
+00229 |     to ``token_dim``.  History and future must still share this *same* encoder.
+00230 | 
+00231 |     Masked values are replaced by zero before the category adapter and are
+00232 |     zeroed again after every temporal convolution.  Consequently, synthetic
+00233 |     cold-start padding cannot leak into a valid token through a convolution.
+00234 |     """
+00235 | 
+00236 |     def __init__(
+00237 |         self,
+00238 |         action_dim: int,
+00239 |         trajectory_horizon: int,
+00240 |         token_dim: int,
+00241 |         num_embodiments: int = 1,
+00242 |         conv_channels: tuple[int, int, int] = (128, 256, 512),
+00243 |         kernel_size: int = 5,
+00244 |     ):
+00245 |         super().__init__()
+00246 |         if min(action_dim, trajectory_horizon, token_dim, num_embodiments) <= 0:
+00247 |             raise ValueError(
+00248 |                 "action_dim, trajectory_horizon, token_dim, and num_embodiments must be positive"
+00249 |             )
+00250 |         if len(conv_channels) != 3 or any(channel <= 0 for channel in conv_channels):
+00251 |             raise ValueError("conv_channels must contain exactly three positive channel sizes")
+00252 |         if kernel_size <= 0 or kernel_size % 2 == 0:
+00253 |             raise ValueError("kernel_size must be a positive odd integer")
+00254 | 
+00255 |         self.action_dim = action_dim
+00256 |         self.trajectory_horizon = trajectory_horizon
+00257 |         self.token_dim = token_dim
+00258 |         self.num_embodiments = num_embodiments
+00259 |         self.input_adapter = CategorySpecificLinear(num_embodiments, action_dim, conv_channels[0])
+00260 |         in_channels = (conv_channels[0], *conv_channels[:-1])
+00261 |         padding = kernel_size // 2
+00262 |         self.convolutions = nn.ModuleList(
+00263 |             nn.Conv1d(input_channel, output_channel, kernel_size, padding=padding)
+00264 |             for input_channel, output_channel in zip(in_channels, conv_channels, strict=True)
+00265 |         )
+00266 |         self.normalizations = nn.ModuleList(nn.LayerNorm(channel) for channel in conv_channels)
+00267 |         self.token_projection = nn.Linear(conv_channels[-1], token_dim)
+00268 | 
+00269 |     def forward(
+00270 |         self,
+00271 |         trajectory: Tensor,
+00272 |         embodiment_ids: Tensor,
+00273 |         trajectory_mask: Tensor | None = None,
+00274 |     ) -> Tensor:
+00275 |         if trajectory.ndim != 3:
+00276 |             raise ValueError(
+00277 |                 f"expected trajectory [batch, {self.trajectory_horizon}, {self.action_dim}], "
+00278 |                 f"got {tuple(trajectory.shape)}"
+00279 |             )
+00280 |         expected_shape = (trajectory.shape[0], self.trajectory_horizon, self.action_dim)
+00281 |         if tuple(trajectory.shape) != expected_shape:
+00282 |             raise ValueError(
+00283 |                 f"expected trajectory [batch, {self.trajectory_horizon}, {self.action_dim}], "
+00284 |                 f"got {tuple(trajectory.shape)}"
+00285 |             )
+00286 |         batch_size = trajectory.shape[0]
+00287 |         if embodiment_ids.shape != (batch_size,):
+00288 |             raise ValueError(
+00289 |                 f"expected embodiment_ids shape ({batch_size},), got {tuple(embodiment_ids.shape)}"
+00290 |             )
+00291 | 
+00292 |         element_mask = _trajectory_mask(trajectory_mask, trajectory)
+00293 |         time_mask = element_mask.any(dim=-1)
+00294 |         masked_trajectory = torch.where(element_mask, trajectory, torch.zeros_like(trajectory))
+00295 | 
+00296 |         hidden_states = self.input_adapter(masked_trajectory, embodiment_ids)
+00297 |         time_weights = time_mask.to(dtype=hidden_states.dtype).unsqueeze(-1)
+00298 |         hidden_states = hidden_states * time_weights
+00299 |         for convolution, normalization in zip(self.convolutions, self.normalizations, strict=True):
+00300 |             hidden_states = convolution(hidden_states.transpose(1, 2)).transpose(1, 2)
+00301 |             hidden_states = F.silu(normalization(hidden_states)) * time_weights
+00302 | 
+00303 |         tokens = self.token_projection(hidden_states) * time_weights
+00304 |         return tokens
+00305 | 
+00306 | 
+00307 | class ResidualMLPBlock(nn.Module):
+00308 |     """Pre-normalized residual MLP block used by the A2A decoder."""
+00309 | 
+00310 |     def __init__(self, hidden_dim: int, expansion_factor: int = 4):
+00311 |         super().__init__()
+00312 |         if hidden_dim <= 0 or expansion_factor <= 0:
+00313 |             raise ValueError("hidden_dim and expansion_factor must be positive")
+00314 |         self.norm = nn.LayerNorm(hidden_dim)
+00315 |         self.mlp = nn.Sequential(
+00316 |             nn.Linear(hidden_dim, hidden_dim * expansion_factor),
+00317 |             nn.SiLU(),
+00318 |             nn.Linear(hidden_dim * expansion_factor, hidden_dim),
+00319 |         )
+00320 | 
+00321 |     def forward(self, hidden_states: Tensor) -> Tensor:
+00322 |         return hidden_states + self.mlp(self.norm(hidden_states))
+00323 | 
+00324 | 
+00325 | class ActionTrajectoryDecoder(nn.Module):
+00326 |     """Decode one latent into a future action trajectory with four residual MLPs."""
+00327 | 
+00328 |     def __init__(
+00329 |         self,
+00330 |         action_dim: int,
+00331 |         action_horizon: int,
+00332 |         latent_dim: int = 512,
+00333 |         hidden_dim: int = 512,
+00334 |         num_embodiments: int = 1,
+00335 |         num_blocks: int = 4,
+00336 |         expansion_factor: int = 4,
+00337 |     ):
+00338 |         super().__init__()
+00339 |         if min(action_dim, action_horizon, latent_dim, hidden_dim, num_embodiments) <= 0:
+00340 |             raise ValueError("decoder dimensions and num_embodiments must be positive")
+00341 |         if num_blocks <= 0:
+00342 |             raise ValueError("num_blocks must be positive")
+00343 |         self.action_dim = action_dim
+00344 |         self.action_horizon = action_horizon
+00345 |         self.latent_projection = nn.Linear(latent_dim, hidden_dim)
+00346 |         self.blocks = nn.ModuleList(
+00347 |             ResidualMLPBlock(hidden_dim, expansion_factor) for _ in range(num_blocks)
+00348 |         )
+00349 |         self.output_projection = CategorySpecificLinear(
+00350 |             num_embodiments, hidden_dim, action_horizon * action_dim
+00351 |         )
+00352 | 
+00353 |     def forward(
+00354 |         self,
+00355 |         latent: Tensor,
+00356 |         embodiment_ids: Tensor,
+00357 |         trajectory_mask: Tensor | None = None,
+00358 |     ) -> Tensor:
+00359 |         if latent.ndim != 2:
+00360 |             raise ValueError(f"expected latent [batch, dimension], got {tuple(latent.shape)}")
+00361 |         batch_size = latent.shape[0]
+00362 |         if embodiment_ids.shape != (batch_size,):
+00363 |             raise ValueError(
+00364 |                 f"expected embodiment_ids shape ({batch_size},), got {tuple(embodiment_ids.shape)}"
+00365 |             )
+00366 | 
+00367 |         hidden_states = self.latent_projection(latent)
+00368 |         for block in self.blocks:
+00369 |             hidden_states = block(hidden_states)
+00370 |         trajectory = self.output_projection(hidden_states.unsqueeze(1), embodiment_ids)
+00371 |         trajectory = trajectory.reshape(batch_size, self.action_horizon, self.action_dim)
+00372 |         if trajectory_mask is not None:
+00373 |             trajectory = trajectory * _trajectory_mask(trajectory_mask, trajectory).to(
+00374 |                 dtype=trajectory.dtype
+00375 |             )
+00376 |         return trajectory
+00377 | 
+00378 | 
+00379 | class ActionTrajectoryTokenDecoder(nn.Module):
+00380 |     """Decode a temporal latent-token sequence into one future action chunk.
+00381 | 
+00382 |     The token sequence is flattened only at the decoder boundary.  Keeping the
+00383 |     four residual MLP blocks global preserves the existing decoder's ability to
+00384 |     model correlations across the complete action chunk, while the FlowNet can
+00385 |     operate on explicit temporal tokens before this point.
+00386 |     """
+00387 | 
+00388 |     def __init__(
+00389 |         self,
+00390 |         action_dim: int,
+00391 |         action_horizon: int,
+00392 |         token_dim: int,
+00393 |         hidden_dim: int = 512,
+00394 |         num_embodiments: int = 1,
+00395 |         num_blocks: int = 4,
+00396 |         expansion_factor: int = 4,
+00397 |     ):
+00398 |         super().__init__()
+00399 |         if min(action_dim, action_horizon, token_dim, hidden_dim, num_embodiments) <= 0:
+00400 |             raise ValueError("decoder dimensions and num_embodiments must be positive")
+00401 |         if num_blocks <= 0:
+00402 |             raise ValueError("num_blocks must be positive")
+00403 |         self.action_dim = action_dim
+00404 |         self.action_horizon = action_horizon
+00405 |         self.token_dim = token_dim
+00406 |         self.latent_projection = nn.Linear(action_horizon * token_dim, hidden_dim)
+00407 |         self.blocks = nn.ModuleList(
+00408 |             ResidualMLPBlock(hidden_dim, expansion_factor) for _ in range(num_blocks)
+00409 |         )
+00410 |         self.output_projection = CategorySpecificLinear(
+00411 |             num_embodiments, hidden_dim, action_horizon * action_dim
+00412 |         )
+00413 | 
+00414 |     def forward(
+00415 |         self,
+00416 |         latent_tokens: Tensor,
+00417 |         embodiment_ids: Tensor,
+00418 |         trajectory_mask: Tensor | None = None,
+00419 |     ) -> Tensor:
+00420 |         if latent_tokens.ndim != 3:
+00421 |             raise ValueError(
+00422 |                 f"expected latent tokens [batch, {self.action_horizon}, {self.token_dim}], "
+00423 |                 f"got {tuple(latent_tokens.shape)}"
+00424 |             )
+00425 |         expected_shape = (
+00426 |             latent_tokens.shape[0],
+00427 |             self.action_horizon,
+00428 |             self.token_dim,
+00429 |         )
+00430 |         if tuple(latent_tokens.shape) != expected_shape:
+00431 |             raise ValueError(
+00432 |                 f"expected latent tokens [batch, {self.action_horizon}, {self.token_dim}], "
+00433 |                 f"got {tuple(latent_tokens.shape)}"
+00434 |             )
+00435 |         batch_size = latent_tokens.shape[0]
+00436 |         if embodiment_ids.shape != (batch_size,):
+00437 |             raise ValueError(
+00438 |                 f"expected embodiment_ids shape ({batch_size},), got {tuple(embodiment_ids.shape)}"
+00439 |             )
+00440 | 
+00441 |         hidden_states = self.latent_projection(latent_tokens.flatten(1))
+00442 |         for block in self.blocks:
+00443 |             hidden_states = block(hidden_states)
+00444 |         trajectory = self.output_projection(hidden_states.unsqueeze(1), embodiment_ids)
+00445 |         trajectory = trajectory.reshape(batch_size, self.action_horizon, self.action_dim)
+00446 |         if trajectory_mask is not None:
+00447 |             trajectory = trajectory * _trajectory_mask(trajectory_mask, trajectory).to(
+00448 |                 dtype=trajectory.dtype
+00449 |             )
+00450 |         return trajectory
+00451 | 
+00452 | 
+00453 | class VLMConditionPooler(nn.Module):
+00454 |     """Pool masked VLM tokens while preserving separate image/text summaries."""
+00455 | 
+00456 |     def __init__(
+00457 |         self,
+00458 |         input_dim: int,
+00459 |         condition_dim: int = 512,
+00460 |         hidden_dim: int | None = None,
+00461 |     ):
+00462 |         super().__init__()
+00463 |         if input_dim <= 0 or condition_dim <= 0:
+00464 |             raise ValueError("input_dim and condition_dim must be positive")
+00465 |         hidden_dim = condition_dim if hidden_dim is None else hidden_dim
+00466 |         if hidden_dim <= 0:
+00467 |             raise ValueError("hidden_dim must be positive")
+00468 |         self.projection = nn.Sequential(
+00469 |             nn.Linear(3 * input_dim, hidden_dim),
+00470 |             nn.SiLU(),
+00471 |             nn.Linear(hidden_dim, condition_dim),
+00472 |         )
+00473 | 
+00474 |     def forward(
+00475 |         self,
+00476 |         hidden_states: Tensor,
+00477 |         attention_mask: Tensor | None = None,
+00478 |         image_mask: Tensor | None = None,
+00479 |         text_mask: Tensor | None = None,
+00480 |     ) -> Tensor:
+00481 |         if hidden_states.ndim != 3:
+00482 |             raise ValueError(
+00483 |                 f"expected hidden_states [batch, sequence, feature], got "
+00484 |                 f"{tuple(hidden_states.shape)}"
+00485 |             )
+00486 |         valid_mask = _token_mask(attention_mask, hidden_states)
+00487 |         global_summary = _masked_token_mean(hidden_states, valid_mask)
+00488 | 
+00489 |         if image_mask is None:
+00490 |             image_summary = torch.zeros_like(global_summary)
+00491 |         else:
+00492 |             valid_image_mask = valid_mask & _token_mask(image_mask, hidden_states)
+00493 |             image_summary = _masked_token_mean(hidden_states, valid_image_mask)
+00494 | 
+00495 |         if text_mask is None:
+00496 |             text_summary = torch.zeros_like(global_summary)
+00497 |         else:
+00498 |             valid_text_mask = valid_mask & _token_mask(text_mask, hidden_states)
+00499 |             text_summary = _masked_token_mean(hidden_states, valid_text_mask)
+00500 | 
+00501 |         return self.projection(torch.cat((global_summary, image_summary, text_summary), dim=-1))
+00502 | 
+00503 | 
+00504 | class AdaLNResidualMLPBlock(nn.Module):
+00505 |     """Residual MLP whose pre-normalization is modulated by time and condition."""
+00506 | 
+00507 |     def __init__(
+00508 |         self,
+00509 |         latent_dim: int,
+00510 |         conditioning_dim: int,
+00511 |         hidden_dim: int | None = None,
+00512 |     ):
+00513 |         super().__init__()
+00514 |         hidden_dim = 4 * latent_dim if hidden_dim is None else hidden_dim
+00515 |         if min(latent_dim, conditioning_dim, hidden_dim) <= 0:
+00516 |             raise ValueError("block dimensions must be positive")
+00517 |         self.norm = nn.LayerNorm(latent_dim, elementwise_affine=False)
+00518 |         self.modulation = nn.Sequential(
+00519 |             nn.SiLU(),
+00520 |             nn.Linear(conditioning_dim, 3 * latent_dim),
+00521 |         )
+00522 |         self.mlp = nn.Sequential(
+00523 |             nn.Linear(latent_dim, hidden_dim),
+00524 |             nn.SiLU(),
+00525 |             nn.Linear(hidden_dim, latent_dim),
+00526 |         )
+00527 | 
+00528 |     def forward(self, latent: Tensor, conditioning: Tensor) -> Tensor:
+00529 |         shift, scale, gate = self.modulation(conditioning).chunk(3, dim=-1)
+00530 |         modulated = self.norm(latent) * (1.0 + scale) + shift
+00531 |         return latent + gate * self.mlp(modulated)
+00532 | 
+00533 | 
+00534 | class LatentFlowNet(nn.Module):
+00535 |     """Four-block AdaLN MLP velocity field in the A2A latent space."""
+00536 | 
+00537 |     def __init__(
+00538 |         self,
+00539 |         latent_dim: int = 512,
+00540 |         condition_dim: int = 512,
+00541 |         time_embedding_dim: int = 128,
+00542 |         hidden_dim: int | None = None,
+00543 |         num_blocks: int = 4,
+00544 |     ):
+00545 |         super().__init__()
+00546 |         if min(latent_dim, condition_dim, time_embedding_dim, num_blocks) <= 0:
+00547 |             raise ValueError("flow dimensions and num_blocks must be positive")
+00548 |         self.latent_dim = latent_dim
+00549 |         self.condition_dim = condition_dim
+00550 |         self.time_embedding = SinusoidalTimeEmbedding(time_embedding_dim)
+00551 |         self.conditioning_projection = nn.Sequential(
+00552 |             nn.Linear(condition_dim + time_embedding_dim, condition_dim),
+00553 |             nn.SiLU(),
+00554 |             nn.Linear(condition_dim, condition_dim),
+00555 |         )
+00556 |         self.blocks = nn.ModuleList(
+00557 |             AdaLNResidualMLPBlock(latent_dim, condition_dim, hidden_dim) for _ in range(num_blocks)
+00558 |         )
+00559 |         self.output_norm = nn.LayerNorm(latent_dim)
+00560 |         self.output_projection = nn.Linear(latent_dim, latent_dim)
+00561 | 
+00562 |     def forward(self, latent: Tensor, timesteps: Tensor, condition: Tensor) -> Tensor:
+00563 |         if latent.ndim != 2 or latent.shape[-1] != self.latent_dim:
+00564 |             raise ValueError(
+00565 |                 f"expected latent [batch, {self.latent_dim}], got {tuple(latent.shape)}"
+00566 |             )
+00567 |         batch_size = latent.shape[0]
+00568 |         if condition.shape != (batch_size, self.condition_dim):
+00569 |             raise ValueError(
+00570 |                 f"expected condition shape ({batch_size}, {self.condition_dim}), got "
+00571 |                 f"{tuple(condition.shape)}"
+00572 |             )
+00573 |         time_embedding = self.time_embedding(timesteps).to(dtype=latent.dtype)
+00574 |         conditioning = self.conditioning_projection(
+00575 |             torch.cat((condition.to(dtype=latent.dtype), time_embedding), dim=-1)
+00576 |         )
+00577 |         hidden_states = latent
+00578 |         for block in self.blocks:
+00579 |             hidden_states = block(hidden_states, conditioning)
+00580 |         return self.output_projection(self.output_norm(hidden_states))
+00581 | 
+00582 | 
+00583 | def _modulate_tokens(normalized: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
+00584 |     """Apply one sample-wise AdaLN shift/scale pair to all temporal tokens."""
+00585 |     return normalized * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+00586 | 
+00587 | 
+00588 | class TemporalSelfAttention(nn.Module):
+00589 |     """ONNX-friendly multi-head self-attention over trajectory time tokens.
+00590 | 
+00591 |     ``nn.MultiheadAttention`` can dispatch to PyTorch's fused
+00592 |     ``aten::_native_multi_head_attention`` during legacy ONNX tracing, which is
+00593 |     not exportable in the deployment toolchain used by this repository.  The
+00594 |     explicit QKV/MatMul/Softmax form below is mathematically equivalent and
+00595 |     lowers to standard ONNX operators understood by ONNX Runtime and TensorRT.
+00596 |     """
+00597 | 
+00598 |     def __init__(self, token_dim: int, num_heads: int, dropout: float = 0.0):
+00599 |         super().__init__()
+00600 |         if token_dim <= 0 or num_heads <= 0:
+00601 |             raise ValueError("attention token_dim and num_heads must be positive")
+00602 |         if token_dim % num_heads != 0:
+00603 |             raise ValueError("attention token_dim must be divisible by num_heads")
+00604 |         if not 0.0 <= dropout < 1.0:
+00605 |             raise ValueError("attention dropout must be in [0, 1)")
+00606 |         self.token_dim = token_dim
+00607 |         self.num_heads = num_heads
+00608 |         self.head_dim = token_dim // num_heads
+00609 |         self.scale = self.head_dim**-0.5
+00610 |         self.qkv_projection = nn.Linear(token_dim, 3 * token_dim)
+00611 |         self.attention_dropout = nn.Dropout(dropout)
+00612 |         self.output_projection = nn.Linear(token_dim, token_dim)
+00613 |         self.output_dropout = nn.Dropout(dropout)
+00614 | 
+00615 |     def forward(self, hidden_states: Tensor) -> Tensor:
+00616 |         if hidden_states.ndim != 3 or hidden_states.shape[-1] != self.token_dim:
+00617 |             raise ValueError(
+00618 |                 f"expected attention input [batch, tokens, {self.token_dim}], got "
+00619 |                 f"{tuple(hidden_states.shape)}"
+00620 |             )
+00621 |         batch_size, num_tokens, _ = hidden_states.shape
+00622 |         qkv = self.qkv_projection(hidden_states)
+00623 |         qkv = qkv.reshape(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+00624 |         qkv = qkv.permute(2, 0, 3, 1, 4)
+00625 |         query, key, value = qkv.unbind(dim=0)
+00626 |         attention_scores = torch.matmul(query, key.transpose(-2, -1)) * self.scale
+00627 |         attention_probabilities = self.attention_dropout(attention_scores.softmax(dim=-1))
+00628 |         attended = torch.matmul(attention_probabilities, value)
+00629 |         attended = attended.transpose(1, 2).reshape(batch_size, num_tokens, self.token_dim)
+00630 |         return self.output_dropout(self.output_projection(attended))
+00631 | 
+00632 | 
+00633 | class AdaLNDiTBlock(nn.Module):
+00634 |     """A temporal DiT block with AdaLN-modulated attention and feed-forward paths.
+00635 | 
+00636 |     Unlike :class:`AdaLNResidualMLPBlock`, this block contains multi-head
+00637 |     self-attention.  Its tokens therefore exchange information across relative
+00638 |     action timesteps.  Flow time and the pooled VLM condition jointly produce
+00639 |     the two AdaLN shift/scale/gate triplets.
+00640 |     """
+00641 | 
+00642 |     def __init__(
+00643 |         self,
+00644 |         token_dim: int,
+00645 |         conditioning_dim: int,
+00646 |         num_heads: int,
+00647 |         mlp_ratio: int = 4,
+00648 |         dropout: float = 0.0,
+00649 |     ):
+00650 |         super().__init__()
+00651 |         if min(token_dim, conditioning_dim, num_heads, mlp_ratio) <= 0:
+00652 |             raise ValueError("DiT block dimensions, heads, and MLP ratio must be positive")
+00653 |         if token_dim % num_heads != 0:
+00654 |             raise ValueError("token_dim must be divisible by num_heads")
+00655 |         if not 0.0 <= dropout < 1.0:
+00656 |             raise ValueError("dropout must be in [0, 1)")
+00657 | 
+00658 |         self.norm_attention = nn.LayerNorm(token_dim, elementwise_affine=False)
+00659 |         self.attention = TemporalSelfAttention(token_dim, num_heads, dropout)
+00660 |         self.norm_mlp = nn.LayerNorm(token_dim, elementwise_affine=False)
+00661 |         self.mlp = nn.Sequential(
+00662 |             nn.Linear(token_dim, token_dim * mlp_ratio),
+00663 |             nn.GELU(approximate="tanh"),
+00664 |             nn.Dropout(dropout),
+00665 |             nn.Linear(token_dim * mlp_ratio, token_dim),
+00666 |             nn.Dropout(dropout),
+00667 |         )
+00668 |         self.modulation = nn.Sequential(
+00669 |             nn.SiLU(),
+00670 |             nn.Linear(conditioning_dim, 6 * token_dim),
+00671 |         )
+00672 | 
+00673 |     def forward(self, hidden_states: Tensor, conditioning: Tensor) -> Tensor:
+00674 |         (
+00675 |             attention_shift,
+00676 |             attention_scale,
+00677 |             attention_gate,
+00678 |             mlp_shift,
+00679 |             mlp_scale,
+00680 |             mlp_gate,
+00681 |         ) = self.modulation(conditioning).chunk(6, dim=-1)
+00682 |         attention_input = _modulate_tokens(
+00683 |             self.norm_attention(hidden_states), attention_shift, attention_scale
+00684 |         )
+00685 |         attention_output = self.attention(attention_input)
+00686 |         hidden_states = hidden_states + attention_gate.unsqueeze(1) * attention_output
+00687 |         mlp_input = _modulate_tokens(self.norm_mlp(hidden_states), mlp_shift, mlp_scale)
+00688 |         return hidden_states + mlp_gate.unsqueeze(1) * self.mlp(mlp_input)
+00689 | 
+00690 | 
+00691 | class LatentDiTFlowNet(nn.Module):
+00692 |     """DiT velocity field over a sequence of action-trajectory latent tokens.
+00693 | 
+00694 |     ``token_mask`` describes which history positions contain real proprioceptive
+00695 |     feedback during cold start.  Invalid positions are *not* removed with a key
+00696 |     padding mask: every position must eventually predict a future action token.
+00697 |     Instead, a learned validity embedding tells the DiT whether a zero token is
+00698 |     real or synthetic padding while still allowing that query to be generated.
+00699 |     """
+00700 | 
+00701 |     def __init__(
+00702 |         self,
+00703 |         token_dim: int,
+00704 |         num_tokens: int,
+00705 |         condition_dim: int = 512,
+00706 |         time_embedding_dim: int = 128,
+00707 |         num_layers: int = 8,
+00708 |         num_heads: int = 8,
+00709 |         mlp_ratio: int = 4,
+00710 |         dropout: float = 0.0,
+00711 |     ):
+00712 |         super().__init__()
+00713 |         if min(token_dim, num_tokens, condition_dim, time_embedding_dim, num_layers) <= 0:
+00714 |             raise ValueError("DiT flow dimensions, token count, and layer count must be positive")
+00715 |         if token_dim % num_heads != 0:
+00716 |             raise ValueError("a2a_dit_token_dim must be divisible by a2a_dit_num_heads")
+00717 |         if not 0.0 <= dropout < 1.0:
+00718 |             raise ValueError("a2a_dit_dropout must be in [0, 1)")
+00719 | 
+00720 |         self.token_dim = token_dim
+00721 |         self.num_tokens = num_tokens
+00722 |         self.condition_dim = condition_dim
+00723 |         self.time_embedding = SinusoidalTimeEmbedding(time_embedding_dim)
+00724 |         self.conditioning_projection = nn.Sequential(
+00725 |             nn.Linear(condition_dim + time_embedding_dim, condition_dim),
+00726 |             nn.SiLU(),
+00727 |             nn.Linear(condition_dim, condition_dim),
+00728 |         )
+00729 |         self.position_embedding = nn.Parameter(torch.empty(1, num_tokens, token_dim))
+00730 |         self.validity_embedding = nn.Embedding(2, token_dim)
+00731 |         self.blocks = nn.ModuleList(
+00732 |             AdaLNDiTBlock(
+00733 |                 token_dim=token_dim,
+00734 |                 conditioning_dim=condition_dim,
+00735 |                 num_heads=num_heads,
+00736 |                 mlp_ratio=mlp_ratio,
+00737 |                 dropout=dropout,
+00738 |             )
+00739 |             for _ in range(num_layers)
+00740 |         )
+00741 |         self.output_norm = nn.LayerNorm(token_dim, elementwise_affine=False)
+00742 |         self.output_modulation = nn.Sequential(
+00743 |             nn.SiLU(),
+00744 |             nn.Linear(condition_dim, 2 * token_dim),
+00745 |         )
+00746 |         self.output_projection = nn.Linear(token_dim, token_dim)
+00747 |         nn.init.trunc_normal_(self.position_embedding, std=0.02)
+00748 |         nn.init.normal_(self.validity_embedding.weight, std=0.02)
+00749 | 
+00750 |     def forward(
+00751 |         self,
+00752 |         latent_tokens: Tensor,
+00753 |         timesteps: Tensor,
+00754 |         condition: Tensor,
+00755 |         token_mask: Tensor | None = None,
+00756 |     ) -> Tensor:
+00757 |         if latent_tokens.ndim != 3:
+00758 |             raise ValueError(
+00759 |                 f"expected latent tokens [batch, {self.num_tokens}, {self.token_dim}], "
+00760 |                 f"got {tuple(latent_tokens.shape)}"
+00761 |             )
+00762 |         expected_shape = (latent_tokens.shape[0], self.num_tokens, self.token_dim)
+00763 |         if tuple(latent_tokens.shape) != expected_shape:
+00764 |             raise ValueError(
+00765 |                 f"expected latent tokens [batch, {self.num_tokens}, {self.token_dim}], "
+00766 |                 f"got {tuple(latent_tokens.shape)}"
+00767 |             )
+00768 |         batch_size = latent_tokens.shape[0]
+00769 |         if condition.shape != (batch_size, self.condition_dim):
+00770 |             raise ValueError(
+00771 |                 f"expected condition shape ({batch_size}, {self.condition_dim}), got "
+00772 |                 f"{tuple(condition.shape)}"
+00773 |             )
+00774 |         if token_mask is None:
+00775 |             token_mask = torch.ones(
+00776 |                 batch_size,
+00777 |                 self.num_tokens,
+00778 |                 dtype=torch.bool,
+00779 |                 device=latent_tokens.device,
+00780 |             )
+00781 |         else:
+00782 |             token_mask = _token_mask(token_mask, latent_tokens)
+00783 | 
+00784 |         time_embedding = self.time_embedding(timesteps).to(dtype=latent_tokens.dtype)
+00785 |         conditioning = self.conditioning_projection(
+00786 |             torch.cat((condition.to(dtype=latent_tokens.dtype), time_embedding), dim=-1)
+00787 |         )
+00788 |         hidden_states = (
+00789 |             latent_tokens
+00790 |             + self.position_embedding.to(dtype=latent_tokens.dtype)
+00791 |             + self.validity_embedding(token_mask.long()).to(dtype=latent_tokens.dtype)
+00792 |         )
+00793 |         for block in self.blocks:
+00794 |             hidden_states = block(hidden_states, conditioning)
+00795 |         output_shift, output_scale = self.output_modulation(conditioning).chunk(2, dim=-1)
+00796 |         hidden_states = _modulate_tokens(
+00797 |             self.output_norm(hidden_states), output_shift, output_scale
+00798 |         )
+00799 |         return self.output_projection(hidden_states)
+00800 | 
+00801 | 
+00802 | def euler_integrate(
+00803 |     velocity_field: Callable[..., Tensor],
+00804 |     initial_latent: Tensor,
+00805 |     condition: Tensor | None = None,
+00806 |     num_steps: int = 1,
+00807 |     start_time: float = 0.0,
+00808 |     end_time: float = 1.0,
+00809 |     return_trajectory: bool = False,
+00810 | ) -> Tensor | tuple[Tensor, Tensor]:
+00811 |     """Integrate a latent velocity field with differentiable explicit Euler steps.
+00812 | 
+00813 |     ``velocity_field`` is called as ``field(z, tau, condition)`` when a condition
+00814 |     is supplied and as ``field(z, tau)`` otherwise.  No ``no_grad`` context or
+00815 |     in-place update is used, so inferred-latent consistency losses can backprop
+00816 |     through every solver step.
+00817 |     """
+00818 |     if initial_latent.ndim < 2:
+00819 |         raise ValueError(
+00820 |             "expected initial_latent with a batch dimension and at least one latent "
+00821 |             f"dimension, got {tuple(initial_latent.shape)}"
+00822 |         )
+00823 |     if not isinstance(num_steps, int) or num_steps <= 0:
+00824 |         raise ValueError("num_steps must be a positive integer")
+00825 |     if not end_time > start_time:
+00826 |         raise ValueError("end_time must be greater than start_time")
+00827 | 
+00828 |     step_size = (end_time - start_time) / num_steps
+00829 |     latent = initial_latent
+00830 |     trajectory = [latent] if return_trajectory else None
+00831 |     for step in range(num_steps):
+00832 |         timesteps = torch.full(
+00833 |             (latent.shape[0],),
+00834 |             start_time + step * step_size,
+00835 |             device=latent.device,
+00836 |             dtype=torch.float32,
+00837 |         )
+00838 |         if condition is None:
+00839 |             velocity = velocity_field(latent, timesteps)
+00840 |         else:
+00841 |             velocity = velocity_field(latent, timesteps, condition)
+00842 |         if velocity.shape != latent.shape:
+00843 |             raise ValueError(
+00844 |                 f"velocity field returned shape {tuple(velocity.shape)}, expected "
+00845 |                 f"{tuple(latent.shape)}"
+00846 |             )
+00847 |         latent = latent + step_size * velocity
+00848 |         if trajectory is not None:
+00849 |             trajectory.append(latent)
+00850 | 
+00851 |     if trajectory is None:
+00852 |         return latent
+00853 |     return latent, torch.stack(trajectory, dim=1)

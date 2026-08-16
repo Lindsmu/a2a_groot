@@ -1,0 +1,650 @@
+00001 | #!/usr/bin/env python
+00002 | 
+00003 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+00004 | # SPDX-License-Identifier: Apache-2.0
+00005 | 
+00006 | """Export strict, unnormalized canonical A2A windows from preprocessed data.
+00007 | 
+00008 | This exporter deliberately implements only the identity transform.  Every
+00009 | continuous source-state and target-action column must therefore already be in
+00010 | the same physical representation, unit, and frame recorded by the channel
+00011 | contract.  Controller deltas, joint velocities, and other raw command spaces
+00012 | must be canonicalized into new dataset columns before this script is used.
+00013 | 
+00014 | The output NPZ is the input expected by ``build_canonical_stats.py`` and
+00015 | ``audit_a2a_data.py``.  No model Processor is constructed or called, so the
+00016 | arrays remain in unnormalized physical units.
+00017 | """
+00018 | 
+00019 | from __future__ import annotations
+00020 | 
+00021 | import argparse
+00022 | from copy import deepcopy
+00023 | import importlib
+00024 | import json
+00025 | from pathlib import Path
+00026 | import sys
+00027 | from typing import Any
+00028 | 
+00029 | from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+00030 | from gr00t.data.a2a_contract import validate_channel_contract
+00031 | from gr00t.data.dataset.a2a_single_step_dataset import (
+00032 |     A2AShardedSingleStepDataset,
+00033 |     compute_a2a_window_bounds,
+00034 |     extract_a2a_step_data,
+00035 | )
+00036 | from gr00t.data.embodiment_tags import EmbodimentTag
+00037 | from gr00t.data.types import ModalityConfig, VLAStepData
+00038 | import numpy as np
+00039 | 
+00040 | 
+00041 | IDENTITY_CANONICALIZER = "identity_preprocessed"
+00042 | EXPORTER_VERSION = "1"
+00043 | _SUPPORTED_KINDS = {"continuous", "regression", "binary", "categorical"}
+00044 | _RAW_LIBERO_ACTION_KEYS = {"x", "y", "z", "roll", "pitch", "yaw", "gripper"}
+00045 | 
+00046 | 
+00047 | def load_modality_config(modality_config_path: str | Path) -> Path:
+00048 |     """Import a user-selected local Python module that registers modality configs.
+00049 | 
+00050 |     This mirrors the explicit local registration path used by
+00051 |     ``gr00t.experiment.launch_finetune``.  Importing a Python file executes it,
+00052 |     so the path is accepted only through the dedicated CLI option.
+00053 |     """
+00054 | 
+00055 |     path = Path(modality_config_path)
+00056 |     if not path.exists() or not path.is_file() or path.suffix != ".py":
+00057 |         raise FileNotFoundError(
+00058 |             f"Modality config path does not exist or is not a .py file: {path}"
+00059 |         )
+00060 |     sys.path.append(str(path.parent))
+00061 |     importlib.import_module(path.stem)
+00062 |     print(f"Loaded modality config: {path}")
+00063 |     return path
+00064 | 
+00065 | 
+00066 | def _required_positive_int(payload: dict[str, Any], key: str) -> int:
+00067 |     value = payload.get(key)
+00068 |     if (
+00069 |         isinstance(value, bool)
+00070 |         or not isinstance(value, (int, np.integer))
+00071 |         or int(value) <= 0
+00072 |     ):
+00073 |         raise ValueError(f"A2A contract {key} must be a positive integer, got {value!r}")
+00074 |     return int(value)
+00075 | 
+00076 | 
+00077 | def _require_nonempty_string(payload: dict[str, Any], key: str, context: str) -> str:
+00078 |     value = payload.get(key)
+00079 |     if not isinstance(value, str) or not value:
+00080 |         raise ValueError(f"{context} requires a non-empty {key}")
+00081 |     return value
+00082 | 
+00083 | 
+00084 | def validate_identity_preprocessed_contract(contract: dict[str, Any]) -> dict[str, Any]:
+00085 |     """Validate that a contract is safe for a no-op canonicalizer.
+00086 | 
+00087 |     String equality is not treated as a conversion.  Continuous columns must
+00088 |     already have identical source, target, and canonical semantics.  LIBERO's
+00089 |     well-known raw controller keys are rejected as continuous targets because
+00090 |     they are OSC delta commands rather than absolute EEF state.
+00091 |     """
+00092 | 
+00093 |     feature_dim = _required_positive_int(contract, "feature_dim")
+00094 |     history_horizon = _required_positive_int(contract, "history_horizon")
+00095 |     future_horizon = _required_positive_int(contract, "future_horizon")
+00096 |     normalized = validate_channel_contract(
+00097 |         contract,
+00098 |         feature_dim=feature_dim,
+00099 |         history_horizon=history_horizon,
+00100 |         future_horizon=future_horizon,
+00101 |     )
+00102 | 
+00103 |     provenance = normalized["provenance"]
+00104 |     if provenance["canonicalizer"] != IDENTITY_CANONICALIZER:
+00105 |         raise ValueError(
+00106 |             "export_canonical_windows.py only supports "
+00107 |             f"provenance.canonicalizer={IDENTITY_CANONICALIZER!r}, got "
+00108 |             f"{provenance['canonicalizer']!r}"
+00109 |         )
+00110 |     if provenance["exporter_version"] != EXPORTER_VERSION:
+00111 |         raise ValueError(
+00112 |             f"Contract exporter_version={provenance['exporter_version']!r} does not match "
+00113 |             f"this exporter version {EXPORTER_VERSION!r}"
+00114 |         )
+00115 | 
+00116 |     controller = normalized["controller"]
+00117 |     for key in ("type", "version", "frame", "rotation_composition"):
+00118 |         _require_nonempty_string(controller, key, "A2A controller contract")
+00119 |     if not isinstance(controller["control_delta"], bool):
+00120 |         raise ValueError("A2A controller control_delta must be a JSON boolean")
+00121 |     scale = np.asarray(controller["scale"])
+00122 |     if (
+00123 |         scale.ndim != 1
+00124 |         or scale.size == 0
+00125 |         or not np.issubdtype(scale.dtype, np.number)
+00126 |         or not np.isfinite(scale).all()
+00127 |     ):
+00128 |         raise ValueError("A2A controller scale must be a non-empty finite numeric vector")
+00129 | 
+00130 |     continuous_count = 0
+00131 |     continuous_sources: set[str] = set()
+00132 |     for channel in normalized["channels"]:
+00133 |         action_key = channel["action_key"]
+00134 |         kind = channel.get("kind")
+00135 |         if kind not in _SUPPORTED_KINDS:
+00136 |             raise ValueError(
+00137 |                 f"A2A channel {action_key!r} has unsupported kind {kind!r}; "
+00138 |                 f"expected one of {sorted(_SUPPORTED_KINDS)}"
+00139 |             )
+00140 |         if kind != "continuous":
+00141 |             continue
+00142 | 
+00143 |         continuous_count += 1
+00144 |         source_key = _require_nonempty_string(
+00145 |             channel, "source_state_key", f"Continuous A2A channel {action_key!r}"
+00146 |         )
+00147 |         if source_key in continuous_sources:
+00148 |             raise ValueError(
+00149 |                 f"Continuous source_state_key {source_key!r} is mapped more than once"
+00150 |             )
+00151 |         continuous_sources.add(source_key)
+00152 | 
+00153 |         canonical_format = _require_nonempty_string(
+00154 |             channel, "canonical_format", f"Continuous A2A channel {action_key!r}"
+00155 |         )
+00156 |         source_format = _require_nonempty_string(
+00157 |             channel, "source_format", f"Continuous A2A channel {action_key!r}"
+00158 |         )
+00159 |         target_format = _require_nonempty_string(
+00160 |             channel, "target_format", f"Continuous A2A channel {action_key!r}"
+00161 |         )
+00162 |         if canonical_format == "auto" or not (
+00163 |             canonical_format == source_format == target_format
+00164 |         ):
+00165 |             raise ValueError(
+00166 |                 f"Identity continuous channel {action_key!r} must already share one explicit "
+00167 |                 "source/target/canonical format"
+00168 |             )
+00169 |         source_unit = _require_nonempty_string(
+00170 |             channel, "source_unit", f"Continuous A2A channel {action_key!r}"
+00171 |         )
+00172 |         target_unit = _require_nonempty_string(
+00173 |             channel, "target_unit", f"Continuous A2A channel {action_key!r}"
+00174 |         )
+00175 |         source_frame = _require_nonempty_string(
+00176 |             channel, "source_frame", f"Continuous A2A channel {action_key!r}"
+00177 |         )
+00178 |         target_frame = _require_nonempty_string(
+00179 |             channel, "target_frame", f"Continuous A2A channel {action_key!r}"
+00180 |         )
+00181 |         if source_unit != target_unit or source_frame != target_frame:
+00182 |             raise ValueError(
+00183 |                 f"Identity continuous channel {action_key!r} has mismatched units or frames"
+00184 |             )
+00185 | 
+00186 |         if normalized["embodiment"] == "libero_sim" and action_key in _RAW_LIBERO_ACTION_KEYS:
+00187 |             raise ValueError(
+00188 |                 "Raw LIBERO action keys are OSC delta commands and cannot be exported as "
+00189 |                 "identity continuous canonical targets. Preprocess them into new absolute "
+00190 |                 "canonical action columns first."
+00191 |             )
+00192 | 
+00193 |     if continuous_count == 0:
+00194 |         raise ValueError("Identity latent A2A export requires at least one continuous channel")
+00195 |     return normalized
+00196 | 
+00197 | 
+00198 | def build_export_modality_configs(
+00199 |     contract: dict[str, Any],
+00200 |     base_modality_configs: dict[str, ModalityConfig],
+00201 | ) -> dict[str, ModalityConfig]:
+00202 |     """Build the smallest raw-data configuration needed by the exporter."""
+00203 | 
+00204 |     contract = validate_identity_preprocessed_contract(contract)
+00205 |     if "language" not in base_modality_configs:
+00206 |         raise ValueError("A2A export requires one language modality for VLAStepData extraction")
+00207 |     state_keys = [
+00208 |         channel["source_state_key"]
+00209 |         for channel in contract["channels"]
+00210 |         if channel["kind"] == "continuous"
+00211 |     ]
+00212 |     action_keys = [channel["action_key"] for channel in contract["channels"]]
+00213 |     return {
+00214 |         "state": ModalityConfig(
+00215 |             delta_indices=list(range(-(int(contract["history_horizon"]) - 1), 1)),
+00216 |             modality_keys=state_keys,
+00217 |         ),
+00218 |         "action": ModalityConfig(
+00219 |             delta_indices=list(range(int(contract["future_horizon"]))),
+00220 |             modality_keys=action_keys,
+00221 |         ),
+00222 |         "language": deepcopy(base_modality_configs["language"]),
+00223 |     }
+00224 | 
+00225 | 
+00226 | def _finite_matrix(value: Any, expected_shape: tuple[int, int], name: str) -> np.ndarray:
+00227 |     array = np.asarray(value)
+00228 |     if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+00229 |         array.dtype, np.complexfloating
+00230 |     ):
+00231 |         raise TypeError(f"{name} must be real numeric, got dtype {array.dtype}")
+00232 |     if array.shape != expected_shape:
+00233 |         raise ValueError(f"{name} must have shape {expected_shape}, got {array.shape}")
+00234 |     if not np.isfinite(array).all():
+00235 |         raise ValueError(f"{name} contains non-finite values")
+00236 |     return array.astype(np.float32, copy=False)
+00237 | 
+00238 | 
+00239 | def pack_identity_preprocessed_window(
+00240 |     step: VLAStepData, contract: dict[str, Any]
+00241 | ) -> dict[str, np.ndarray]:
+00242 |     """Pack one raw, already-canonical VLA step into the shared A2A layout."""
+00243 | 
+00244 |     contract = validate_identity_preprocessed_contract(contract)
+00245 |     return _pack_validated_identity_preprocessed_window(step, contract)
+00246 | 
+00247 | 
+00248 | def _pack_validated_identity_preprocessed_window(
+00249 |     step: VLAStepData, contract: dict[str, Any]
+00250 | ) -> dict[str, np.ndarray]:
+00251 |     """Pack one step after the caller has validated ``contract`` once."""
+00252 | 
+00253 |     history_horizon = int(contract["history_horizon"])
+00254 |     future_horizon = int(contract["future_horizon"])
+00255 |     feature_dim = int(contract["feature_dim"])
+00256 |     history = np.zeros((history_horizon, feature_dim), dtype=np.float32)
+00257 |     future = np.zeros((future_horizon, feature_dim), dtype=np.float32)
+00258 |     history_mask = np.zeros_like(history, dtype=np.uint8)
+00259 |     future_mask = np.zeros_like(future, dtype=np.uint8)
+00260 | 
+00261 |     for channel in contract["channels"]:
+00262 |         action_key = channel["action_key"]
+00263 |         kind = channel["kind"]
+00264 |         start, end = int(channel["start"]), int(channel["end"])
+00265 |         dim = end - start
+00266 |         if action_key not in step.actions:
+00267 |             raise KeyError(f"Canonical target action {action_key!r} is missing from the sample")
+00268 |         target = _finite_matrix(
+00269 |             step.actions[action_key],
+00270 |             (future_horizon, dim),
+00271 |             f"action.{action_key}",
+00272 |         )
+00273 |         if kind == "binary" and not np.isin(target, [0.0, 1.0]).all():
+00274 |             raise ValueError(
+00275 |                 f"Binary canonical target action.{action_key} must contain only 0/1"
+00276 |             )
+00277 |         if kind == "categorical" and (
+00278 |             not np.isin(target, [0.0, 1.0]).all()
+00279 |             or not np.allclose(target.sum(axis=-1), 1.0)
+00280 |         ):
+00281 |             raise ValueError(
+00282 |                 f"Categorical canonical target action.{action_key} must be one-hot"
+00283 |             )
+00284 |         future[:, start:end] = target
+00285 |         future_mask[:, start:end] = 1
+00286 | 
+00287 |         if kind == "continuous":
+00288 |             source_key = channel["source_state_key"]
+00289 |             if source_key not in step.states:
+00290 |                 raise KeyError(
+00291 |                     f"Canonical history state {source_key!r} for action {action_key!r} is missing"
+00292 |                 )
+00293 |             source = _finite_matrix(
+00294 |                 step.states[source_key],
+00295 |                 (history_horizon, dim),
+00296 |                 f"state.{source_key}",
+00297 |             )
+00298 |             history[:, start:end] = source
+00299 |             history_mask[:, start:end] = 1
+00300 | 
+00301 |     if not np.isin(history_mask, [0, 1]).all() or not np.isin(future_mask, [0, 1]).all():
+00302 |         raise AssertionError("Internal A2A exporter masks are not binary")
+00303 |     if not history_mask.any() or not future_mask.any():
+00304 |         raise ValueError("Canonical window has no active history/future values")
+00305 |     if not np.isfinite(history[history_mask.astype(bool)]).all() or not np.isfinite(
+00306 |         future[future_mask.astype(bool)]
+00307 |     ).all():
+00308 |         raise ValueError("Canonical window contains non-finite active values")
+00309 |     return {
+00310 |         "history": history,
+00311 |         "future": future,
+00312 |         "history_mask": history_mask,
+00313 |         "future_mask": future_mask,
+00314 |     }
+00315 | 
+00316 | 
+00317 | def _validate_export_dataset_contract(
+00318 |     dataset: A2AShardedSingleStepDataset,
+00319 |     contract: dict[str, Any],
+00320 | ) -> None:
+00321 |     """Require the loader configuration to encode the contract's exact timeline."""
+00322 | 
+00323 |     dataset_embodiment = getattr(dataset.embodiment_tag, "value", dataset.embodiment_tag)
+00324 |     if dataset_embodiment != contract["embodiment"]:
+00325 |         raise ValueError(
+00326 |             f"Dataset embodiment {dataset_embodiment!r} does not match contract embodiment "
+00327 |             f"{contract['embodiment']!r}"
+00328 |         )
+00329 | 
+00330 |     expected_state_deltas = list(range(-(int(contract["history_horizon"]) - 1), 1))
+00331 |     expected_action_deltas = list(range(int(contract["future_horizon"])))
+00332 |     expected_state_keys = [
+00333 |         channel["source_state_key"]
+00334 |         for channel in contract["channels"]
+00335 |         if channel["kind"] == "continuous"
+00336 |     ]
+00337 |     expected_action_keys = [channel["action_key"] for channel in contract["channels"]]
+00338 |     expected = {
+00339 |         "state": (expected_state_deltas, expected_state_keys),
+00340 |         "action": (expected_action_deltas, expected_action_keys),
+00341 |     }
+00342 |     for modality, (expected_deltas, expected_keys) in expected.items():
+00343 |         if modality not in dataset.modality_configs:
+00344 |             raise ValueError(f"A2A export dataset is missing {modality!r} modality config")
+00345 |         config = dataset.modality_configs[modality]
+00346 |         actual_deltas = list(config.delta_indices)
+00347 |         actual_keys = list(config.modality_keys)
+00348 |         if actual_deltas != expected_deltas:
+00349 |             raise ValueError(
+00350 |                 f"A2A export {modality} delta_indices={actual_deltas}, expected the exact "
+00351 |                 f"contract timeline {expected_deltas}"
+00352 |             )
+00353 |         if actual_keys != expected_keys:
+00354 |             raise ValueError(
+00355 |                 f"A2A export {modality} modality_keys={actual_keys}, expected {expected_keys}"
+00356 |             )
+00357 | 
+00358 | 
+00359 | def collect_identity_preprocessed_windows(
+00360 |     dataset: A2AShardedSingleStepDataset,
+00361 |     contract: dict[str, Any],
+00362 |     *,
+00363 |     max_windows: int | None = None,
+00364 | ) -> dict[str, np.ndarray]:
+00365 |     """Traverse every strict anchor in every complete episode."""
+00366 | 
+00367 |     contract = validate_identity_preprocessed_contract(contract)
+00368 |     _validate_export_dataset_contract(dataset, contract)
+00369 |     if max_windows is not None and (
+00370 |         isinstance(max_windows, bool) or not isinstance(max_windows, int) or max_windows <= 0
+00371 |     ):
+00372 |         raise ValueError(f"max_windows must be a positive integer, got {max_windows!r}")
+00373 | 
+00374 |     windows: list[dict[str, np.ndarray]] = []
+00375 |     episode_indices: list[int] = []
+00376 |     base_step_indices: list[int] = []
+00377 |     stop = False
+00378 |     for episode_index in range(len(dataset.episode_loader.episode_lengths)):
+00379 |         # LeRobotEpisodeLoader.__getitem__ returns the complete processed episode.
+00380 |         episode_data = dataset.episode_loader[episode_index]
+00381 |         bounds = compute_a2a_window_bounds(len(episode_data), dataset.modality_configs)
+00382 |         for step_index in range(bounds.valid_start, bounds.valid_end + 1):
+00383 |             step = extract_a2a_step_data(
+00384 |                 episode_data=episode_data,
+00385 |                 step_index=step_index,
+00386 |                 modality_configs=dataset.modality_configs,
+00387 |                 embodiment_tag=dataset.embodiment_tag,
+00388 |             )
+00389 |             windows.append(_pack_validated_identity_preprocessed_window(step, contract))
+00390 |             episode_indices.append(episode_index)
+00391 |             base_step_indices.append(step_index)
+00392 |             if max_windows is not None and len(windows) >= max_windows:
+00393 |                 stop = True
+00394 |                 break
+00395 |         if stop:
+00396 |             break
+00397 | 
+00398 |     if not windows:
+00399 |         raise ValueError("Dataset contains no strict canonical A2A windows")
+00400 |     result = {
+00401 |         key: np.stack([window[key] for window in windows], axis=0)
+00402 |         for key in ("history", "future", "history_mask", "future_mask")
+00403 |     }
+00404 |     result["episode_index"] = np.asarray(episode_indices, dtype=np.int64)
+00405 |     result["base_step_index"] = np.asarray(base_step_indices, dtype=np.int64)
+00406 |     return result
+00407 | 
+00408 | 
+00409 | def _validate_export_arrays(
+00410 |     arrays: dict[str, np.ndarray],
+00411 |     contract: dict[str, Any],
+00412 | ) -> dict[str, np.ndarray]:
+00413 |     """Validate the complete NPZ tensor contract before any bytes are written."""
+00414 | 
+00415 |     required = {
+00416 |         "history",
+00417 |         "future",
+00418 |         "history_mask",
+00419 |         "future_mask",
+00420 |         "episode_index",
+00421 |         "base_step_index",
+00422 |     }
+00423 |     missing = required - set(arrays)
+00424 |     if missing:
+00425 |         raise KeyError(f"Canonical export arrays are missing: {sorted(missing)}")
+00426 | 
+00427 |     history = np.asarray(arrays["history"])
+00428 |     future = np.asarray(arrays["future"])
+00429 |     history_mask = np.asarray(arrays["history_mask"])
+00430 |     future_mask = np.asarray(arrays["future_mask"])
+00431 |     episode_index = np.asarray(arrays["episode_index"])
+00432 |     base_step_index = np.asarray(arrays["base_step_index"])
+00433 | 
+00434 |     history_shape = (
+00435 |         history.shape[0] if history.ndim == 3 else -1,
+00436 |         int(contract["history_horizon"]),
+00437 |         int(contract["feature_dim"]),
+00438 |     )
+00439 |     future_shape = (
+00440 |         history_shape[0],
+00441 |         int(contract["future_horizon"]),
+00442 |         int(contract["feature_dim"]),
+00443 |     )
+00444 |     if history.shape != history_shape or history_shape[0] <= 0:
+00445 |         raise ValueError(
+00446 |             f"history must have non-empty shape [N,H,D]={history_shape}, "
+00447 |             f"got {history.shape}"
+00448 |         )
+00449 |     if future.shape != future_shape:
+00450 |         raise ValueError(f"future must have shape {future_shape}, got {future.shape}")
+00451 |     if history_mask.shape != history_shape or future_mask.shape != future_shape:
+00452 |         raise ValueError("Canonical masks must exactly match their history/future array shapes")
+00453 |     for value, name in ((history, "history"), (future, "future")):
+00454 |         if not np.issubdtype(value.dtype, np.number) or np.issubdtype(
+00455 |             value.dtype, np.complexfloating
+00456 |         ):
+00457 |             raise TypeError(f"{name} must be real numeric, got dtype {value.dtype}")
+00458 |         if not np.isfinite(value).all():
+00459 |             raise ValueError(f"{name} must contain only finite values, including padding")
+00460 |     for value, name in ((history_mask, "history_mask"), (future_mask, "future_mask")):
+00461 |         if not (
+00462 |             np.issubdtype(value.dtype, np.bool_)
+00463 |             or (
+00464 |                 np.issubdtype(value.dtype, np.number)
+00465 |                 and not np.issubdtype(value.dtype, np.complexfloating)
+00466 |             )
+00467 |         ):
+00468 |             raise TypeError(f"{name} must be boolean or real numeric, got dtype {value.dtype}")
+00469 |         if not np.isfinite(value).all() or not np.isin(value, [0, 1]).all():
+00470 |             raise ValueError(f"{name} must contain only finite binary 0/1 values")
+00471 | 
+00472 |     expected_history_mask = np.zeros(history_shape[1:], dtype=np.uint8)
+00473 |     expected_future_mask = np.zeros(future_shape[1:], dtype=np.uint8)
+00474 |     for channel in contract["channels"]:
+00475 |         start, end = int(channel["start"]), int(channel["end"])
+00476 |         expected_future_mask[:, start:end] = 1
+00477 |         if channel["kind"] == "continuous":
+00478 |             expected_history_mask[:, start:end] = 1
+00479 |     if not np.array_equal(
+00480 |         history_mask.astype(np.uint8, copy=False),
+00481 |         np.broadcast_to(expected_history_mask, history_shape),
+00482 |     ):
+00483 |         raise ValueError("history_mask does not match the contract's continuous channel layout")
+00484 |     if not np.array_equal(
+00485 |         future_mask.astype(np.uint8, copy=False),
+00486 |         np.broadcast_to(expected_future_mask, future_shape),
+00487 |     ):
+00488 |         raise ValueError("future_mask does not match the contract's target channel layout")
+00489 |     for channel in contract["channels"]:
+00490 |         start, end = int(channel["start"]), int(channel["end"])
+00491 |         target = future[..., start:end]
+00492 |         if channel["kind"] == "binary" and not np.isin(target, [0.0, 1.0]).all():
+00493 |             raise ValueError(
+00494 |                 f"Binary canonical target {channel['action_key']!r} must contain only 0/1"
+00495 |             )
+00496 |         if channel["kind"] == "categorical" and (
+00497 |             not np.isin(target, [0.0, 1.0]).all()
+00498 |             or not np.allclose(target.sum(axis=-1), 1.0)
+00499 |         ):
+00500 |             raise ValueError(
+00501 |                 f"Categorical canonical target {channel['action_key']!r} must be one-hot"
+00502 |             )
+00503 |     if np.any(history[~history_mask.astype(bool)]) or np.any(
+00504 |         future[~future_mask.astype(bool)]
+00505 |     ):
+00506 |         raise ValueError("Inactive canonical padding must be exactly zero")
+00507 | 
+00508 |     for value, name in (
+00509 |         (episode_index, "episode_index"),
+00510 |         (base_step_index, "base_step_index"),
+00511 |     ):
+00512 |         if value.shape != (history_shape[0],):
+00513 |             raise ValueError(f"{name} must have shape {(history_shape[0],)}, got {value.shape}")
+00514 |         if not np.issubdtype(value.dtype, np.integer) or np.any(value < 0):
+00515 |             raise ValueError(f"{name} must contain non-negative integers")
+00516 |     anchors = np.stack((episode_index, base_step_index), axis=-1)
+00517 |     if np.unique(anchors, axis=0).shape[0] != history_shape[0]:
+00518 |         raise ValueError("Canonical export contains duplicate episode/base-step anchors")
+00519 |     expected_order = np.lexsort((base_step_index, episode_index))
+00520 |     if not np.array_equal(expected_order, np.arange(history_shape[0])):
+00521 |         raise ValueError("Canonical export anchors must be ordered by episode then base step")
+00522 | 
+00523 |     return {
+00524 |         "history": history,
+00525 |         "future": future,
+00526 |         "history_mask": history_mask.astype(np.uint8, copy=False),
+00527 |         "future_mask": future_mask.astype(np.uint8, copy=False),
+00528 |         "episode_index": episode_index.astype(np.int64, copy=False),
+00529 |         "base_step_index": base_step_index.astype(np.int64, copy=False),
+00530 |     }
+00531 | 
+00532 | 
+00533 | def save_identity_preprocessed_windows(
+00534 |     arrays: dict[str, np.ndarray],
+00535 |     contract: dict[str, Any],
+00536 |     output_path: str | Path,
+00537 | ) -> Path:
+00538 |     """Save canonical arrays together with their immutable contract provenance."""
+00539 | 
+00540 |     contract = validate_identity_preprocessed_contract(contract)
+00541 |     arrays = _validate_export_arrays(arrays, contract)
+00542 |     output_path = Path(output_path)
+00543 |     if output_path.suffix.lower() != ".npz":
+00544 |         raise ValueError(f"Canonical export output must use a .npz suffix: {output_path}")
+00545 |     output_path.parent.mkdir(parents=True, exist_ok=True)
+00546 |     provenance = contract["provenance"]
+00547 |     metadata = {
+00548 |         "input_space": np.asarray("unnormalized_canonical_physical"),
+00549 |         "contract_json": np.asarray(
+00550 |             json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+00551 |         ),
+00552 |         "contract_sha256": np.asarray(contract["sha256"]),
+00553 |         "contract_version": np.asarray(contract["version"], dtype=np.int64),
+00554 |         "embodiment": np.asarray(contract["embodiment"]),
+00555 |         "dataset": np.asarray(provenance["dataset"]),
+00556 |         "dataset_revision": np.asarray(provenance["dataset_revision"]),
+00557 |         "dataset_fingerprint_sha256": np.asarray(
+00558 |             provenance["dataset_fingerprint_sha256"]
+00559 |         ),
+00560 |         "source_schema_sha256": np.asarray(provenance["source_schema_sha256"]),
+00561 |         "canonicalizer": np.asarray(provenance["canonicalizer"]),
+00562 |         "canonicalizer_version": np.asarray(provenance["canonicalizer_version"]),
+00563 |         "canonicalizer_sha256": np.asarray(provenance["canonicalizer_sha256"]),
+00564 |         "exporter_version": np.asarray(provenance["exporter_version"]),
+00565 |         "target_definition": np.asarray(provenance["target_definition"]),
+00566 |         "time_alignment": np.asarray(provenance["time_alignment"]),
+00567 |         "num_windows": np.asarray(arrays["history"].shape[0], dtype=np.int64),
+00568 |         "history_horizon": np.asarray(contract["history_horizon"], dtype=np.int64),
+00569 |         "future_horizon": np.asarray(contract["future_horizon"], dtype=np.int64),
+00570 |         "feature_dim": np.asarray(contract["feature_dim"], dtype=np.int64),
+00571 |     }
+00572 |     np.savez_compressed(output_path, **arrays, **metadata)
+00573 |     return output_path
+00574 | 
+00575 | 
+00576 | def export_identity_preprocessed_dataset(
+00577 |     dataset: A2AShardedSingleStepDataset,
+00578 |     contract: dict[str, Any],
+00579 |     output_path: str | Path,
+00580 |     *,
+00581 |     max_windows: int | None = None,
+00582 | ) -> Path:
+00583 |     """Collect and save all strict identity-preprocessed windows."""
+00584 | 
+00585 |     arrays = collect_identity_preprocessed_windows(
+00586 |         dataset, contract, max_windows=max_windows
+00587 |     )
+00588 |     return save_identity_preprocessed_windows(arrays, contract, output_path)
+00589 | 
+00590 | 
+00591 | def build_argument_parser() -> argparse.ArgumentParser:
+00592 |     parser = argparse.ArgumentParser(description=__doc__)
+00593 |     parser.add_argument("--dataset-path", type=Path, required=True)
+00594 |     parser.add_argument("--contract", type=Path, required=True)
+00595 |     parser.add_argument("--output", type=Path, required=True)
+00596 |     parser.add_argument(
+00597 |         "--embodiment-tag",
+00598 |         help="Embodiment enum name or value; defaults to contract.embodiment",
+00599 |     )
+00600 |     parser.add_argument(
+00601 |         "--modality-config-path",
+00602 |         type=Path,
+00603 |         help="Local .py module that registers a custom entry in MODALITY_CONFIGS",
+00604 |     )
+00605 |     parser.add_argument("--max-windows", type=int)
+00606 |     parser.add_argument("--seed", type=int, default=42)
+00607 |     return parser
+00608 | 
+00609 | 
+00610 | def main(argv: list[str] | None = None) -> int:
+00611 |     args = build_argument_parser().parse_args(argv)
+00612 |     contract = validate_identity_preprocessed_contract(
+00613 |         json.loads(args.contract.read_text(encoding="utf-8"))
+00614 |     )
+00615 |     embodiment = EmbodimentTag.resolve(args.embodiment_tag or contract["embodiment"])
+00616 |     if embodiment.value != contract["embodiment"]:
+00617 |         raise ValueError(
+00618 |             f"Contract embodiment {contract['embodiment']!r} does not match "
+00619 |             f"--embodiment-tag {embodiment.value!r}"
+00620 |         )
+00621 |     if args.modality_config_path is not None:
+00622 |         load_modality_config(args.modality_config_path)
+00623 |     if embodiment.value not in MODALITY_CONFIGS:
+00624 |         raise ValueError(
+00625 |             f"No registered modality configuration for embodiment {embodiment.value!r}. "
+00626 |             "Pass --modality-config-path for preprocessed custom embodiments."
+00627 |         )
+00628 |     modality_configs = build_export_modality_configs(
+00629 |         contract, MODALITY_CONFIGS[embodiment.value]
+00630 |     )
+00631 |     dataset = A2AShardedSingleStepDataset(
+00632 |         dataset_path=args.dataset_path,
+00633 |         embodiment_tag=embodiment,
+00634 |         modality_configs=modality_configs,
+00635 |         episode_sampling_rate=1.0,
+00636 |         seed=args.seed,
+00637 |         allow_padding=False,
+00638 |     )
+00639 |     output_path = export_identity_preprocessed_dataset(
+00640 |         dataset,
+00641 |         contract,
+00642 |         args.output,
+00643 |         max_windows=args.max_windows,
+00644 |     )
+00645 |     print(f"Wrote strict unnormalized canonical A2A windows to {output_path}")
+00646 |     return 0
+00647 | 
+00648 | 
+00649 | if __name__ == "__main__":
+00650 |     raise SystemExit(main())

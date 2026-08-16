@@ -1,0 +1,257 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | import json
+00017 | import logging
+00018 | from pathlib import Path
+00019 | 
+00020 | import numpy as np
+00021 | import torch
+00022 | from transformers import AutoModel, AutoProcessor
+00023 | 
+00024 | from gr00t.configs.base_config import Config
+00025 | from gr00t.configs.model.gr00t_n1d7 import Gr00tN1d7Config
+00026 | from gr00t.data.dataset.factory import DatasetFactory
+00027 | from gr00t.model.base.model_pipeline import ModelPipeline
+00028 | from gr00t.model.gr00t_n1d7.gr00t_n1d7 import Gr00tN1d7
+00029 | from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+00030 | from gr00t.model.registry import register_model
+00031 | from gr00t.utils.dist_utils import run_or_wait_on_rank0
+00032 | 
+00033 | 
+00034 | # Convert tensors to lists for JSON serialization
+00035 | def convert_tensors_to_lists(obj):
+00036 |     """Recursively convert tensors to lists in nested dictionaries/lists."""
+00037 |     if torch.is_tensor(obj) or isinstance(obj, np.ndarray):
+00038 |         return obj.tolist()
+00039 |     elif isinstance(obj, dict):
+00040 |         return {key: convert_tensors_to_lists(value) for key, value in obj.items()}
+00041 |     elif isinstance(obj, (list, tuple)):
+00042 |         return [convert_tensors_to_lists(item) for item in obj]
+00043 |     else:
+00044 |         return obj
+00045 | 
+00046 | 
+00047 | class Gr00tN1d7Pipeline(ModelPipeline):
+00048 |     model_class = Gr00tN1d7
+00049 |     processor_class = Gr00tN1d7Processor
+00050 | 
+00051 |     def __init__(self, config: Config, save_cfg_dir: Path):
+00052 |         super().__init__(config)
+00053 |         self.save_cfg_dir = save_cfg_dir
+00054 | 
+00055 |         # Build transformers loading kwargs from training config
+00056 |         transformers_loading_kwargs = {
+00057 |             "trust_remote_code": self.config.training.transformers_trust_remote_code,
+00058 |             "local_files_only": self.config.training.transformers_local_files_only,
+00059 |         }
+00060 |         if self.model_config.model_revision is not None:
+00061 |             transformers_loading_kwargs["revision"] = self.model_config.model_revision
+00062 |         if self.config.training.transformers_cache_dir is not None:
+00063 |             transformers_loading_kwargs["cache_dir"] = self.config.training.transformers_cache_dir
+00064 |         if self.config.training.transformers_access_token is not None:
+00065 |             transformers_loading_kwargs["token"] = self.config.training.transformers_access_token
+00066 | 
+00067 |         self.transformers_loading_kwargs = transformers_loading_kwargs
+00068 | 
+00069 |     @property
+00070 |     def model_config(self):
+00071 |         return self.config.model
+00072 | 
+00073 |     def setup(self):
+00074 |         self.model = self._create_model()
+00075 |         self.train_dataset, self.eval_dataset = self._create_dataset(self.save_cfg_dir)
+00076 |         self.data_collator = self._create_collator()
+00077 | 
+00078 |     def _create_model(self):
+00079 |         """Setup model with proper vocabulary expansion."""
+00080 |         skip_weight_loading = getattr(self.config.training, "skip_weight_loading", False)
+00081 |         if self.config.training.start_from_checkpoint is not None and not skip_weight_loading:
+00082 |             model, loading_info = AutoModel.from_pretrained(
+00083 |                 self.config.training.start_from_checkpoint,
+00084 |                 tune_llm=self.config.model.tune_llm,
+00085 |                 tune_visual=self.config.model.tune_visual,
+00086 |                 tune_projector=self.config.model.tune_projector,
+00087 |                 tune_diffusion_model=self.config.model.tune_diffusion_model,
+00088 |                 tune_vlln=self.config.model.tune_vlln,
+00089 |                 state_dropout_prob=self.config.model.state_dropout_prob,
+00090 |                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
+00091 |                 load_bf16=self.config.model.load_bf16,
+00092 |                 **self._get_model_extra_kwargs(),
+00093 |                 transformers_loading_kwargs=self.transformers_loading_kwargs,
+00094 |                 output_loading_info=True,
+00095 |                 **self.transformers_loading_kwargs,
+00096 |             )
+00097 | 
+00098 |             missing_keys = loading_info.get("missing_keys", [])
+00099 |             mask_token_missing = any("mask_token" in key for key in missing_keys)
+00100 |             if mask_token_missing and model.action_head.mask_token is not None:
+00101 |                 with torch.no_grad():
+00102 |                     model.action_head.mask_token.data.copy_(
+00103 |                         0.02 * torch.randn_like(model.action_head.mask_token)
+00104 |                     )
+00105 |                 logging.info("mask_token not in checkpoint - initialized")
+00106 | 
+00107 |             unexpected_keys = loading_info.get("unexpected_keys", [])
+00108 |             mismatched_keys = loading_info.get("mismatched_keys", [])
+00109 |             other_missing = [k for k in missing_keys if "mask_token" not in k]
+00110 |             errors = []
+00111 |             if other_missing:
+00112 |                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
+00113 |             if unexpected_keys:
+00114 |                 errors.append(f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
+00115 |             if mismatched_keys:
+00116 |                 errors.append(f"Mismatched keys ({len(mismatched_keys)}): {mismatched_keys}")
+00117 |             if errors:
+00118 |                 raise RuntimeError(
+00119 |                     "Checkpoint weight mismatch for "
+00120 |                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
+00121 |                 )
+00122 | 
+00123 |         else:
+00124 |             model = self.model_class(
+00125 |                 self.config.model,
+00126 |                 transformers_loading_kwargs=self.transformers_loading_kwargs,
+00127 |             )
+00128 | 
+00129 |         logging.debug(f"Model Config: {model.config}")
+00130 |         with run_or_wait_on_rank0(label="final_model_config.json write") as is_rank0:
+00131 |             if is_rank0:
+00132 |                 with open(self.save_cfg_dir / "final_model_config.json", "w") as f:
+00133 |                     f.write(model.config.to_filtered_json())
+00134 |         # Print parameter statistics
+00135 |         total_params = sum(p.numel() for p in model.parameters())
+00136 |         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+00137 |         logging.info(f"Total parameters: {total_params:,}")
+00138 |         logging.info(
+00139 |             f"Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)"
+00140 |         )
+00141 |         logging.debug(f"Model architecture: {model}")
+00142 | 
+00143 |         return model
+00144 | 
+00145 |     def _get_model_extra_kwargs(self) -> dict:
+00146 |         """Model-variant config overrides applied during checkpoint loading."""
+00147 |         return {}
+00148 | 
+00149 |     def _get_statistics(
+00150 |         self,
+00151 |     ) -> dict[str, dict[str, dict[str, dict[str, list[float]]]]] | None:
+00152 |         return None
+00153 | 
+00154 |     def _get_embodiment_id_mapping(self) -> dict[str, int]:
+00155 |         return None
+00156 | 
+00157 |     def _get_processor_extra_kwargs(self) -> dict:
+00158 |         """Model-variant processor kwargs.
+00159 | 
+00160 |         Kept as an empty hook for N1.7 so derived model variants can extend the
+00161 |         processor contract without duplicating the complete dataset setup path.
+00162 |         """
+00163 |         return {}
+00164 | 
+00165 |     def _create_dataset(self, save_cfg_dir: Path):
+00166 |         """Create appropriate dataset based on task and mode."""
+00167 |         letter_box_transform = self.model_config.letter_box_transform
+00168 |         logging.info("N1.7 letter_box_transform=%s", letter_box_transform)
+00169 |         if self.config.training.start_from_checkpoint is not None:
+00170 |             processor = AutoProcessor.from_pretrained(
+00171 |                 self.config.training.start_from_checkpoint,
+00172 |                 # Overrides
+00173 |                 modality_configs=self.config.data.modality_configs,
+00174 |                 use_percentiles=self.model_config.use_percentiles,
+00175 |                 image_crop_size=self.model_config.image_crop_size,
+00176 |                 image_target_size=self.model_config.image_target_size,
+00177 |                 random_rotation_angle=self.model_config.random_rotation_angle,
+00178 |                 color_jitter_params=self.model_config.color_jitter_params,
+00179 |                 model_name=self.model_config.model_name,
+00180 |                 model_type=self.model_config.backbone_model_type,
+00181 |                 formalize_language=self.model_config.formalize_language,
+00182 |                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
+00183 |                 max_action_horizon=self.model_config.action_horizon,
+00184 |                 use_albumentations=self.model_config.use_albumentations_transforms,
+00185 |                 extra_augmentation_config=self.model_config.extra_augmentation_config,
+00186 |                 shortest_image_edge=self.model_config.shortest_image_edge,
+00187 |                 crop_fraction=self.model_config.crop_fraction,
+00188 |                 letter_box_transform=letter_box_transform,
+00189 |                 transformers_loading_kwargs=self.transformers_loading_kwargs,
+00190 |                 use_alternate_vl_dit=self.model_config.use_alternate_vl_dit,
+00191 |                 use_relative_action=self.model_config.use_relative_action,
+00192 |                 # State augmentation overrides
+00193 |                 exclude_state=self.model_config.exclude_state,
+00194 |                 state_dropout_prob=self.model_config.state_dropout_prob,
+00195 |                 use_mean_std=self.model_config.use_mean_std,
+00196 |                 **self._get_processor_extra_kwargs(),
+00197 |                 **self.transformers_loading_kwargs,
+00198 |             )
+00199 |         else:
+00200 |             processor = self.processor_class(
+00201 |                 modality_configs=self.config.data.modality_configs,
+00202 |                 use_percentiles=self.model_config.use_percentiles,
+00203 |                 statistics=self._get_statistics(),  # By default is None, so this will be computed and set later.
+00204 |                 embodiment_id_mapping=self._get_embodiment_id_mapping(),  # By default is None, so this will be set later.
+00205 |                 image_crop_size=self.model_config.image_crop_size,
+00206 |                 image_target_size=self.model_config.image_target_size,
+00207 |                 random_rotation_angle=self.model_config.random_rotation_angle,
+00208 |                 color_jitter_params=self.model_config.color_jitter_params,
+00209 |                 model_name=self.model_config.model_name,
+00210 |                 model_type=self.model_config.backbone_model_type,
+00211 |                 formalize_language=self.model_config.formalize_language,
+00212 |                 max_state_dim=self.model_config.max_state_dim,
+00213 |                 max_action_dim=self.model_config.max_action_dim,
+00214 |                 apply_sincos_state_encoding=self.model_config.apply_sincos_state_encoding,
+00215 |                 max_action_horizon=self.model_config.action_horizon,
+00216 |                 use_albumentations=self.model_config.use_albumentations_transforms,
+00217 |                 extra_augmentation_config=self.model_config.extra_augmentation_config,
+00218 |                 shortest_image_edge=self.model_config.shortest_image_edge,
+00219 |                 crop_fraction=self.model_config.crop_fraction,
+00220 |                 letter_box_transform=letter_box_transform,
+00221 |                 use_relative_action=self.model_config.use_relative_action,
+00222 |                 # State augmentation
+00223 |                 exclude_state=self.model_config.exclude_state,
+00224 |                 state_dropout_prob=self.model_config.state_dropout_prob,
+00225 |                 use_mean_std=self.model_config.use_mean_std,
+00226 |                 transformers_loading_kwargs=self.transformers_loading_kwargs,
+00227 |                 **self._get_processor_extra_kwargs(),
+00228 |             )
+00229 | 
+00230 |         logging.debug(
+00231 |             f"Processor configs for training: {json.dumps({k: str(v) for k, v in vars(processor).items()}, indent=2)}"
+00232 |         )
+00233 |         with run_or_wait_on_rank0(label="final_processor_config.json write") as is_rank0:
+00234 |             if is_rank0:
+00235 |                 with open(self.save_cfg_dir / "final_processor_config.json", "w") as f:
+00236 |                     json.dump({k: str(v) for k, v in vars(processor).items()}, f, indent=2)
+00237 | 
+00238 |         self.processor = processor
+00239 |         dataset_factory = DatasetFactory(config=self.config)
+00240 |         train_dataset, eval_dataset = dataset_factory.build(processor=self.processor)
+00241 | 
+00242 |         with run_or_wait_on_rank0(label="dataset_statistics.json write") as is_rank0:
+00243 |             if is_rank0:
+00244 |                 stats = train_dataset.get_dataset_statistics()
+00245 |                 stats_dict = convert_tensors_to_lists(stats)
+00246 |                 with open(save_cfg_dir / "dataset_statistics.json", "w") as f:
+00247 |                     json.dump(stats_dict, f, indent=2)
+00248 |                 logging.info("Saved dataset statistics for inference")
+00249 | 
+00250 |         return train_dataset, eval_dataset
+00251 | 
+00252 |     def _create_collator(self):
+00253 |         data_collator = self.processor.collator
+00254 |         return data_collator
+00255 | 
+00256 | 
+00257 | register_model(Gr00tN1d7Config, Gr00tN1d7Pipeline)

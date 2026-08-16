@@ -1,0 +1,230 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """TensorRT patch for the fused latent A2A action-head ONNX engine."""
+00004 | 
+00005 | from __future__ import annotations
+00006 | 
+00007 | import json
+00008 | import os
+00009 | from pathlib import Path
+00010 | import sys
+00011 | from types import MethodType
+00012 | 
+00013 | from gr00t.deployment.a2a_artifacts import (
+00014 |     canonical_json_sha256,
+00015 |     canonical_statistics_sha256,
+00016 |     checkpoint_sha256,
+00017 |     sha256_file,
+00018 | )
+00019 | from transformers.feature_extraction_utils import BatchFeature
+00020 | 
+00021 | 
+00022 | A2A_ENGINE_INPUT_NAMES = (
+00023 |     "backbone_features",
+00024 |     "backbone_attention_mask",
+00025 |     "image_mask",
+00026 |     "history_action_canonical",
+00027 |     "history_action_mask",
+00028 |     "continuous_action_mask",
+00029 |     "auxiliary_action_mask",
+00030 |     "binary_action_mask",
+00031 |     "categorical_action_mask",
+00032 |     "embodiment_id",
+00033 | )
+00034 | 
+00035 | A2A_ENGINE_INPUT_DTYPES = {
+00036 |     "backbone_features": "float32",
+00037 |     "backbone_attention_mask": "int64",
+00038 |     "image_mask": "bool",
+00039 |     "history_action_canonical": "float32",
+00040 |     "history_action_mask": "float32",
+00041 |     "continuous_action_mask": "float32",
+00042 |     "auxiliary_action_mask": "float32",
+00043 |     "binary_action_mask": "float32",
+00044 |     "categorical_action_mask": "float32",
+00045 |     "embodiment_id": "int64",
+00046 | }
+00047 | 
+00048 | 
+00049 | def _expected_export_contract(config):
+00050 |     return {
+00051 |         "model_type": "Gr00tN1d7A2A",
+00052 |         "source": "executed_proprio_history",
+00053 |         "latent_dim": int(config.a2a_latent_dim),
+00054 |         "flow_backbone": str(config.a2a_flow_backbone),
+00055 |         "dit_token_dim": int(config.a2a_dit_token_dim),
+00056 |         "dit_num_layers": int(config.a2a_dit_num_layers),
+00057 |         "dit_num_heads": int(config.a2a_dit_num_heads),
+00058 |         "dit_mlp_ratio": int(config.a2a_dit_mlp_ratio),
+00059 |         "dit_dropout": float(config.a2a_dit_dropout),
+00060 |         "history_horizon": int(config.a2a_history_horizon),
+00061 |         "future_horizon": int(config.a2a_future_horizon),
+00062 |         "action_dim": int(config.max_action_dim),
+00063 |         "num_inference_steps": int(config.a2a_num_inference_steps),
+00064 |         "random_initialization": False,
+00065 |         "inputs": list(A2A_ENGINE_INPUT_NAMES),
+00066 |         "input_dtypes": A2A_ENGINE_INPUT_DTYPES,
+00067 |     }
+00068 | 
+00069 | 
+00070 | def _run_a2a_engine(engine, tensors):
+00071 |     prepared = {}
+00072 |     for name in A2A_ENGINE_INPUT_NAMES:
+00073 |         value = tensors[name]
+00074 |         expected_dtype = engine.dtype_of(name)
+00075 |         value = value.to(dtype=expected_dtype).contiguous()
+00076 |         engine.set_runtime_tensor_shape(name, tuple(value.shape))
+00077 |         prepared[name] = value
+00078 |     return engine(**prepared)
+00079 | 
+00080 | 
+00081 | def _a2a_trt_get_action(self, backbone_output, action_input, options=None):
+00082 |     if options and int(options.get("num_inference_steps", self.num_inference_timesteps)) != int(
+00083 |         self.num_inference_timesteps
+00084 |     ):
+00085 |         raise ValueError(
+00086 |             "The fused A2A TensorRT graph has a fixed number of Euler steps; re-export "
+00087 |             "the checkpoint to change it"
+00088 |         )
+00089 |     result = _run_a2a_engine(
+00090 |         self.a2a_action_head_engine,
+00091 |         {
+00092 |             "backbone_features": backbone_output["backbone_features"],
+00093 |             "backbone_attention_mask": backbone_output["backbone_attention_mask"],
+00094 |             "image_mask": backbone_output["image_mask"],
+00095 |             "history_action_canonical": action_input["history_action_canonical"],
+00096 |             "history_action_mask": action_input["history_action_mask"],
+00097 |             "continuous_action_mask": action_input["continuous_action_mask"],
+00098 |             "auxiliary_action_mask": action_input["auxiliary_action_mask"],
+00099 |             "binary_action_mask": action_input["binary_action_mask"],
+00100 |             "categorical_action_mask": action_input["categorical_action_mask"],
+00101 |             "embodiment_id": action_input["embodiment_id"],
+00102 |         },
+00103 |     )
+00104 |     output = result.get("action_pred", result.get("output"))
+00105 |     if output is None:
+00106 |         raise KeyError(f"A2A TensorRT engine returned unexpected outputs: {sorted(result)}")
+00107 |     return BatchFeature(
+00108 |         data={
+00109 |             "action_pred": output,
+00110 |             "num_inference_steps": self.num_inference_timesteps,
+00111 |         }
+00112 |     )
+00113 | 
+00114 | 
+00115 | def _validate_a2a_engine_metadata(policy, engine_directory: Path, engine_path: Path) -> dict:
+00116 |     metadata_path = engine_directory / "a2a_export_metadata.json"
+00117 |     if not metadata_path.is_file():
+00118 |         raise FileNotFoundError(
+00119 |             f"Missing {metadata_path}; build the engine with a2a_action_head mode"
+00120 |         )
+00121 |     with metadata_path.open("r", encoding="utf-8") as handle:
+00122 |         metadata = json.load(handle)
+00123 | 
+00124 |     config = policy.model.config
+00125 |     expected = {
+00126 |         "model_type": "Gr00tN1d7A2A",
+00127 |         "engine": engine_path.name,
+00128 |         "flow_backbone": str(config.a2a_flow_backbone),
+00129 |         "history_horizon": int(config.a2a_history_horizon),
+00130 |         "future_horizon": int(config.a2a_future_horizon),
+00131 |         "action_dim": int(config.max_action_dim),
+00132 |         "num_inference_steps": int(config.a2a_num_inference_steps),
+00133 |     }
+00134 |     mismatches = {
+00135 |         key: {"expected": value, "actual": metadata.get(key)}
+00136 |         for key, value in expected.items()
+00137 |         if metadata.get(key) != value
+00138 |     }
+00139 |     if mismatches:
+00140 |         raise ValueError(f"A2A TensorRT metadata/config mismatch: {mismatches}")
+00141 | 
+00142 |     metadata_inputs = tuple(metadata.get("inputs", ()))
+00143 |     if metadata_inputs != A2A_ENGINE_INPUT_NAMES:
+00144 |         raise ValueError(
+00145 |             "A2A TensorRT metadata input contract mismatch: "
+00146 |             f"expected={A2A_ENGINE_INPUT_NAMES}, actual={metadata_inputs}"
+00147 |         )
+00148 |     expected_sha = metadata.get("engine_sha256")
+00149 |     if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+00150 |         raise ValueError("A2A TensorRT metadata is missing a valid engine_sha256")
+00151 |     actual_sha = sha256_file(engine_path)
+00152 |     if actual_sha != expected_sha:
+00153 |         raise ValueError(
+00154 |             f"A2A TensorRT engine SHA256 mismatch: expected={expected_sha}, actual={actual_sha}"
+00155 |         )
+00156 | 
+00157 |     expected_data_contract = getattr(config, "a2a_expected_contract_sha256", None)
+00158 |     if metadata.get("data_contract_sha256") != expected_data_contract:
+00159 |         raise ValueError("A2A TensorRT data-contract SHA-256 does not match the loaded checkpoint")
+00160 |     if not hasattr(policy, "processor"):
+00161 |         raise ValueError("A2A TensorRT validation requires the checkpoint processor")
+00162 |     expected_statistics_sha256 = canonical_statistics_sha256(policy.processor)
+00163 |     if metadata.get("canonical_statistics_sha256") != expected_statistics_sha256:
+00164 |         raise ValueError(
+00165 |             "A2A TensorRT canonical-statistics SHA-256 does not match the loaded processor"
+00166 |         )
+00167 |     model_path = getattr(policy, "model_path", None)
+00168 |     if model_path is None:
+00169 |         raise ValueError("A2A TensorRT validation requires policy.model_path")
+00170 |     expected_checkpoint_sha256 = checkpoint_sha256(model_path)
+00171 |     if metadata.get("checkpoint_sha256") != expected_checkpoint_sha256:
+00172 |         raise ValueError("A2A TensorRT checkpoint SHA-256 does not match the loaded model weights")
+00173 |     onnx_sha256 = metadata.get("onnx_sha256")
+00174 |     if not isinstance(onnx_sha256, str) or len(onnx_sha256) != 64:
+00175 |         raise ValueError("A2A TensorRT metadata is missing a valid onnx_sha256")
+00176 |     if metadata.get("verification") != "onnx_checker+torch_ort_rtol1e-4_atol1e-4":
+00177 |         raise ValueError("A2A TensorRT metadata does not record a successful ONNX oracle")
+00178 |     return metadata
+00179 | 
+00180 | 
+00181 | def setup_a2a_tensorrt_engine(policy, engine_directory: str | Path):
+00182 |     """Replace only the A2A action-head forward; the backbone may remain eager or TRT."""
+00183 |     if getattr(policy.model.config, "model_type", None) != "Gr00tN1d7A2A":
+00184 |         raise ValueError("A2A TensorRT setup requires a Gr00tN1d7A2A policy")
+00185 |     engine_directory = Path(engine_directory)
+00186 |     engine_path = engine_directory / "a2a_action_head.engine"
+00187 |     if not engine_path.is_file():
+00188 |         raise FileNotFoundError(f"Missing {engine_path}; build it from a2a_action_head.onnx first")
+00189 |     _validate_a2a_engine_metadata(policy, engine_directory, engine_path)
+00190 |     metadata_path = Path(engine_directory) / "a2a_export_metadata.json"
+00191 |     if not metadata_path.is_file():
+00192 |         raise FileNotFoundError(
+00193 |             f"Missing {metadata_path}; A2A TensorRT setup requires export/build metadata"
+00194 |         )
+00195 |     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+00196 |     expected_contract = _expected_export_contract(policy.model.config)
+00197 |     actual_contract = {key: metadata.get(key) for key in expected_contract}
+00198 |     if actual_contract != expected_contract:
+00199 |         raise ValueError("A2A TensorRT metadata does not match the loaded checkpoint configuration")
+00200 |     expected_contract_hash = canonical_json_sha256(expected_contract)
+00201 |     if metadata.get("contract_sha256") != expected_contract_hash:
+00202 |         raise ValueError("A2A TensorRT metadata contract hash is invalid")
+00203 |     if metadata.get("engine_sha256") is not None and metadata["engine_sha256"] != sha256_file(
+00204 |         engine_path
+00205 |     ):
+00206 |         raise ValueError("A2A TensorRT engine SHA-256 does not match export metadata")
+00207 |     # scripts/deployment is intentionally not a Python package. Resolve the
+00208 |     # sibling loader lazily so importing this helper does not require TensorRT.
+00209 |     deploy_directory = os.path.dirname(os.path.abspath(__file__))
+00210 |     if deploy_directory not in sys.path:
+00211 |         sys.path.insert(0, deploy_directory)
+00212 |     from trt_torch import Engine
+00213 | 
+00214 |     head = policy.model.action_head
+00215 |     head.a2a_action_head_engine = Engine(str(engine_path))
+00216 |     actual_inputs = tuple(item[0] for item in head.a2a_action_head_engine.in_meta)
+00217 |     if set(actual_inputs) != set(A2A_ENGINE_INPUT_NAMES):
+00218 |         raise ValueError(
+00219 |             "A2A TensorRT engine input contract mismatch: "
+00220 |             f"expected={A2A_ENGINE_INPUT_NAMES}, actual={actual_inputs}"
+00221 |         )
+00222 |     head.get_action = MethodType(_a2a_trt_get_action, head)
+00223 |     return policy
+00224 | 
+00225 | 
+00226 | __all__ = [
+00227 |     "A2A_ENGINE_INPUT_NAMES",
+00228 |     "A2A_ENGINE_INPUT_DTYPES",
+00229 |     "setup_a2a_tensorrt_engine",
+00230 | ]

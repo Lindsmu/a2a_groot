@@ -1,0 +1,331 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Canonical-space tests for the latent A2A processor.
+00004 | 
+00005 | The fixture copies a convenient seven-key layout into ``new_embodiment``. Its
+00006 | numeric values are synthetic, *already-canonical* scalar trajectories. These
+00007 | tests deliberately do not claim that raw LIBERO absolute EEF observations and
+00008 | OSC delta commands share a physical space.
+00009 | """
+00010 | 
+00011 | from copy import deepcopy
+00012 | import json
+00013 | from pathlib import Path
+00014 | from unittest.mock import MagicMock, patch
+00015 | 
+00016 | from gr00t.data.a2a_contract import canonical_contract_sha256, canonical_statistics_sha256
+00017 | from gr00t.data.embodiment_tags import EmbodimentTag
+00018 | from gr00t.data.types import MessageType, VLAStepData
+00019 | import numpy as np
+00020 | import pytest
+00021 | 
+00022 | 
+00023 | FIXTURE_DIR = Path(__file__).parent.parent.parent / "fixtures" / "processor_config"
+00024 | EMBODIMENT = EmbodimentTag.NEW_EMBODIMENT.value
+00025 | 
+00026 | 
+00027 | def _channel_specs():
+00028 |     specs = []
+00029 |     for key, unit in zip(
+00030 |         ("x", "y", "z", "roll", "pitch", "yaw"),
+00031 |         ("meter", "meter", "meter", "radian", "radian", "radian"),
+00032 |         strict=True,
+00033 |     ):
+00034 |         specs.append(
+00035 |             {
+00036 |                 "action_key": key,
+00037 |                 "source_state_key": key,
+00038 |                 "kind": "continuous",
+00039 |                 "canonical_format": "scalar",
+00040 |                 "source_format": "scalar",
+00041 |                 "target_format": "scalar",
+00042 |                 "source_unit": unit,
+00043 |                 "target_unit": unit,
+00044 |                 "source_frame": "robot_base",
+00045 |                 "target_frame": "robot_base",
+00046 |             }
+00047 |         )
+00048 |     specs.append(
+00049 |         {
+00050 |             "action_key": "gripper",
+00051 |             "source_state_key": "gripper",
+00052 |             "kind": "regression",
+00053 |             "canonical_format": "scalar",
+00054 |         }
+00055 |     )
+00056 |     return {EMBODIMENT: specs}
+00057 | 
+00058 | 
+00059 | def _canonical_statistics(statistics):
+00060 |     feature_dim = 128
+00061 |     lower = np.zeros(feature_dim, dtype=np.float32)
+00062 |     upper = np.zeros(feature_dim, dtype=np.float32)
+00063 |     active = np.zeros(feature_dim, dtype=bool)
+00064 |     for cursor, key in enumerate(("x", "y", "z", "roll", "pitch", "yaw")):
+00065 |         state = statistics[EMBODIMENT]["state"][key]
+00066 |         action = statistics[EMBODIMENT]["action"][key]
+00067 |         lower[cursor] = min(state["min"][0], action["min"][0])
+00068 |         upper[cursor] = max(state["max"][0], action["max"][0])
+00069 |         active[cursor] = True
+00070 |     result = {
+00071 |         "version": 1,
+00072 |         "normalization": "shared_history_future_continuous_intersection",
+00073 |         "input_space": "unnormalized_canonical_physical",
+00074 |         "feature_dim": feature_dim,
+00075 |         "history_horizon": 8,
+00076 |         "future_horizon": 8,
+00077 |         "num_windows": 1,
+00078 |         "nonfinite_active_count": 0,
+00079 |         "mean": np.zeros(feature_dim, dtype=np.float32).tolist(),
+00080 |         "std": np.ones(feature_dim, dtype=np.float32).tolist(),
+00081 |         "min": lower.tolist(),
+00082 |         "max": upper.tolist(),
+00083 |         "q01": lower.tolist(),
+00084 |         "q99": upper.tolist(),
+00085 |         "q_low": lower.tolist(),
+00086 |         "q_high": upper.tolist(),
+00087 |         "active_channel_mask": active.tolist(),
+00088 |         "valid_count": np.where(active, 16, 0).tolist(),
+00089 |         "history_valid_count": np.where(active, 8, 0).tolist(),
+00090 |         "future_valid_count": np.where(active, 8, 0).tolist(),
+00091 |         "constant_mask": np.zeros(feature_dim, dtype=bool).tolist(),
+00092 |     }
+00093 |     channels = []
+00094 |     cursor = 0
+00095 |     for spec in _channel_specs()[EMBODIMENT]:
+00096 |         dim = len(statistics[EMBODIMENT]["action"][spec["action_key"]]["mean"])
+00097 |         channels.append(
+00098 |             {
+00099 |                 "action_key": spec["action_key"],
+00100 |                 "source_state_key": spec.get("source_state_key"),
+00101 |                 "kind": spec["kind"],
+00102 |                 "start": cursor,
+00103 |                 "end": cursor + dim,
+00104 |                 "canonical_format": spec.get("canonical_format", "auto"),
+00105 |                 "source_format": spec.get("source_format"),
+00106 |                 "target_format": spec.get("target_format"),
+00107 |                 "source_unit": spec.get("source_unit"),
+00108 |                 "target_unit": spec.get("target_unit"),
+00109 |                 "source_frame": spec.get("source_frame"),
+00110 |                 "target_frame": spec.get("target_frame"),
+00111 |             }
+00112 |         )
+00113 |         cursor += dim
+00114 |     result["channel_contract"] = {
+00115 |         "version": 1,
+00116 |         "embodiment": EMBODIMENT,
+00117 |         "feature_dim": feature_dim,
+00118 |         "history_horizon": 8,
+00119 |         "future_horizon": 8,
+00120 |         "channels": channels,
+00121 |         "provenance": {
+00122 |             "dataset": "synthetic_processor_fixture",
+00123 |             "dataset_revision": "1",
+00124 |             "dataset_fingerprint_sha256": "0" * 64,
+00125 |             "source_schema_sha256": "1" * 64,
+00126 |             "canonicalizer": "identity_test_only",
+00127 |             "canonicalizer_version": "1",
+00128 |             "canonicalizer_sha256": "2" * 64,
+00129 |             "exporter_version": "1",
+00130 |             "target_definition": "absolute_physical_target",
+00131 |             "time_alignment": "history_t_minus_7_to_t__future_t_to_t_plus_7",
+00132 |         },
+00133 |         "controller": {
+00134 |             "type": "preprocessed_absolute",
+00135 |             "version": "1",
+00136 |             "frame": "robot_base",
+00137 |             "control_delta": False,
+00138 |             "rotation_composition": "none_scalar_fixture",
+00139 |             "scale": [1.0],
+00140 |         },
+00141 |     }
+00142 |     result["channel_contract"]["sha256"] = canonical_contract_sha256(
+00143 |         result["channel_contract"]
+00144 |     )
+00145 |     result["statistics_sha256"] = canonical_statistics_sha256(result)
+00146 |     return result
+00147 | 
+00148 | 
+00149 | @pytest.fixture
+00150 | def processor_and_stats():
+00151 |     from gr00t.model.gr00t_n1d7_a2a.processing_gr00t_n1d7_a2a import Gr00tN1d7A2AProcessor
+00152 | 
+00153 |     with (FIXTURE_DIR / "processor_config.json").open(encoding="utf-8") as handle:
+00154 |         kwargs = json.load(handle)["processor_kwargs"]
+00155 |     with (FIXTURE_DIR / "statistics.json").open(encoding="utf-8") as handle:
+00156 |         fixture_statistics = json.load(handle)
+00157 |     statistics = {EMBODIMENT: deepcopy(fixture_statistics["libero_sim"])}
+00158 |     modality_configs = {
+00159 |         EMBODIMENT: deepcopy(kwargs["modality_configs"]["libero_sim"])
+00160 |     }
+00161 |     modality_configs[EMBODIMENT]["state"]["delta_indices"] = list(range(-7, 1))
+00162 |     modality_configs[EMBODIMENT]["action"]["delta_indices"] = list(range(8))
+00163 |     mock_vlm = MagicMock()
+00164 |     mock_vlm.tokenizer.padding_side = "left"
+00165 |     mock_vlm.apply_chat_template.return_value = "mock"
+00166 |     with patch(
+00167 |         "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+00168 |         return_value=mock_vlm,
+00169 |     ):
+00170 |         canonical_statistics = _canonical_statistics(statistics)
+00171 |         processor = Gr00tN1d7A2AProcessor(
+00172 |             modality_configs=modality_configs,
+00173 |             statistics=statistics,
+00174 |             max_state_dim=kwargs["max_state_dim"],
+00175 |             max_action_dim=kwargs["max_action_dim"],
+00176 |             max_action_horizon=8,
+00177 |             use_percentiles=kwargs["use_percentiles"],
+00178 |             use_relative_action=kwargs["use_relative_action"],
+00179 |             apply_sincos_state_encoding=kwargs["apply_sincos_state_encoding"],
+00180 |             image_crop_size=[224, 224],
+00181 |             image_target_size=[224, 224],
+00182 |             use_albumentations=False,
+00183 |             a2a_canonical_statistics=canonical_statistics,
+00184 |             a2a_require_canonical_statistics=True,
+00185 |             a2a_channel_specs=_channel_specs(),
+00186 |             a2a_require_explicit_channel_specs=True,
+00187 |             a2a_require_semantic_metadata=True,
+00188 |             a2a_expected_contract_sha256=canonical_statistics["channel_contract"]["sha256"],
+00189 |         )
+00190 |     processor.eval()
+00191 |     return processor, statistics
+00192 | 
+00193 | 
+00194 | def _midpoint(stat):
+00195 |     return (np.asarray(stat["min"], dtype=np.float32) + np.asarray(stat["max"], dtype=np.float32)) / 2
+00196 | 
+00197 | 
+00198 | def _step(processor, statistics):
+00199 |     modality = processor.modality_configs[EMBODIMENT]
+00200 |     states = {
+00201 |         key: np.repeat(
+00202 |             _midpoint(statistics[EMBODIMENT]["state"][key])[None], 8, axis=0
+00203 |         )
+00204 |         for key in modality["state"].modality_keys
+00205 |     }
+00206 |     actions = {
+00207 |         key: np.repeat(
+00208 |             _midpoint(statistics[EMBODIMENT]["action"][key])[None], 8, axis=0
+00209 |         )
+00210 |         for key in modality["action"].modality_keys
+00211 |     }
+00212 |     images = {
+00213 |         key: [np.zeros((16, 16, 3), dtype=np.uint8)]
+00214 |         for key in modality["video"].modality_keys
+00215 |     }
+00216 |     return VLAStepData(
+00217 |         images=images,
+00218 |         states=states,
+00219 |         actions=actions,
+00220 |         text="do the task",
+00221 |         embodiment=EmbodimentTag(EMBODIMENT),
+00222 |     )
+00223 | 
+00224 | 
+00225 | def test_builds_shared_canonical_history_and_future(processor_and_stats):
+00226 |     processor, statistics = processor_and_stats
+00227 |     step = _step(processor, statistics)
+00228 |     result = processor._build_a2a_inputs(step)
+00229 |     assert result["history_action_canonical"].shape == (8, 128)
+00230 |     assert result["future_action_canonical"].shape == (8, 128)
+00231 |     # Six synthetic already-canonical scalar groups map one-to-one. The
+00232 |     # dimension-mismatched auxiliary fixture is excluded from the latent.
+00233 |     assert result["continuous_action_mask"].sum().item() == 8 * 6
+00234 |     assert result["auxiliary_action_mask"].sum().item() == 8
+00235 |     assert result["history_action_mask"].sum().item() == 8 * 6
+00236 | 
+00237 | 
+00238 | def test_continuous_absolute_pose_to_delta_command_semantics_are_rejected(
+00239 |     processor_and_stats,
+00240 | ):
+00241 |     processor, statistics = processor_and_stats
+00242 |     mismatched = _channel_specs()
+00243 |     mismatched[EMBODIMENT][0].update(
+00244 |         {
+00245 |             "source_format": "absolute_eef_position",
+00246 |             "target_format": "normalized_osc_delta_command",
+00247 |             "source_unit": "meter",
+00248 |             "target_unit": "dimensionless",
+00249 |         }
+00250 |     )
+00251 |     processor._configured_channel_specs = mismatched
+00252 | 
+00253 |     with pytest.raises(ValueError, match="mismatched (format|unit)"):
+00254 |         processor._resolve_specs(EMBODIMENT, statistics)
+00255 | 
+00256 | 
+00257 | def test_strict_processor_rejects_known_raw_libero_keys_even_if_metadata_lies(
+00258 |     processor_and_stats,
+00259 | ):
+00260 |     processor, statistics = processor_and_stats
+00261 |     raw_embodiment = EmbodimentTag.LIBERO_PANDA.value
+00262 |     processor.modality_configs[raw_embodiment] = deepcopy(
+00263 |         processor.modality_configs[EMBODIMENT]
+00264 |     )
+00265 |     processor._configured_channel_specs[raw_embodiment] = _channel_specs()[EMBODIMENT]
+00266 |     raw_statistics = dict(statistics)
+00267 |     raw_statistics[raw_embodiment] = deepcopy(statistics[EMBODIMENT])
+00268 | 
+00269 |     with pytest.raises(ValueError, match="Raw LIBERO state columns"):
+00270 |         processor._resolve_specs(raw_embodiment, raw_statistics)
+00271 | 
+00272 | 
+00273 | def test_same_physical_value_has_same_shared_normalization(processor_and_stats):
+00274 |     processor, _ = processor_and_stats
+00275 |     params = processor.a2a_norm_params[EMBODIMENT]["x"]
+00276 |     value = ((params["min"] + params["max"]) / 2)[None]
+00277 |     history_value = processor._normalize(value, EMBODIMENT, "x")
+00278 |     future_value = processor._normalize(value, EMBODIMENT, "x")
+00279 |     np.testing.assert_allclose(history_value, future_value)
+00280 | 
+00281 | 
+00282 | def test_policy_cold_start_valid_mask_reaches_encoder_contract(processor_and_stats):
+00283 |     processor, statistics = processor_and_stats
+00284 |     step = _step(processor, statistics)
+00285 |     step.metadata["a2a_history_valid_mask"] = np.array(
+00286 |         [0, 0, 0, 0, 0, 0, 0, 1], dtype=np.float32
+00287 |     )
+00288 |     result = processor._build_a2a_inputs(step)
+00289 |     assert result["history_action_mask"][:-1].sum().item() == 0
+00290 |     assert result["history_action_mask"][-1].sum().item() == 6
+00291 | 
+00292 | 
+00293 | def test_full_call_keeps_current_state_and_emits_a2a_contract(processor_and_stats):
+00294 |     processor, statistics = processor_and_stats
+00295 |     step = _step(processor, statistics)
+00296 |     with patch.object(processor, "_get_vlm_inputs", return_value={"vlm_content": {}}):
+00297 |         result = processor(
+00298 |             [{"type": MessageType.EPISODE_STEP.value, "content": step}]
+00299 |         )
+00300 |     assert result["state"].shape[0] == 1
+00301 |     assert "action" not in result
+00302 |     assert "history_action_canonical" in result
+00303 |     assert "future_action_canonical" in result
+00304 | 
+00305 | 
+00306 | def test_canonical_decode_round_trip(processor_and_stats):
+00307 |     processor, statistics = processor_and_stats
+00308 |     step = _step(processor, statistics)
+00309 |     encoded = processor._build_a2a_inputs(step)["future_action_canonical"].numpy()
+00310 |     decoded = processor.decode_action(encoded, EmbodimentTag(EMBODIMENT))
+00311 |     for key, expected in step.actions.items():
+00312 |         np.testing.assert_allclose(decoded[key][0], expected[0], atol=1e-5)
+00313 | 
+00314 | 
+00315 | def test_processor_save_load_embeds_canonical_statistics(processor_and_stats, tmp_path):
+00316 |     processor, _ = processor_and_stats
+00317 |     processor.save_pretrained(tmp_path)
+00318 |     saved = json.loads((tmp_path / "processor_config.json").read_text(encoding="utf-8"))
+00319 |     assert saved["processor_kwargs"]["a2a_canonical_statistics"]["feature_dim"] == 128
+00320 | 
+00321 |     mock_vlm = MagicMock()
+00322 |     mock_vlm.tokenizer.padding_side = "left"
+00323 |     with patch(
+00324 |         "gr00t.model.gr00t_n1d7.processing_gr00t_n1d7.build_processor",
+00325 |         return_value=mock_vlm,
+00326 |     ):
+00327 |         loaded = type(processor).from_pretrained(tmp_path)
+00328 |     np.testing.assert_allclose(
+00329 |         loaded.a2a_norm_params[EMBODIMENT]["x"]["min"],
+00330 |         processor.a2a_norm_params[EMBODIMENT]["x"]["min"],
+00331 |     )

@@ -1,0 +1,197 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | # Launch finetuning for N1.7 on "single node".
+00017 | # This script tries to provide a similar user experience as current OSS.
+00018 | 
+00019 | import json
+00020 | import os
+00021 | from pathlib import Path
+00022 | 
+00023 | import tyro
+00024 | 
+00025 | from gr00t.configs.base_config import get_default_config
+00026 | from gr00t.configs.finetune_config import FinetuneConfig
+00027 | from gr00t.experiment.experiment import run
+00028 | 
+00029 | 
+00030 | # Make sure the user provided modality config is registered.
+00031 | def load_modality_config(modality_config_path: str):
+00032 |     import importlib
+00033 |     import sys
+00034 | 
+00035 |     path = Path(modality_config_path)
+00036 |     if path.exists() and path.suffix == ".py":
+00037 |         sys.path.append(str(path.parent))
+00038 |         importlib.import_module(path.stem)
+00039 |         print(f"Loaded modality config: {path}")
+00040 |     else:
+00041 |         raise FileNotFoundError(f"Modality config path does not exist: {modality_config_path}")
+00042 | 
+00043 | 
+00044 | if __name__ == "__main__":
+00045 |     # Set LOGURU_LEVEL environment variable if not already set (default: INFO)
+00046 |     if "LOGURU_LEVEL" not in os.environ:
+00047 |         os.environ["LOGURU_LEVEL"] = "INFO"
+00048 |     # Use tyro for clean CLI
+00049 |     ft_config = tyro.cli(FinetuneConfig, description=__doc__)
+00050 |     from gr00t.data.embodiment_tags import EmbodimentTag
+00051 | 
+00052 |     ft_config.embodiment_tag = EmbodimentTag.resolve(ft_config.embodiment_tag)
+00053 |     embodiment_tag = ft_config.embodiment_tag.value
+00054 | 
+00055 |     # all rank workers should register for the modality config
+00056 |     if ft_config.modality_config_path is not None:
+00057 |         load_modality_config(ft_config.modality_config_path)
+00058 | 
+00059 |     dataset_paths = [path for path in ft_config.dataset_path.split(os.pathsep) if path]
+00060 | 
+00061 |     model_overrides = {"model_type": ft_config.model_type}
+00062 |     a2a_options = {
+00063 |         "a2a_canonical_statistics_path": ft_config.a2a_canonical_statistics_path,
+00064 |         "a2a_expected_contract_sha256": ft_config.a2a_expected_contract_sha256,
+00065 |         "a2a_training_stage": ft_config.a2a_training_stage,
+00066 |         "a2a_cold_start": ft_config.a2a_cold_start,
+00067 |         "a2a_num_inference_steps": ft_config.a2a_num_inference_steps,
+00068 |         "a2a_history_noise_train_std": ft_config.a2a_history_noise_train_std,
+00069 |         "a2a_max_time_gap_s": ft_config.a2a_max_time_gap_s,
+00070 |         "a2a_flow_backbone": ft_config.a2a_flow_backbone,
+00071 |         "a2a_dit_token_dim": ft_config.a2a_dit_token_dim,
+00072 |         "a2a_dit_num_layers": ft_config.a2a_dit_num_layers,
+00073 |         "a2a_dit_num_heads": ft_config.a2a_dit_num_heads,
+00074 |         "a2a_dit_mlp_ratio": ft_config.a2a_dit_mlp_ratio,
+00075 |         "a2a_dit_dropout": ft_config.a2a_dit_dropout,
+00076 |         "a2a_strict_paper_architecture": ft_config.a2a_strict_paper_architecture,
+00077 |     }
+00078 |     is_a2a = ft_config.model_type == "Gr00tN1d7A2A"
+00079 |     if is_a2a:
+00080 |         if ft_config.a2a_channel_specs_path is None:
+00081 |             raise ValueError(
+00082 |                 "Gr00tN1d7A2A requires --a2a-channel-specs-path; equal state/action "
+00083 |                 "dimensions are not a physical-semantics contract"
+00084 |             )
+00085 |         specs_path = Path(ft_config.a2a_channel_specs_path)
+00086 |         with specs_path.open("r", encoding="utf-8") as handle:
+00087 |             channel_specs = json.load(handle)
+00088 |         if not isinstance(channel_specs, dict) or embodiment_tag not in channel_specs:
+00089 |             raise ValueError(
+00090 |                 "A2A channel specs must be a JSON object containing the selected "
+00091 |                 f"embodiment {embodiment_tag!r}"
+00092 |             )
+00093 |         if ft_config.a2a_canonical_statistics_path is None:
+00094 |             raise ValueError(
+00095 |                 "Gr00tN1d7A2A requires --a2a-canonical-statistics-path built from "
+00096 |                 "unnormalized canonical history/future trajectories"
+00097 |             )
+00098 |         if ft_config.a2a_expected_contract_sha256 is None:
+00099 |             raise ValueError(
+00100 |                 "Gr00tN1d7A2A requires --a2a-expected-contract-sha256 to bind the "
+00101 |                 "training configuration to its data/controller contract"
+00102 |             )
+00103 |         model_overrides["a2a_channel_specs"] = channel_specs
+00104 |         model_overrides.update(a2a_options)
+00105 |     elif (
+00106 |         ft_config.a2a_channel_specs_path is not None
+00107 |         or ft_config.a2a_canonical_statistics_path is not None
+00108 |         or ft_config.a2a_expected_contract_sha256 is not None
+00109 |         or ft_config.a2a_training_stage != "joint"
+00110 |         or ft_config.a2a_cold_start != "repeat_first_state"
+00111 |         or ft_config.a2a_num_inference_steps != 1
+00112 |         or ft_config.a2a_history_noise_train_std != 0.02
+00113 |         or ft_config.a2a_max_time_gap_s is not None
+00114 |         or ft_config.a2a_flow_backbone != "mlp"
+00115 |         or ft_config.a2a_dit_token_dim != 256
+00116 |         or ft_config.a2a_dit_num_layers != 8
+00117 |         or ft_config.a2a_dit_num_heads != 8
+00118 |         or ft_config.a2a_dit_mlp_ratio != 4
+00119 |         or ft_config.a2a_dit_dropout != 0.0
+00120 |         or not ft_config.a2a_strict_paper_architecture
+00121 |     ):
+00122 |         raise ValueError("A2A-specific options require --model-type Gr00tN1d7A2A")
+00123 | 
+00124 |     config = get_default_config().load_dict(
+00125 |         {
+00126 |             "model": model_overrides,
+00127 |             "data": {
+00128 |                 "download_cache": False,
+00129 |                 "datasets": [
+00130 |                     {
+00131 |                         "dataset_paths": dataset_paths,
+00132 |                         "mix_ratio": 1.0,
+00133 |                         "embodiment_tag": embodiment_tag,
+00134 |                     }
+00135 |                 ],
+00136 |             },
+00137 |         }
+00138 |     )
+00139 |     config.load_config_path = None
+00140 | 
+00141 |     # overwrite with finetune config supplied by the user
+00142 |     config.model.tune_llm = ft_config.tune_llm
+00143 |     config.model.tune_visual = ft_config.tune_visual
+00144 |     config.model.tune_projector = ft_config.tune_projector
+00145 |     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
+00146 |     config.model.state_dropout_prob = ft_config.state_dropout_prob
+00147 |     config.model.random_rotation_angle = ft_config.random_rotation_angle
+00148 |     config.model.color_jitter_params = ft_config.color_jitter_params
+00149 |     config.model.use_percentiles = ft_config.use_percentiles
+00150 |     if (ft_config.shortest_image_edge is None) != (ft_config.crop_fraction is None):
+00151 |         raise ValueError("shortest_image_edge and crop_fraction must be set together")
+00152 |     if ft_config.shortest_image_edge is not None:
+00153 |         config.model.shortest_image_edge = ft_config.shortest_image_edge
+00154 |         config.model.crop_fraction = ft_config.crop_fraction
+00155 |         config.model.image_crop_size = None
+00156 |         config.model.image_target_size = None
+00157 |     if ft_config.extra_augmentation_config:
+00158 |         config.model.extra_augmentation_config = json.loads(ft_config.extra_augmentation_config)
+00159 |     else:
+00160 |         config.model.extra_augmentation_config = None
+00161 | 
+00162 |     config.model.load_bf16 = False
+00163 |     config.model.reproject_vision = False
+00164 |     config.model.model_name = "nvidia/Cosmos-Reason2-2B"
+00165 |     config.model.backbone_trainable_params_fp32 = True
+00166 |     # The latent A2A processor builds its absolute canonical trajectories from
+00167 |     # raw states/actions before the legacy relative-action transform. Keep the
+00168 |     # old launcher's behaviour only for the original N1.7 model.
+00169 |     config.model.use_relative_action = not is_a2a
+00170 | 
+00171 |     config.training.experiment_name = ft_config.experiment_name
+00172 |     config.training.start_from_checkpoint = ft_config.base_model_path
+00173 |     config.training.optim = "adamw_torch"
+00174 |     config.training.global_batch_size = ft_config.global_batch_size
+00175 |     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
+00176 |     config.training.learning_rate = ft_config.learning_rate
+00177 |     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
+00178 |     config.training.output_dir = ft_config.output_dir
+00179 |     config.training.save_steps = ft_config.save_steps
+00180 |     config.training.save_total_limit = ft_config.save_total_limit
+00181 |     config.training.num_gpus = ft_config.num_gpus
+00182 |     config.training.use_wandb = ft_config.use_wandb
+00183 |     config.training.max_steps = ft_config.max_steps
+00184 |     config.training.weight_decay = ft_config.weight_decay
+00185 |     config.training.warmup_ratio = ft_config.warmup_ratio
+00186 |     config.training.wandb_project = ft_config.wandb_project
+00187 | 
+00188 |     config.data.shard_size = ft_config.shard_size
+00189 |     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
+00190 |     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+00191 |     config.data.ds_weights_alpha = ft_config.ds_weights_alpha
+00192 | 
+00193 |     config.training.save_only_model = ft_config.save_only_model
+00194 |     config.training.resume_from_checkpoint = ft_config.resume_from_checkpoint
+00195 |     config.training.skip_weight_loading = ft_config.skip_weight_loading
+00196 | 
+00197 |     run(config)

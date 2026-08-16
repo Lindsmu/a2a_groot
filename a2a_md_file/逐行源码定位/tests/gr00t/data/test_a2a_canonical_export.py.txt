@@ -1,0 +1,270 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | import json
+00004 | from pathlib import Path
+00005 | import sys
+00006 | from types import SimpleNamespace
+00007 | 
+00008 | from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+00009 | from gr00t.data.embodiment_tags import EmbodimentTag
+00010 | from gr00t.data.types import ModalityConfig, VLAStepData
+00011 | import numpy as np
+00012 | import pandas as pd
+00013 | import pytest
+00014 | from scripts.a2a.export_canonical_windows import (
+00015 |     collect_identity_preprocessed_windows,
+00016 |     load_modality_config,
+00017 |     pack_identity_preprocessed_window,
+00018 |     save_identity_preprocessed_windows,
+00019 |     validate_identity_preprocessed_contract,
+00020 | )
+00021 | 
+00022 | 
+00023 | def _contract(*, embodiment: str | None = None) -> dict:
+00024 |     embodiment = embodiment or EmbodimentTag.NEW_EMBODIMENT.value
+00025 |     return {
+00026 |         "version": 1,
+00027 |         "embodiment": embodiment,
+00028 |         "feature_dim": 4,
+00029 |         "history_horizon": 2,
+00030 |         "future_horizon": 2,
+00031 |         "channels": [
+00032 |             {
+00033 |                 "action_key": "arm_canonical",
+00034 |                 "source_state_key": "arm_canonical",
+00035 |                 "kind": "continuous",
+00036 |                 "start": 0,
+00037 |                 "end": 2,
+00038 |                 "canonical_format": "joint_position",
+00039 |                 "source_format": "joint_position",
+00040 |                 "target_format": "joint_position",
+00041 |                 "source_unit": "radian",
+00042 |                 "target_unit": "radian",
+00043 |                 "source_frame": "joint",
+00044 |                 "target_frame": "joint",
+00045 |             },
+00046 |             {
+00047 |                 "action_key": "gripper_command",
+00048 |                 "source_state_key": None,
+00049 |                 "kind": "binary",
+00050 |                 "start": 2,
+00051 |                 "end": 3,
+00052 |                 "canonical_format": "scalar",
+00053 |                 "source_format": None,
+00054 |                 "target_format": None,
+00055 |                 "source_unit": None,
+00056 |                 "target_unit": None,
+00057 |                 "source_frame": None,
+00058 |                 "target_frame": None,
+00059 |             },
+00060 |         ],
+00061 |         "provenance": {
+00062 |             "dataset": "preprocessed_unit_test",
+00063 |             "dataset_revision": "1",
+00064 |             "dataset_fingerprint_sha256": "0" * 64,
+00065 |             "source_schema_sha256": "1" * 64,
+00066 |             "canonicalizer": "identity_preprocessed",
+00067 |             "canonicalizer_version": "1",
+00068 |             "canonicalizer_sha256": "2" * 64,
+00069 |             "exporter_version": "1",
+00070 |             "target_definition": "absolute_joint_target",
+00071 |             "time_alignment": "history_t_minus_1_to_t__future_t_to_t_plus_1",
+00072 |         },
+00073 |         "controller": {
+00074 |             "type": "joint_position",
+00075 |             "version": "1",
+00076 |             "frame": "joint",
+00077 |             "control_delta": False,
+00078 |             "rotation_composition": "none",
+00079 |             "scale": [1.0, 1.0],
+00080 |         },
+00081 |     }
+00082 | 
+00083 | 
+00084 | def _step() -> VLAStepData:
+00085 |     return VLAStepData(
+00086 |         images={},
+00087 |         states={
+00088 |             "arm_canonical": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32)
+00089 |         },
+00090 |         actions={
+00091 |             "arm_canonical": np.array([[0.5, 0.6], [0.7, 0.8]], dtype=np.float32),
+00092 |             "gripper_command": np.array([[0.0], [1.0]], dtype=np.float32),
+00093 |         },
+00094 |         text="task",
+00095 |         embodiment=EmbodimentTag.NEW_EMBODIMENT,
+00096 |     )
+00097 | 
+00098 | 
+00099 | def test_pack_preserves_unnormalized_values_and_contract_masks():
+00100 |     packed = pack_identity_preprocessed_window(_step(), _contract())
+00101 | 
+00102 |     np.testing.assert_array_equal(
+00103 |         packed["history"][:, :2], _step().states["arm_canonical"]
+00104 |     )
+00105 |     np.testing.assert_array_equal(
+00106 |         packed["future"][:, :2], _step().actions["arm_canonical"]
+00107 |     )
+00108 |     np.testing.assert_array_equal(
+00109 |         packed["future"][:, 2:3], _step().actions["gripper_command"]
+00110 |     )
+00111 |     assert packed["history_mask"][:, :2].all()
+00112 |     assert not packed["history_mask"][:, 2:].any()
+00113 |     assert packed["future_mask"][:, :3].all()
+00114 |     assert not packed["future_mask"][:, 3:].any()
+00115 | 
+00116 | 
+00117 | def test_contract_rejects_nonidentity_and_raw_libero_pseudo_canonical():
+00118 |     nonidentity = _contract()
+00119 |     nonidentity["provenance"]["canonicalizer"] = "osc_delta_to_absolute"
+00120 |     with pytest.raises(ValueError, match="only supports"):
+00121 |         validate_identity_preprocessed_contract(nonidentity)
+00122 | 
+00123 |     raw_libero = _contract(embodiment="libero_sim")
+00124 |     raw_libero["feature_dim"] = 1
+00125 |     raw_libero["channels"] = [
+00126 |         {
+00127 |             "action_key": "x",
+00128 |             "source_state_key": "x",
+00129 |             "kind": "continuous",
+00130 |             "start": 0,
+00131 |             "end": 1,
+00132 |             "canonical_format": "scalar",
+00133 |             "source_format": "scalar",
+00134 |             "target_format": "scalar",
+00135 |             "source_unit": "meter",
+00136 |             "target_unit": "meter",
+00137 |             "source_frame": "world",
+00138 |             "target_frame": "world",
+00139 |         }
+00140 |     ]
+00141 |     with pytest.raises(ValueError, match="Raw LIBERO action keys"):
+00142 |         validate_identity_preprocessed_contract(raw_libero)
+00143 | 
+00144 | 
+00145 | def test_pack_rejects_nonfinite_and_nonbinary_active_values():
+00146 |     nonfinite = _step()
+00147 |     nonfinite.states["arm_canonical"][0, 0] = np.nan
+00148 |     with pytest.raises(ValueError, match="non-finite"):
+00149 |         pack_identity_preprocessed_window(nonfinite, _contract())
+00150 | 
+00151 |     nonbinary = _step()
+00152 |     nonbinary.actions["gripper_command"][0, 0] = 0.5
+00153 |     with pytest.raises(ValueError, match="only 0/1"):
+00154 |         pack_identity_preprocessed_window(nonbinary, _contract())
+00155 | 
+00156 | 
+00157 | class _FakeEpisodeLoader:
+00158 |     def __init__(self, episode: pd.DataFrame):
+00159 |         self.episode = episode
+00160 |         self.episode_lengths = [len(episode)]
+00161 | 
+00162 |     def __getitem__(self, index: int) -> pd.DataFrame:
+00163 |         assert index == 0
+00164 |         return self.episode
+00165 | 
+00166 | 
+00167 | def test_collect_traverses_every_strict_anchor_and_embeds_provenance(tmp_path: Path):
+00168 |     episode = pd.DataFrame(
+00169 |         {
+00170 |             "state.arm_canonical": [
+00171 |                 np.array([index, index + 0.1], dtype=np.float32) for index in range(4)
+00172 |             ],
+00173 |             "action.arm_canonical": [
+00174 |                 np.array([index + 0.2, index + 0.3], dtype=np.float32)
+00175 |                 for index in range(4)
+00176 |             ],
+00177 |             "action.gripper_command": [
+00178 |                 np.array([index % 2], dtype=np.float32) for index in range(4)
+00179 |             ],
+00180 |             "language.task": ["task"] * 4,
+00181 |         }
+00182 |     )
+00183 |     modality_configs = {
+00184 |         "state": ModalityConfig(delta_indices=[-1, 0], modality_keys=["arm_canonical"]),
+00185 |         "action": ModalityConfig(
+00186 |             delta_indices=[0, 1], modality_keys=["arm_canonical", "gripper_command"]
+00187 |         ),
+00188 |         "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+00189 |     }
+00190 |     dataset = SimpleNamespace(
+00191 |         episode_loader=_FakeEpisodeLoader(episode),
+00192 |         modality_configs=modality_configs,
+00193 |         embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+00194 |     )
+00195 | 
+00196 |     arrays = collect_identity_preprocessed_windows(dataset, _contract())
+00197 |     assert arrays["history"].shape == (2, 2, 4)
+00198 |     assert arrays["future"].shape == (2, 2, 4)
+00199 |     np.testing.assert_array_equal(arrays["episode_index"], [0, 0])
+00200 |     np.testing.assert_array_equal(arrays["base_step_index"], [1, 2])
+00201 | 
+00202 |     output_path = save_identity_preprocessed_windows(
+00203 |         arrays, _contract(), tmp_path / "canonical_windows.npz"
+00204 |     )
+00205 |     with np.load(output_path, allow_pickle=False) as payload:
+00206 |         assert payload["input_space"].item() == "unnormalized_canonical_physical"
+00207 |         assert payload["canonicalizer"].item() == "identity_preprocessed"
+00208 |         assert len(payload["contract_sha256"].item()) == 64
+00209 |         saved_contract = json.loads(payload["contract_json"].item())
+00210 |         assert saved_contract["provenance"]["dataset"] == "preprocessed_unit_test"
+00211 | 
+00212 | 
+00213 | def test_collect_rejects_noncontiguous_timeline_even_when_shapes_match():
+00214 |     episode = pd.DataFrame(
+00215 |         {
+00216 |             "state.arm_canonical": [np.zeros(2, dtype=np.float32)] * 4,
+00217 |             "action.arm_canonical": [np.zeros(2, dtype=np.float32)] * 4,
+00218 |             "action.gripper_command": [np.zeros(1, dtype=np.float32)] * 4,
+00219 |             "language.task": ["task"] * 4,
+00220 |         }
+00221 |     )
+00222 |     dataset = SimpleNamespace(
+00223 |         episode_loader=_FakeEpisodeLoader(episode),
+00224 |         modality_configs={
+00225 |             "state": ModalityConfig(
+00226 |                 delta_indices=[-2, 0], modality_keys=["arm_canonical"]
+00227 |             ),
+00228 |             "action": ModalityConfig(
+00229 |                 delta_indices=[0, 1],
+00230 |                 modality_keys=["arm_canonical", "gripper_command"],
+00231 |             ),
+00232 |             "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+00233 |         },
+00234 |         embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+00235 |     )
+00236 | 
+00237 |     with pytest.raises(ValueError, match="exact contract timeline"):
+00238 |         collect_identity_preprocessed_windows(dataset, _contract())
+00239 | 
+00240 | 
+00241 | def test_save_rejects_mask_layout_that_disagrees_with_contract(tmp_path: Path):
+00242 |     packed = pack_identity_preprocessed_window(_step(), _contract())
+00243 |     arrays = {key: value[None, ...] for key, value in packed.items()}
+00244 |     arrays["episode_index"] = np.array([0], dtype=np.int64)
+00245 |     arrays["base_step_index"] = np.array([1], dtype=np.int64)
+00246 |     arrays["history_mask"][0, 0, 2] = 1
+00247 | 
+00248 |     with pytest.raises(ValueError, match="continuous channel layout"):
+00249 |         save_identity_preprocessed_windows(
+00250 |             arrays, _contract(), tmp_path / "invalid_windows.npz"
+00251 |         )
+00252 | 
+00253 | 
+00254 | def test_load_modality_config_uses_explicit_local_python_registration(tmp_path: Path):
+00255 |     module_name = f"a2a_export_config_{abs(hash(str(tmp_path)))}"
+00256 |     registry_key = f"{module_name}_embodiment"
+00257 |     config_path = tmp_path / f"{module_name}.py"
+00258 |     config_path.write_text(
+00259 |         "from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS\n"
+00260 |         f"MODALITY_CONFIGS[{registry_key!r}] = {{'registered': True}}\n",
+00261 |         encoding="utf-8",
+00262 |     )
+00263 |     try:
+00264 |         assert load_modality_config(config_path) == config_path
+00265 |         assert MODALITY_CONFIGS[registry_key] == {"registered": True}
+00266 |     finally:
+00267 |         MODALITY_CONFIGS.pop(registry_key, None)
+00268 |         sys.modules.pop(module_name, None)
+00269 |         if str(tmp_path) in sys.path:
+00270 |             sys.path.remove(str(tmp_path))

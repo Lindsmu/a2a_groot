@@ -1,0 +1,265 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Export the fixed-horizon latent A2A action head to one ONNX graph.
+00004 | 
+00005 | The graph starts from actual canonical proprio history and VLM backbone
+00006 | features.  The configured Euler steps are unrolled; no random action tensor is
+00007 | created in the exported graph.
+00008 | """
+00009 | 
+00010 | from __future__ import annotations
+00011 | 
+00012 | import hashlib
+00013 | import json
+00014 | from pathlib import Path
+00015 | 
+00016 | from gr00t.deployment.a2a_artifacts import (
+00017 |     canonical_statistics_sha256,
+00018 |     checkpoint_sha256,
+00019 |     sha256_file,
+00020 | )
+00021 | 
+00022 | # Import registrations before AutoModel resolves the model type.
+00023 | import gr00t.model  # noqa: F401
+00024 | import numpy as np
+00025 | import torch
+00026 | from torch import nn
+00027 | from transformers import AutoModel
+00028 | from transformers.feature_extraction_utils import BatchFeature
+00029 | import tyro
+00030 | 
+00031 | 
+00032 | class A2AActionHeadExportWrapper(nn.Module):
+00033 |     def __init__(self, action_head):
+00034 |         super().__init__()
+00035 |         self.action_head = action_head
+00036 | 
+00037 |     def forward(
+00038 |         self,
+00039 |         backbone_features,
+00040 |         backbone_attention_mask,
+00041 |         image_mask,
+00042 |         history_action_canonical,
+00043 |         history_action_mask,
+00044 |         continuous_action_mask,
+00045 |         auxiliary_action_mask,
+00046 |         binary_action_mask,
+00047 |         categorical_action_mask,
+00048 |         embodiment_id,
+00049 |     ):
+00050 |         # future_action_mask is exactly the union of mutually-exclusive head
+00051 |         # masks. Keeping one source of truth avoids ONNX DCE silently changing
+00052 |         # an 11-input export into a 10-input TensorRT engine.
+00053 |         future_action_mask = (
+00054 |             continuous_action_mask
+00055 |             + auxiliary_action_mask
+00056 |             + binary_action_mask
+00057 |             + categorical_action_mask
+00058 |         ).clamp(0, 1)
+00059 |         backbone = BatchFeature(
+00060 |             data={
+00061 |                 "backbone_features": backbone_features,
+00062 |                 "backbone_attention_mask": backbone_attention_mask,
+00063 |                 "image_mask": image_mask,
+00064 |             }
+00065 |         )
+00066 |         action = BatchFeature(
+00067 |             data={
+00068 |                 "history_action_canonical": history_action_canonical,
+00069 |                 "history_action_mask": history_action_mask,
+00070 |                 "future_action_mask": future_action_mask,
+00071 |                 "continuous_action_mask": continuous_action_mask,
+00072 |                 "auxiliary_action_mask": auxiliary_action_mask,
+00073 |                 "binary_action_mask": binary_action_mask,
+00074 |                 "categorical_action_mask": categorical_action_mask,
+00075 |                 "embodiment_id": embodiment_id,
+00076 |             }
+00077 |         )
+00078 |         return self.action_head.get_action(backbone, action)["action_pred"]
+00079 | 
+00080 | 
+00081 | def _checkpoint_canonical_statistics(model_path: Path) -> dict:
+00082 |     candidates = (
+00083 |         model_path / "a2a_statistics.json",
+00084 |         model_path / "processor" / "a2a_statistics.json",
+00085 |     )
+00086 |     for path in candidates:
+00087 |         if not path.is_file():
+00088 |             continue
+00089 |         payload = json.loads(path.read_text(encoding="utf-8"))
+00090 |         statistics = payload.get("canonical_statistics", payload)
+00091 |         if not isinstance(statistics, dict) or not statistics:
+00092 |             raise ValueError(f"A2A canonical statistics in {path} are absent or invalid")
+00093 |         return statistics
+00094 |     raise FileNotFoundError(
+00095 |         "A2A checkpoint is missing a2a_statistics.json at its root or processor/ directory"
+00096 |     )
+00097 | 
+00098 | 
+00099 | def _verify_a2a_onnx(
+00100 |     onnx_path: Path,
+00101 |     wrapper: A2AActionHeadExportWrapper,
+00102 |     inputs: tuple[torch.Tensor, ...],
+00103 |     input_names: list[str],
+00104 | ) -> None:
+00105 |     """Run structural ONNX validation and a PyTorch/ORT fixed-input oracle."""
+00106 | 
+00107 |     try:
+00108 |         import onnx
+00109 |         import onnxruntime as ort
+00110 |     except ImportError as error:
+00111 |         raise RuntimeError(
+00112 |             "A2A export verification requires both onnx and onnxruntime; install the "
+00113 |             "deployment dependencies or pass verify_export=False explicitly"
+00114 |         ) from error
+00115 | 
+00116 |     onnx.checker.check_model(onnx.load(str(onnx_path)))
+00117 |     with torch.inference_mode():
+00118 |         expected = wrapper(*inputs).detach().cpu().numpy()
+00119 |     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+00120 |     ort_inputs = {
+00121 |         name: value.detach().cpu().numpy() for name, value in zip(input_names, inputs, strict=True)
+00122 |     }
+00123 |     actual = session.run(["action_pred"], ort_inputs)[0]
+00124 |     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)
+00125 | 
+00126 | 
+00127 | def export_a2a_action_head(
+00128 |     model_path: str,
+00129 |     output_dir: str,
+00130 |     batch_size: int = 1,
+00131 |     vl_sequence_length: int = 512,
+00132 |     opset: int = 18,
+00133 |     verify_export: bool = True,
+00134 | ) -> Path:
+00135 |     model_path = Path(model_path).resolve()
+00136 |     model = AutoModel.from_pretrained(model_path, local_files_only=True)
+00137 |     if getattr(model.config, "model_type", None) != "Gr00tN1d7A2A":
+00138 |         raise ValueError("Checkpoint is not a Gr00tN1d7A2A model")
+00139 |     if float(model.config.a2a_history_noise_infer_std) != 0.0:
+00140 |         raise ValueError("Deterministic A2A ONNX export requires a2a_history_noise_infer_std=0")
+00141 |     if bool(model.config.a2a_include_current_state_condition):
+00142 |         raise ValueError(
+00143 |             "The optional current-state conditioning ablation is not part of the strict "
+00144 |             "10-input A2A deployment contract; export a strict checkpoint instead"
+00145 |         )
+00146 |     data_contract_sha256 = getattr(model.config, "a2a_expected_contract_sha256", None)
+00147 |     if not isinstance(data_contract_sha256, str) or len(data_contract_sha256) != 64:
+00148 |         raise ValueError(
+00149 |             "A2A ONNX export requires a checkpoint bound to a 64-character "
+00150 |             "a2a_expected_contract_sha256"
+00151 |         )
+00152 |     statistics_payload = _checkpoint_canonical_statistics(model_path)
+00153 |     statistics_sha256 = canonical_statistics_sha256(statistics_payload)
+00154 |     model_checkpoint_sha256 = checkpoint_sha256(model_path)
+00155 |     wrapper = A2AActionHeadExportWrapper(model.action_head.float().cpu()).eval()
+00156 |     config = model.config
+00157 |     history_shape = (
+00158 |         batch_size,
+00159 |         config.a2a_history_horizon,
+00160 |         config.max_action_dim,
+00161 |     )
+00162 |     future_shape = (
+00163 |         batch_size,
+00164 |         config.a2a_future_horizon,
+00165 |         config.max_action_dim,
+00166 |     )
+00167 |     continuous = torch.ones(future_shape, dtype=torch.float32)
+00168 |     zeros = torch.zeros(future_shape, dtype=torch.float32)
+00169 |     inputs = (
+00170 |         torch.randn(batch_size, vl_sequence_length, config.backbone_embedding_dim),
+00171 |         torch.ones(batch_size, vl_sequence_length, dtype=torch.long),
+00172 |         torch.zeros(batch_size, vl_sequence_length, dtype=torch.bool),
+00173 |         torch.randn(history_shape),
+00174 |         torch.ones(history_shape),
+00175 |         continuous,
+00176 |         zeros,
+00177 |         zeros,
+00178 |         zeros,
+00179 |         torch.zeros(batch_size, dtype=torch.long),
+00180 |     )
+00181 |     input_names = [
+00182 |         "backbone_features",
+00183 |         "backbone_attention_mask",
+00184 |         "image_mask",
+00185 |         "history_action_canonical",
+00186 |         "history_action_mask",
+00187 |         "continuous_action_mask",
+00188 |         "auxiliary_action_mask",
+00189 |         "binary_action_mask",
+00190 |         "categorical_action_mask",
+00191 |         "embodiment_id",
+00192 |     ]
+00193 |     output = Path(output_dir)
+00194 |     output.mkdir(parents=True, exist_ok=True)
+00195 |     onnx_path = output / "a2a_action_head.onnx"
+00196 |     # The generic TensorRT builder recognizes the symbolic name
+00197 |     # ``batch_size`` when deriving optimization profiles.
+00198 |     dynamic_axes = {name: {0: "batch_size"} for name in input_names}
+00199 |     dynamic_axes["backbone_features"][1] = "vl_sequence"
+00200 |     dynamic_axes["backbone_attention_mask"][1] = "vl_sequence"
+00201 |     dynamic_axes["image_mask"][1] = "vl_sequence"
+00202 |     dynamic_axes["action_pred"] = {0: "batch_size"}
+00203 |     torch.onnx.export(
+00204 |         wrapper,
+00205 |         inputs,
+00206 |         onnx_path,
+00207 |         input_names=input_names,
+00208 |         output_names=["action_pred"],
+00209 |         dynamic_axes=dynamic_axes,
+00210 |         opset_version=opset,
+00211 |         do_constant_folding=True,
+00212 |         dynamo=False,
+00213 |     )
+00214 |     if verify_export:
+00215 |         _verify_a2a_onnx(onnx_path, wrapper, inputs, input_names)
+00216 |     contract = {
+00217 |         "model_type": config.model_type,
+00218 |         "source": "executed_proprio_history",
+00219 |         "latent_dim": config.a2a_latent_dim,
+00220 |         "flow_backbone": config.a2a_flow_backbone,
+00221 |         "dit_token_dim": config.a2a_dit_token_dim,
+00222 |         "dit_num_layers": config.a2a_dit_num_layers,
+00223 |         "dit_num_heads": config.a2a_dit_num_heads,
+00224 |         "dit_mlp_ratio": config.a2a_dit_mlp_ratio,
+00225 |         "dit_dropout": config.a2a_dit_dropout,
+00226 |         "history_horizon": config.a2a_history_horizon,
+00227 |         "future_horizon": config.a2a_future_horizon,
+00228 |         "action_dim": config.max_action_dim,
+00229 |         "num_inference_steps": config.a2a_num_inference_steps,
+00230 |         "random_initialization": False,
+00231 |         "inputs": input_names,
+00232 |         "input_dtypes": {
+00233 |             "backbone_features": "float32",
+00234 |             "backbone_attention_mask": "int64",
+00235 |             "image_mask": "bool",
+00236 |             "history_action_canonical": "float32",
+00237 |             "history_action_mask": "float32",
+00238 |             "continuous_action_mask": "float32",
+00239 |             "auxiliary_action_mask": "float32",
+00240 |             "binary_action_mask": "float32",
+00241 |             "categorical_action_mask": "float32",
+00242 |             "embodiment_id": "int64",
+00243 |         },
+00244 |     }
+00245 |     contract_sha256 = hashlib.sha256(
+00246 |         json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+00247 |     ).hexdigest()
+00248 |     metadata = {
+00249 |         **contract,
+00250 |         "contract_sha256": contract_sha256,
+00251 |         "onnx": onnx_path.name,
+00252 |         "onnx_sha256": sha256_file(onnx_path),
+00253 |         "checkpoint_sha256": model_checkpoint_sha256,
+00254 |         "data_contract_sha256": data_contract_sha256,
+00255 |         "canonical_statistics_sha256": statistics_sha256,
+00256 |         "verification": "onnx_checker+torch_ort_rtol1e-4_atol1e-4" if verify_export else "skipped",
+00257 |     }
+00258 |     (output / "a2a_export_metadata.json").write_text(
+00259 |         json.dumps(metadata, indent=2), encoding="utf-8"
+00260 |     )
+00261 |     return onnx_path
+00262 | 
+00263 | 
+00264 | if __name__ == "__main__":
+00265 |     tyro.cli(export_a2a_action_head)

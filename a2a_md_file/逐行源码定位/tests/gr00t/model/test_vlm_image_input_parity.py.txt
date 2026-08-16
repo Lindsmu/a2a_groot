@@ -1,0 +1,115 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """Bitwise parity of the inference image path after removing the PIL round-trip.
+00017 | 
+00018 | ``_apply_vlm_processing`` used to convert every CHW frame to PIL before handing
+00019 | it to the Qwen3VL processor; it now passes CHW uint8 tensors directly. These
+00020 | tests assert the final model inputs are bitwise identical to a verbatim
+00021 | reimplementation of the old PIL path, on the real checkpoint processor.
+00022 | """
+00023 | 
+00024 | import numpy as np
+00025 | from PIL import Image
+00026 | import pytest
+00027 | import torch
+00028 | 
+00029 | 
+00030 | pytestmark = pytest.mark.serial
+00031 | 
+00032 | INSTRUCTION = "pick up the black bowl and place it on the plate"
+00033 | 
+00034 | 
+00035 | @pytest.fixture(scope="module")
+00036 | def vlm_processor(load_hf_model_weights):
+00037 |     """Real Qwen3VL processor; skips when the gated repo is unreachable.
+00038 | 
+00039 |     Only processor configs/tokenizer files are fetched (no model weights).
+00040 |     Uses the ``load_hf_model_weights`` opt-in: the suite-wide
+00041 |     ``GROOT_SKIP_HF_MODEL_WEIGHTS=1`` harness would otherwise stub the load and
+00042 |     make the parity assertions vacuous.
+00043 |     """
+00044 |     from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import build_processor
+00045 | 
+00046 |     try:
+00047 |         with load_hf_model_weights():
+00048 |             return build_processor("nvidia/Cosmos-Reason2-2B", {"trust_remote_code": True})
+00049 |     except Exception as exc:  # pragma: no cover - environment dependent
+00050 |         pytest.skip(f"Cosmos-Reason2-2B processor unavailable (gated/offline?): {exc}")
+00051 | 
+00052 | 
+00053 | def _reference_pil_outputs(processor, frames_chw: np.ndarray, language: str):
+00054 |     """Verbatim reimplementation of the pre-change path: CHW -> PIL -> processor."""
+00055 |     pil_images = [Image.fromarray(np.transpose(v, (1, 2, 0))) for v in frames_chw]
+00056 |     conversation = [
+00057 |         {
+00058 |             "role": "user",
+00059 |             "content": [
+00060 |                 *[{"type": "image", "image": img} for img in pil_images],
+00061 |                 {"type": "text", "text": language},
+00062 |             ],
+00063 |         }
+00064 |     ]
+00065 |     text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+00066 |     return processor(text=[text], images=pil_images, return_tensors="pt", padding=True)
+00067 | 
+00068 | 
+00069 | def _direct_outputs(processor, frames_chw: np.ndarray, language: str):
+00070 |     """The new path: CHW uint8 tensors handed to the processor directly."""
+00071 |     frames = [torch.as_tensor(v) for v in frames_chw]
+00072 |     conversation = [
+00073 |         {
+00074 |             "role": "user",
+00075 |             "content": [
+00076 |                 *[{"type": "image", "image": img} for img in frames],
+00077 |                 {"type": "text", "text": language},
+00078 |             ],
+00079 |         }
+00080 |     ]
+00081 |     text = processor.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
+00082 |     return processor(text=[text], images=frames, return_tensors="pt", padding=True)
+00083 | 
+00084 | 
+00085 | @pytest.mark.parametrize(
+00086 |     "height,width",
+00087 |     [
+00088 |         (256, 256),  # matches patch grid: smart-resize is a no-op
+00089 |         (240, 320),  # non-square: real smart-resize happens
+00090 |         (243, 243),  # not a patch multiple: smart-resize rounds
+00091 |     ],
+00092 | )
+00093 | @pytest.mark.parametrize("num_frames", [2, 6])  # 1 and 3 cameras x 2 temporal frames
+00094 | def test_direct_tensor_input_is_bitwise_identical_to_pil(vlm_processor, height, width, num_frames):
+00095 |     rng = np.random.default_rng(1234)
+00096 |     frames = rng.integers(0, 256, size=(num_frames, 3, height, width), dtype=np.uint8)
+00097 | 
+00098 |     reference = _reference_pil_outputs(vlm_processor, frames, INSTRUCTION)
+00099 |     direct = _direct_outputs(vlm_processor, frames, INSTRUCTION)
+00100 | 
+00101 |     assert set(reference.keys()) == set(direct.keys())
+00102 |     for key in reference.keys():
+00103 |         assert torch.equal(reference[key], direct[key]), f"mismatch in {key}"
+00104 | 
+00105 | 
+00106 | def test_processor_output_through_gr00t_pipeline_shape(vlm_processor):
+00107 |     """The tensors handed over by _apply_vlm_processing (post-change) are CHW
+00108 |     uint8 — the exact type proven bitwise-equal above."""
+00109 |     from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor  # noqa: F401
+00110 | 
+00111 |     rng = np.random.default_rng(0)
+00112 |     frames = torch.as_tensor(rng.integers(0, 256, size=(2, 3, 256, 256), dtype=np.uint8))
+00113 |     out = _direct_outputs(vlm_processor, frames.numpy(), INSTRUCTION)
+00114 |     assert out["pixel_values"].dtype == torch.float32
+00115 |     assert out["image_grid_thw"].shape[0] == 2

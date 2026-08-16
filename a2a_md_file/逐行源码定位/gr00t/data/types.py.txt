@@ -1,0 +1,154 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | from dataclasses import dataclass, field
+00017 | from enum import Enum
+00018 | from typing import Any, Literal
+00019 | 
+00020 | import numpy as np
+00021 | 
+00022 | from gr00t.data.embodiment_tags import EmbodimentTag
+00023 | 
+00024 | 
+00025 | class MessageType(Enum):
+00026 |     START_OF_EPISODE = "start_of_episode"
+00027 |     END_OF_EPISODE = "end_of_episode"
+00028 |     EPISODE_STEP = "episode_step"
+00029 |     IMAGE = "image"
+00030 |     TEXT = "text"
+00031 | 
+00032 | 
+00033 | class ActionRepresentation(Enum):
+00034 |     RELATIVE = "relative"
+00035 |     DELTA = "delta"
+00036 |     ABSOLUTE = "absolute"
+00037 | 
+00038 | 
+00039 | class ActionType(Enum):
+00040 |     EEF = "eef"
+00041 |     NON_EEF = "non_eef"
+00042 | 
+00043 | 
+00044 | class ActionFormat(Enum):
+00045 |     DEFAULT = "default"
+00046 |     XYZ_ROT6D = "xyz+rot6d"
+00047 |     XYZ_ROTVEC = "xyz+rotvec"
+00048 | 
+00049 | 
+00050 | @dataclass
+00051 | class VLAStepData:
+00052 |     """
+00053 |     Represents a single step of VLA (Vision-Language-Action) data.
+00054 | 
+00055 |     This is the core data structure returned by datasets, containing raw observation
+00056 |     and action data that will be processed by the SequenceVLAProcessor.
+00057 |     """
+00058 | 
+00059 |     # Core data
+00060 |     images: dict[str, list[np.ndarray]]  # view_name -> list[np.ndarray] (for temporal stacking)
+00061 |     states: dict[
+00062 |         str, np.ndarray
+00063 |     ]  # state_name -> np.ndarray (dim,) for single step or (horizon, dim) for trajectory
+00064 |     actions: dict[str, np.ndarray]  # action_name -> np.ndarray (horizon, dim) for action chunk
+00065 |     masks: dict[str, list[np.ndarray]] | None = None  # view_name -> list[np.ndarray] (H, W)
+00066 |     text: str | None = None  # Optional task description or instruction
+00067 |     embodiment: EmbodimentTag = (
+00068 |         EmbodimentTag.NEW_EMBODIMENT
+00069 |     )  # Optional embodiment tag for cross-embodiment training
+00070 |     is_demonstration: bool = False  # Whether the step is a demonstration. If True, no loss should be computed for this step.
+00071 | 
+00072 |     # Flexible metadata that can be extended by users
+00073 |     metadata: dict[str, Any] = field(default_factory=dict)
+00074 | 
+00075 | 
+00076 | @dataclass
+00077 | class ActionConfig:
+00078 |     rep: ActionRepresentation
+00079 |     type: ActionType
+00080 |     format: ActionFormat
+00081 |     state_key: str | None = None
+00082 | 
+00083 | 
+00084 | @dataclass
+00085 | class A2AChannelSpec:
+00086 |     """Map one controller action group into the canonical A2A trajectory space.
+00087 | 
+00088 |     ``continuous`` groups are encoded by the shared action autoencoder. ``regression``
+00089 |     and ``binary`` groups are predicted by the auxiliary head. ``categorical`` is
+00090 |     reserved for explicitly configured one-hot groups; scalar token channels should
+00091 |     remain ``unsupported`` until a class vocabulary is supplied.
+00092 |     """
+00093 | 
+00094 |     action_key: str
+00095 |     source_state_key: str | None = None
+00096 |     kind: Literal[
+00097 |         "auto", "continuous", "regression", "binary", "categorical", "unsupported"
+00098 |     ] = "auto"
+00099 |     canonical_format: Literal[
+00100 |         "auto", "joint_position", "xyz_rot6d", "scalar", "token"
+00101 |     ] = "auto"
+00102 |     source_format: str | None = None
+00103 |     target_format: str | None = None
+00104 |     source_unit: str | None = None
+00105 |     target_unit: str | None = None
+00106 |     source_frame: str | None = None
+00107 |     target_frame: str | None = None
+00108 |     dim: int | None = None
+00109 |     num_classes: int | None = None
+00110 | 
+00111 | 
+00112 | @dataclass
+00113 | class ModalityConfig:
+00114 |     """Configuration for a modality defining how data should be sampled and loaded.
+00115 | 
+00116 |     This class specifies which indices to sample relative to a base index and which
+00117 |     keys to load for a particular modality (e.g., video, state, action).
+00118 |     """
+00119 | 
+00120 |     delta_indices: list[int]
+00121 |     """Delta indices to sample relative to the current index. The returned data will correspond to the original data at a sampled base index + delta indices."""
+00122 |     modality_keys: list[str]
+00123 |     """The keys to load for the modality in the dataset."""
+00124 |     sin_cos_embedding_keys: list[str] | None = None
+00125 |     """Optional list of keys to apply sin/cos encoding. If None or empty, use min/max normalization for all keys."""
+00126 |     mean_std_embedding_keys: list[str] | None = None
+00127 |     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
+00128 |     action_configs: list[ActionConfig] | None = None
+00129 | 
+00130 |     def __post_init__(self):
+00131 |         """Validate fields and set default values."""
+00132 |         if self.delta_indices is None or not isinstance(self.delta_indices, list):
+00133 |             raise ValueError(f"delta_indices must be a non-None list, got {self.delta_indices!r}")
+00134 |         if (
+00135 |             self.modality_keys is None
+00136 |             or not isinstance(self.modality_keys, list)
+00137 |             or len(self.modality_keys) == 0
+00138 |         ):
+00139 |             raise ValueError(f"modality_keys must be a non-empty list, got {self.modality_keys!r}")
+00140 |         if self.action_configs is not None:
+00141 |             assert len(self.action_configs) == len(self.modality_keys), (
+00142 |                 f"Number of action configs ({len(self.action_configs)}) must match number of modality keys ({len(self.modality_keys)})"
+00143 |             )
+00144 |             parsed_action_configs = []
+00145 |             for action_config in self.action_configs:
+00146 |                 if isinstance(action_config, dict):
+00147 |                     action_config = ActionConfig(
+00148 |                         rep=ActionRepresentation[action_config["rep"]],
+00149 |                         type=ActionType[action_config["type"]],
+00150 |                         format=ActionFormat[action_config["format"]],
+00151 |                         state_key=action_config.get("state_key", None),
+00152 |                     )
+00153 |                 parsed_action_configs.append(action_config)
+00154 |             self.action_configs = parsed_action_configs

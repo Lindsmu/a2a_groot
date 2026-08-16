@@ -1,0 +1,267 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | 
+00004 | """Training pipeline and strict base-VLA migration for latent A2A."""
+00005 | 
+00006 | from copy import deepcopy
+00007 | import gc
+00008 | import json
+00009 | import logging
+00010 | 
+00011 | from transformers import AutoConfig, AutoModel
+00012 | 
+00013 | from gr00t.configs.model.gr00t_n1d7_a2a import Gr00tN1d7A2AConfig
+00014 | from gr00t.model.gr00t_n1d7.setup import Gr00tN1d7Pipeline
+00015 | from gr00t.model.registry import register_model
+00016 | from gr00t.utils.dist_utils import run_or_wait_on_rank0
+00017 | 
+00018 | from .gr00t_n1d7_a2a import Gr00tN1d7A2A
+00019 | from .processing_gr00t_n1d7_a2a import Gr00tN1d7A2AProcessor
+00020 | 
+00021 | 
+00022 | class Gr00tN1d7A2APipeline(Gr00tN1d7Pipeline):
+00023 |     model_class = Gr00tN1d7A2A
+00024 |     processor_class = Gr00tN1d7A2AProcessor
+00025 | 
+00026 |     def setup(self):
+00027 |         self._configure_a2a_windows()
+00028 |         self._normalize_checkpoint_sources()
+00029 |         if (
+00030 |             self.model_config.a2a_training_stage == "flow_only"
+00031 |             and self.config.training.start_from_checkpoint is None
+00032 |         ):
+00033 |             raise ValueError(
+00034 |                 "a2a_training_stage='flow_only' requires a full A2A checkpoint in "
+00035 |                 "training.start_from_checkpoint; freezing a randomly initialized AE is invalid"
+00036 |             )
+00037 |         super().setup()
+00038 | 
+00039 |     def _normalize_checkpoint_sources(self) -> None:
+00040 |         """Distinguish a full A2A resume from a base N1.7 initialization."""
+00041 |         checkpoint = self.config.training.start_from_checkpoint
+00042 |         if checkpoint is None:
+00043 |             return
+00044 |         checkpoint_config = AutoConfig.from_pretrained(
+00045 |             checkpoint, **self.transformers_loading_kwargs
+00046 |         )
+00047 |         checkpoint_type = getattr(checkpoint_config, "model_type", None)
+00048 |         if checkpoint_type == "Gr00tN1d7A2A":
+00049 |             # A full A2A resume must keep the serialized module graph. In
+00050 |             # particular, silently loading an MLP checkpoint into a DiT head
+00051 |             # would leave most of the new action head randomly initialized.
+00052 |             common_fields = (
+00053 |                 "action_horizon",
+00054 |                 "a2a_history_horizon",
+00055 |                 "a2a_future_horizon",
+00056 |                 "a2a_latent_dim",
+00057 |                 "a2a_encoder_channels",
+00058 |                 "a2a_encoder_kernel_size",
+00059 |                 "a2a_decoder_res_blocks",
+00060 |                 "a2a_flow_backbone",
+00061 |             )
+00062 |             backend = getattr(checkpoint_config, "a2a_flow_backbone", "mlp")
+00063 |             backend_fields = (
+00064 |                 ("a2a_flow_blocks", "a2a_flow_mlp_ratio")
+00065 |                 if backend == "mlp"
+00066 |                 else (
+00067 |                     "a2a_dit_token_dim",
+00068 |                     "a2a_dit_num_layers",
+00069 |                     "a2a_dit_num_heads",
+00070 |                     "a2a_dit_mlp_ratio",
+00071 |                     "a2a_dit_dropout",
+00072 |                 )
+00073 |             )
+00074 |             mismatches = {}
+00075 |             for field in (*common_fields, *backend_fields):
+00076 |                 checkpoint_value = getattr(
+00077 |                     checkpoint_config,
+00078 |                     field,
+00079 |                     "mlp" if field == "a2a_flow_backbone" else None,
+00080 |                 )
+00081 |                 requested_value = getattr(self.model_config, field)
+00082 |                 if field == "a2a_encoder_channels":
+00083 |                     checkpoint_value = tuple(checkpoint_value)
+00084 |                     requested_value = tuple(requested_value)
+00085 |                 if checkpoint_value != requested_value:
+00086 |                     mismatches[field] = {
+00087 |                         "checkpoint": checkpoint_value,
+00088 |                         "requested": requested_value,
+00089 |                     }
+00090 |             if mismatches:
+00091 |                 raise ValueError(
+00092 |                     "A full A2A checkpoint cannot change its MLP/DiT module graph. "
+00093 |                     "Start the comparison from the same original Gr00tN1d7 base "
+00094 |                     f"checkpoint instead; mismatches={mismatches}"
+00095 |                 )
+00096 |             return
+00097 |         if checkpoint_type != "Gr00tN1d7":
+00098 |             raise ValueError(
+00099 |                 "A2A start_from_checkpoint must be a full Gr00tN1d7A2A checkpoint or "
+00100 |                 f"an original Gr00tN1d7 base checkpoint, got {checkpoint_type!r}"
+00101 |             )
+00102 |         configured_base = self.model_config.a2a_base_vla_checkpoint
+00103 |         if configured_base is not None and str(configured_base) != str(checkpoint):
+00104 |             raise ValueError(
+00105 |                 "Conflicting original N1.7 checkpoints were supplied through "
+00106 |                 "start_from_checkpoint and a2a_base_vla_checkpoint"
+00107 |             )
+00108 |         self.model_config.a2a_base_vla_checkpoint = str(checkpoint)
+00109 |         self.config.training.start_from_checkpoint = None
+00110 |         logging.info(
+00111 |             "Treating original N1.7 start_from_checkpoint=%s as A2A base initialization",
+00112 |             checkpoint,
+00113 |         )
+00114 | 
+00115 |     def _configure_a2a_windows(self) -> None:
+00116 |         history = int(self.model_config.a2a_history_horizon)
+00117 |         future = int(self.model_config.a2a_future_horizon)
+00118 |         if history != future:
+00119 |             raise ValueError("Strict latent A2A requires equal history and future horizons")
+00120 |         if int(self.model_config.action_horizon) != future:
+00121 |             raise ValueError(
+00122 |                 "action_horizon must equal a2a_future_horizon for the strict A2A variant"
+00123 |             )
+00124 |         if int(self.model_config.state_history_length) != 1:
+00125 |             raise ValueError(
+00126 |                 "state_history_length must remain 1; A2A history is carried separately"
+00127 |             )
+00128 | 
+00129 |         updated = {}
+00130 |         for embodiment, modalities in self.config.data.modality_configs.items():
+00131 |             modalities = deepcopy(modalities)
+00132 |             modalities["state"].delta_indices = list(range(-(history - 1), 1))
+00133 |             modalities["action"].delta_indices = list(range(future))
+00134 |             updated[embodiment] = modalities
+00135 |         self.config.data.modality_configs = updated
+00136 | 
+00137 |     def _get_processor_extra_kwargs(self) -> dict:
+00138 |         kwargs = {
+00139 |             "a2a_history_horizon": self.model_config.a2a_history_horizon,
+00140 |             "a2a_future_horizon": self.model_config.a2a_future_horizon,
+00141 |             "a2a_cold_start": self.model_config.a2a_cold_start,
+00142 |             "a2a_require_canonical_statistics": (
+00143 |                 self.model_config.a2a_require_canonical_statistics
+00144 |             ),
+00145 |             "a2a_require_explicit_channel_specs": (
+00146 |                 self.model_config.a2a_require_explicit_channel_specs
+00147 |             ),
+00148 |             "a2a_require_semantic_metadata": self.model_config.a2a_require_semantic_metadata,
+00149 |         }
+00150 |         if self.model_config.a2a_expected_contract_sha256 is not None:
+00151 |             kwargs["a2a_expected_contract_sha256"] = self.model_config.a2a_expected_contract_sha256
+00152 |         if self.model_config.a2a_channel_specs is not None:
+00153 |             kwargs["a2a_channel_specs"] = self.model_config.a2a_channel_specs
+00154 |         # A resumed A2A processor already embeds the canonical statistics. Do
+00155 |         # not re-open a possibly machine-local source path from the old run.
+00156 |         if (
+00157 |             self.config.training.start_from_checkpoint is None
+00158 |             and self.model_config.a2a_canonical_statistics_path is not None
+00159 |         ):
+00160 |             kwargs["a2a_canonical_statistics_path"] = (
+00161 |                 self.model_config.a2a_canonical_statistics_path
+00162 |             )
+00163 |         return kwargs
+00164 | 
+00165 |     def _get_model_extra_kwargs(self) -> dict:
+00166 |         """Apply the requested A2A experiment stage when loading a full checkpoint.
+00167 | 
+00168 |         In particular, an AE warmup checkpoint stores ``autoencoder`` in its
+00169 |         config. Loading it for the next ``joint`` stage must not silently retain
+00170 |         the old stage and freeze the FlowNet path.
+00171 |         """
+00172 |         fields = (
+00173 |             "action_horizon",
+00174 |             "a2a_history_horizon",
+00175 |             "a2a_future_horizon",
+00176 |             "a2a_latent_dim",
+00177 |             "a2a_encoder_channels",
+00178 |             "a2a_encoder_kernel_size",
+00179 |             "a2a_flow_blocks",
+00180 |             "a2a_flow_mlp_ratio",
+00181 |             "a2a_decoder_res_blocks",
+00182 |             "a2a_flow_backbone",
+00183 |             "a2a_dit_token_dim",
+00184 |             "a2a_dit_num_layers",
+00185 |             "a2a_dit_num_heads",
+00186 |             "a2a_dit_mlp_ratio",
+00187 |             "a2a_dit_dropout",
+00188 |             "a2a_lambda_fm",
+00189 |             "a2a_lambda_ae",
+00190 |             "a2a_lambda_ic",
+00191 |             "a2a_lambda_ic_action",
+00192 |             "a2a_lambda_aux",
+00193 |             "a2a_history_noise_train_std",
+00194 |             "a2a_history_noise_infer_std",
+00195 |             "a2a_num_inference_steps",
+00196 |             "a2a_ic_train_steps",
+00197 |             "a2a_include_current_state_condition",
+00198 |             "a2a_training_stage",
+00199 |             "a2a_strict_paper_architecture",
+00200 |             "a2a_channel_specs",
+00201 |             "a2a_require_explicit_channel_specs",
+00202 |             "a2a_require_semantic_metadata",
+00203 |             "a2a_expected_contract_sha256",
+00204 |             "a2a_require_canonical_statistics",
+00205 |             "a2a_cold_start",
+00206 |             "a2a_max_time_gap_s",
+00207 |         )
+00208 |         return {field: getattr(self.model_config, field) for field in fields}
+00209 | 
+00210 |     def _create_model(self):
+00211 |         model = super()._create_model()
+00212 |         if not isinstance(model, Gr00tN1d7A2A):
+00213 |             raise TypeError(
+00214 |                 "A2A pipeline loaded a non-A2A model. Use a2a_base_vla_checkpoint for an "
+00215 |                 "original N1.7 initializer and start_from_checkpoint only for full A2A resume."
+00216 |             )
+00217 |         base_checkpoint = self.model_config.a2a_base_vla_checkpoint
+00218 |         if base_checkpoint is None or self.config.training.start_from_checkpoint is not None:
+00219 |             return model
+00220 | 
+00221 |         logging.info("Loading base GR00T VLA allowlist from %s", base_checkpoint)
+00222 |         base_model = AutoModel.from_pretrained(
+00223 |             base_checkpoint,
+00224 |             transformers_loading_kwargs=self.transformers_loading_kwargs,
+00225 |             **self.transformers_loading_kwargs,
+00226 |         )
+00227 |         if getattr(base_model.config, "model_type", None) != "Gr00tN1d7":
+00228 |             raise ValueError(
+00229 |                 "a2a_base_vla_checkpoint must contain the original Gr00tN1d7 model, got "
+00230 |                 f"{getattr(base_model.config, 'model_type', None)!r}"
+00231 |             )
+00232 | 
+00233 |         # Strictly copy only the documented allowlist. Any backbone drift fails.
+00234 |         backbone_result = model.backbone.load_state_dict(
+00235 |             base_model.backbone.state_dict(), strict=True
+00236 |         )
+00237 |         reused = ["backbone.*"]
+00238 |         if hasattr(base_model.action_head, "vlln") and hasattr(model.action_head, "vlln"):
+00239 |             model.action_head.vlln.load_state_dict(
+00240 |                 base_model.action_head.vlln.state_dict(), strict=True
+00241 |             )
+00242 |             reused.append("action_head.vlln.*")
+00243 |         report = {
+00244 |             "source": str(base_checkpoint),
+00245 |             "source_model_type": base_model.config.model_type,
+00246 |             "reused_allowlist": reused,
+00247 |             "ignored": [
+00248 |                 "action_head.model.*",
+00249 |                 "action_head.state_encoder.*",
+00250 |                 "action_head.action_encoder.*",
+00251 |                 "action_head.action_decoder.*",
+00252 |             ],
+00253 |             "backbone_missing": list(backbone_result.missing_keys),
+00254 |             "backbone_unexpected": list(backbone_result.unexpected_keys),
+00255 |         }
+00256 |         report_path = self.save_cfg_dir / "base_vla_migration_report.json"
+00257 |         with run_or_wait_on_rank0(label="A2A base migration report") as is_rank0:
+00258 |             if is_rank0:
+00259 |                 with report_path.open("w", encoding="utf-8") as handle:
+00260 |                     json.dump(report, handle, indent=2)
+00261 |         del base_model
+00262 |         gc.collect()
+00263 |         logging.info("Base VLA migration report written to %s", report_path)
+00264 |         return model
+00265 | 
+00266 | 
+00267 | register_model(Gr00tN1d7A2AConfig, Gr00tN1d7A2APipeline)

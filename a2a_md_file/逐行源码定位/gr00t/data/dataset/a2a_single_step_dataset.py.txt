@@ -1,0 +1,288 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | 
+00004 | """Strict temporal-window dataset for action-to-action (A2A) training.
+00005 | 
+00006 | The regular single-step dataset historically shortened episodes using only the
+00007 | future action horizon.  That is insufficient for A2A, where proprioceptive
+00008 | history normally has negative ``delta_indices``.  Passing such an index to
+00009 | ``pandas.DataFrame.iloc`` silently reads from the end of the episode.
+00010 | 
+00011 | This module derives the valid base-step interval from *every* configured
+00012 | modality and validates the interval again immediately before extraction.  A2A
+00013 | training therefore never relies on pandas' negative-index behaviour.
+00014 | """
+00015 | 
+00016 | from dataclasses import dataclass
+00017 | from numbers import Integral
+00018 | from pathlib import Path
+00019 | 
+00020 | import numpy as np
+00021 | import pandas as pd
+00022 | 
+00023 | from gr00t.data.types import EmbodimentTag, MessageType, ModalityConfig, VLAStepData
+00024 | 
+00025 | from .sharded_single_step_dataset import ShardedSingleStepDataset, extract_step_data
+00026 | 
+00027 | 
+00028 | @dataclass(frozen=True)
+00029 | class A2AWindowBounds:
+00030 |     """Inclusive valid interval for a base step in one episode."""
+00031 | 
+00032 |     valid_start: int
+00033 |     valid_end: int
+00034 |     min_delta: int
+00035 |     max_delta: int
+00036 | 
+00037 |     @property
+00038 |     def num_steps(self) -> int:
+00039 |         """Number of base steps in the interval (zero for an empty interval)."""
+00040 | 
+00041 |         return max(0, self.valid_end - self.valid_start + 1)
+00042 | 
+00043 |     def contains(self, step_index: int) -> bool:
+00044 |         """Return whether ``step_index`` is inside the inclusive interval."""
+00045 | 
+00046 |         return self.valid_start <= step_index <= self.valid_end
+00047 | 
+00048 | 
+00049 | def is_a2a_model_config(model_config: object) -> bool:
+00050 |     """Return whether a model config requires strict A2A dataset windows."""
+00051 | 
+00052 |     if getattr(model_config, "model_type", "") == "Gr00tN1d7A2A":
+00053 |         return True
+00054 |     history_horizon = getattr(model_config, "a2a_history_horizon", None)
+00055 |     return (
+00056 |         isinstance(history_horizon, int)
+00057 |         and not isinstance(history_horizon, bool)
+00058 |         and history_horizon > 0
+00059 |     )
+00060 | 
+00061 | 
+00062 | def get_modality_delta_bounds(
+00063 |     modality_configs: dict[str, ModalityConfig],
+00064 | ) -> tuple[int, int]:
+00065 |     """Return the minimum and maximum delta across all configured modalities.
+00066 | 
+00067 |     Empty configurations are rejected because they would make the valid window
+00068 |     ambiguous.  ``bool`` is deliberately rejected even though it subclasses
+00069 |     ``int``: accepting ``True`` as a temporal offset is almost certainly a
+00070 |     configuration error.
+00071 |     """
+00072 | 
+00073 |     if not modality_configs:
+00074 |         raise ValueError("A2A requires at least one configured modality")
+00075 | 
+00076 |     deltas: list[int] = []
+00077 |     for modality, config in modality_configs.items():
+00078 |         if not config.delta_indices:
+00079 |             raise ValueError(f"Modality {modality!r} has no delta_indices")
+00080 |         for delta in config.delta_indices:
+00081 |             if isinstance(delta, bool) or not isinstance(delta, Integral):
+00082 |                 raise TypeError(f"Modality {modality!r} contains non-integer delta index {delta!r}")
+00083 |             deltas.append(int(delta))
+00084 | 
+00085 |     return min(deltas), max(deltas)
+00086 | 
+00087 | 
+00088 | def compute_a2a_window_bounds(
+00089 |     episode_length: int,
+00090 |     modality_configs: dict[str, ModalityConfig],
+00091 | ) -> A2AWindowBounds:
+00092 |     """Compute the inclusive base-step interval whose sampled indices are valid.
+00093 | 
+00094 |     For every configured delta ``d``, a valid base step ``t`` must satisfy
+00095 |     ``0 <= t + d < episode_length``.  Intersecting those inequalities gives::
+00096 | 
+00097 |         valid_start = max(0, -min_delta)
+00098 |         valid_end = episode_length - 1 - max_delta
+00099 | 
+00100 |     ``valid_end`` can be larger than ``episode_length - 1`` when every delta is
+00101 |     negative.  That is mathematically valid: the base step is an anchor and all
+00102 |     actually sampled indices still lie inside the episode.
+00103 |     """
+00104 | 
+00105 |     if isinstance(episode_length, bool) or not isinstance(episode_length, Integral):
+00106 |         raise TypeError(f"episode_length must be an integer, got {episode_length!r}")
+00107 |     if episode_length < 0:
+00108 |         raise ValueError(f"episode_length must be non-negative, got {episode_length}")
+00109 | 
+00110 |     min_delta, max_delta = get_modality_delta_bounds(modality_configs)
+00111 |     valid_start = max(0, -min_delta)
+00112 |     valid_end = int(episode_length) - 1 - max_delta
+00113 |     return A2AWindowBounds(valid_start, valid_end, min_delta, max_delta)
+00114 | 
+00115 | 
+00116 | def validate_a2a_step_index(
+00117 |     episode_length: int,
+00118 |     step_index: int,
+00119 |     modality_configs: dict[str, ModalityConfig],
+00120 | ) -> A2AWindowBounds:
+00121 |     """Validate a base step and every resulting physical row index.
+00122 | 
+00123 |     The second, explicit per-index check is intentionally redundant with the
+00124 |     interval algebra.  It keeps the safety property local to extraction if the
+00125 |     interval implementation is changed in the future.
+00126 |     """
+00127 | 
+00128 |     if isinstance(step_index, bool) or not isinstance(step_index, Integral):
+00129 |         raise TypeError(f"step_index must be an integer, got {step_index!r}")
+00130 |     step_index = int(step_index)
+00131 |     bounds = compute_a2a_window_bounds(episode_length, modality_configs)
+00132 |     if not bounds.contains(step_index):
+00133 |         raise IndexError(
+00134 |             f"A2A base step {step_index} is outside valid interval "
+00135 |             f"[{bounds.valid_start}, {bounds.valid_end}] for episode length "
+00136 |             f"{episode_length} and delta range [{bounds.min_delta}, {bounds.max_delta}]"
+00137 |         )
+00138 | 
+00139 |     invalid_indices = [
+00140 |         (modality, step_index + int(delta))
+00141 |         for modality, config in modality_configs.items()
+00142 |         for delta in config.delta_indices
+00143 |         if not 0 <= step_index + int(delta) < episode_length
+00144 |     ]
+00145 |     if invalid_indices:
+00146 |         raise IndexError(
+00147 |             "A2A extraction would access rows outside the episode: "
+00148 |             + ", ".join(f"{modality}={index}" for modality, index in invalid_indices)
+00149 |         )
+00150 |     return bounds
+00151 | 
+00152 | 
+00153 | def extract_a2a_step_data(
+00154 |     episode_data: pd.DataFrame,
+00155 |     step_index: int,
+00156 |     modality_configs: dict[str, ModalityConfig],
+00157 |     embodiment_tag: EmbodimentTag,
+00158 | ) -> VLAStepData:
+00159 |     """Safely extract one A2A window without temporal padding or wraparound."""
+00160 | 
+00161 |     bounds = validate_a2a_step_index(len(episode_data), step_index, modality_configs)
+00162 |     step = extract_step_data(
+00163 |         episode_data=episode_data,
+00164 |         step_index=int(step_index),
+00165 |         modality_configs=modality_configs,
+00166 |         embodiment_tag=embodiment_tag,
+00167 |         allow_padding=False,
+00168 |     )
+00169 |     step.metadata["a2a_window"] = {
+00170 |         "base_step_index": int(step_index),
+00171 |         "valid_start": bounds.valid_start,
+00172 |         "valid_end": bounds.valid_end,
+00173 |         "min_delta": bounds.min_delta,
+00174 |         "max_delta": bounds.max_delta,
+00175 |     }
+00176 |     return step
+00177 | 
+00178 | 
+00179 | class A2AShardedSingleStepDataset(ShardedSingleStepDataset):
+00180 |     """Single-step dataset using strict all-modality A2A temporal windows.
+00181 | 
+00182 |     Padding is intentionally not supported for training.  Runtime cold-start
+00183 |     padding belongs in the stateful policy/processor path, where a validity mask
+00184 |     can accompany repeated proprio observations.
+00185 |     """
+00186 | 
+00187 |     def __init__(
+00188 |         self,
+00189 |         dataset_path: str | Path,
+00190 |         embodiment_tag: EmbodimentTag,
+00191 |         modality_configs: dict[str, ModalityConfig],
+00192 |         shard_size: int = 2**10,
+00193 |         episode_sampling_rate: float = 0.1,
+00194 |         seed: int = 42,
+00195 |         allow_padding: bool = False,
+00196 |     ):
+00197 |         if allow_padding:
+00198 |             raise ValueError(
+00199 |                 "A2A training requires strict valid windows; allow_padding must be False. "
+00200 |                 "Handle inference cold-start padding in the policy/processor instead."
+00201 |             )
+00202 |         if not 0 < episode_sampling_rate <= 1:
+00203 |             raise ValueError(
+00204 |                 f"episode_sampling_rate must be in (0, 1] for A2A, got {episode_sampling_rate}"
+00205 |             )
+00206 |         if isinstance(shard_size, bool) or not isinstance(shard_size, Integral) or shard_size <= 0:
+00207 |             raise ValueError(f"shard_size must be a positive integer, got {shard_size!r}")
+00208 |         super().__init__(
+00209 |             dataset_path=dataset_path,
+00210 |             embodiment_tag=embodiment_tag,
+00211 |             modality_configs=modality_configs,
+00212 |             shard_size=int(shard_size),
+00213 |             episode_sampling_rate=episode_sampling_rate,
+00214 |             seed=seed,
+00215 |             allow_padding=False,
+00216 |         )
+00217 | 
+00218 |     def get_valid_step_bounds(self, episode_index: int) -> A2AWindowBounds:
+00219 |         """Return strict bounds for one episode."""
+00220 | 
+00221 |         return compute_a2a_window_bounds(
+00222 |             self.episode_loader.get_episode_length(episode_index), self.modality_configs
+00223 |         )
+00224 | 
+00225 |     def get_effective_episode_length(self, episode_index: int) -> int:
+00226 |         """Return the number of strict all-modality windows in an episode."""
+00227 | 
+00228 |         return self.get_valid_step_bounds(episode_index).num_steps
+00229 | 
+00230 |     def shard_dataset(self):
+00231 |         """Build balanced shards containing absolute, already-valid base steps."""
+00232 | 
+00233 |         shuffled_episode_indices = self.rng.permutation(len(self.episode_loader.episode_lengths))
+00234 |         num_splits = int(1 / self.episode_sampling_rate)
+00235 |         if len(shuffled_episode_indices) == 0:
+00236 |             raise AssertionError(f"No valid trajectories found for dataset {self.dataset_path}")
+00237 | 
+00238 |         episode_splits: list[tuple[int, np.ndarray]] = []
+00239 |         total_steps = 0
+00240 |         for ep_idx in shuffled_episode_indices:
+00241 |             bounds = self.get_valid_step_bounds(int(ep_idx))
+00242 |             step_indices = np.arange(bounds.valid_start, bounds.valid_end + 1, dtype=np.int64)
+00243 |             self.rng.shuffle(step_indices)
+00244 |             total_steps += len(step_indices)
+00245 |             for split_index in range(num_splits):
+00246 |                 split_step_indices = step_indices[split_index::num_splits]
+00247 |                 if len(split_step_indices) > 0:
+00248 |                     episode_splits.append((int(ep_idx), split_step_indices))
+00249 | 
+00250 |         if total_steps == 0 or not episode_splits:
+00251 |             min_delta, max_delta = get_modality_delta_bounds(self.modality_configs)
+00252 |             raise AssertionError(
+00253 |                 f"No valid A2A timesteps found for dataset {self.dataset_path}; "
+00254 |                 f"episodes do not cover delta range [{min_delta}, {max_delta}]"
+00255 |             )
+00256 | 
+00257 |         num_shards = min(int(np.ceil(total_steps / self.shard_size)), len(episode_splits))
+00258 |         sharded_episodes: list[list[tuple[int, np.ndarray]]] = [[] for _ in range(num_shards)]
+00259 |         shard_lengths = np.zeros(num_shards, dtype=int)
+00260 | 
+00261 |         for split_index, (ep_idx, split_step_indices) in enumerate(episode_splits):
+00262 |             shard_index = split_index if split_index < num_shards else int(np.argmin(shard_lengths))
+00263 |             sharded_episodes[shard_index].append((ep_idx, split_step_indices))
+00264 |             shard_lengths[shard_index] += len(split_step_indices)
+00265 | 
+00266 |         if not np.all(shard_lengths > 0):
+00267 |             raise AssertionError("All A2A shards must have length greater than zero")
+00268 | 
+00269 |         print(f"Generated {num_shards} A2A shards for dataset {self.dataset_path}")
+00270 |         print(
+00271 |             f"Total A2A steps: {total_steps}, average shard length: "
+00272 |             f"{total_steps / num_shards}, shard length std: {np.std(shard_lengths)}"
+00273 |         )
+00274 |         self.sharded_episodes = sharded_episodes
+00275 |         self.shard_lengths = shard_lengths
+00276 | 
+00277 |     def get_datapoint(self, episode_data: pd.DataFrame, step_index: int) -> dict:
+00278 |         """Extract a strict A2A window and apply the configured processor."""
+00279 | 
+00280 |         assert self.processor is not None, "Processor must be set before getting datapoints"
+00281 |         vla_step_data = extract_a2a_step_data(
+00282 |             episode_data=episode_data,
+00283 |             step_index=step_index,
+00284 |             modality_configs=self.modality_configs,
+00285 |             embodiment_tag=self.embodiment_tag,
+00286 |         )
+00287 |         messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
+00288 |         return self.processor(messages)

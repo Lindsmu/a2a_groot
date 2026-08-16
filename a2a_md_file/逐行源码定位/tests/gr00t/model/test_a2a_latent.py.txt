@@ -1,0 +1,364 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """CPU tests for the model-independent latent A2A building blocks."""
+00017 | 
+00018 | from gr00t.model.modules.a2a_latent import (
+00019 |     ActionTrajectoryDecoder,
+00020 |     ActionTrajectoryEncoder,
+00021 |     ActionTrajectoryTokenDecoder,
+00022 |     ActionTrajectoryTokenEncoder,
+00023 |     LatentDiTFlowNet,
+00024 |     LatentFlowNet,
+00025 |     SinusoidalTimeEmbedding,
+00026 |     VLMConditionPooler,
+00027 |     euler_integrate,
+00028 |     masked_l1_loss,
+00029 | )
+00030 | import pytest
+00031 | import torch
+00032 | 
+00033 | 
+00034 | def _small_encoder() -> ActionTrajectoryEncoder:
+00035 |     return ActionTrajectoryEncoder(
+00036 |         action_dim=6,
+00037 |         latent_dim=16,
+00038 |         num_embodiments=3,
+00039 |         conv_channels=(8, 12, 16),
+00040 |         kernel_size=5,
+00041 |     )
+00042 | 
+00043 | 
+00044 | class TestActionTrajectoryAutoencoder:
+00045 |     def test_encoder_decoder_shapes_and_gradients(self):
+00046 |         encoder = _small_encoder()
+00047 |         decoder = ActionTrajectoryDecoder(
+00048 |             action_dim=6,
+00049 |             action_horizon=5,
+00050 |             latent_dim=16,
+00051 |             hidden_dim=24,
+00052 |             num_embodiments=3,
+00053 |             num_blocks=4,
+00054 |         )
+00055 |         actions = torch.randn(3, 5, 6, requires_grad=True)
+00056 |         embodiment_ids = torch.tensor([0, 1, 2])
+00057 |         mask = torch.ones_like(actions, dtype=torch.bool)
+00058 |         mask[1, -1] = False
+00059 | 
+00060 |         latent = encoder(actions, embodiment_ids, mask)
+00061 |         reconstruction = decoder(latent, embodiment_ids, mask)
+00062 |         loss = masked_l1_loss(reconstruction, actions, mask)
+00063 |         loss.backward()
+00064 | 
+00065 |         assert latent.shape == (3, 16)
+00066 |         assert reconstruction.shape == (3, 5, 6)
+00067 |         assert torch.count_nonzero(reconstruction[1, -1]) == 0
+00068 |         assert actions.grad is not None
+00069 |         assert torch.isfinite(actions.grad).all()
+00070 |         assert all(parameter.grad is not None for parameter in encoder.parameters())
+00071 |         assert all(parameter.grad is not None for parameter in decoder.parameters())
+00072 | 
+00073 |     def test_masked_values_cannot_change_latent(self):
+00074 |         torch.manual_seed(7)
+00075 |         encoder = _small_encoder().eval()
+00076 |         actions = torch.randn(2, 7, 6)
+00077 |         mask = torch.ones_like(actions, dtype=torch.bool)
+00078 |         mask[:, -2:] = False
+00079 |         perturbed = actions.clone()
+00080 |         perturbed[~mask] = torch.nan
+00081 |         embodiment_ids = torch.tensor([0, 2])
+00082 | 
+00083 |         actual = encoder(actions, embodiment_ids, mask)
+00084 |         changed_only_under_mask = encoder(perturbed, embodiment_ids, mask)
+00085 | 
+00086 |         torch.testing.assert_close(actual, changed_only_under_mask, atol=0, rtol=0)
+00087 | 
+00088 |     def test_explicit_padding_matches_shorter_trajectory(self):
+00089 |         torch.manual_seed(11)
+00090 |         encoder = _small_encoder().eval()
+00091 |         short = torch.randn(2, 5, 6)
+00092 |         padded = torch.cat((short, torch.randn(2, 3, 6)), dim=1)
+00093 |         short_mask = torch.ones_like(short, dtype=torch.bool)
+00094 |         padded_mask = torch.zeros_like(padded, dtype=torch.bool)
+00095 |         padded_mask[:, : short.shape[1]] = True
+00096 |         embodiment_ids = torch.tensor([1, 2])
+00097 | 
+00098 |         short_latent = encoder(short, embodiment_ids, short_mask)
+00099 |         padded_latent = encoder(padded, embodiment_ids, padded_mask)
+00100 | 
+00101 |         torch.testing.assert_close(short_latent, padded_latent, atol=1e-6, rtol=1e-6)
+00102 | 
+00103 |     def test_all_masked_trajectory_maps_to_zero(self):
+00104 |         encoder = _small_encoder().eval()
+00105 |         actions = torch.randn(2, 4, 6)
+00106 |         latent = encoder(
+00107 |             actions,
+00108 |             torch.tensor([0, 1]),
+00109 |             torch.zeros_like(actions, dtype=torch.bool),
+00110 |         )
+00111 |         torch.testing.assert_close(latent, torch.zeros_like(latent), atol=0, rtol=0)
+00112 | 
+00113 | 
+00114 | class TestVLMConditionPooler:
+00115 |     def test_shape_and_mask_invariance(self):
+00116 |         torch.manual_seed(3)
+00117 |         pooler = VLMConditionPooler(input_dim=12, condition_dim=16, hidden_dim=20).eval()
+00118 |         hidden_states = torch.randn(2, 8, 12)
+00119 |         attention_mask = torch.tensor(
+00120 |             [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0]], dtype=torch.bool
+00121 |         )
+00122 |         image_mask = torch.tensor(
+00123 |             [[1, 1, 0, 0, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.bool
+00124 |         )
+00125 |         text_mask = attention_mask & ~image_mask
+00126 |         perturbed = hidden_states.clone()
+00127 |         perturbed[~attention_mask] = torch.nan
+00128 | 
+00129 |         condition = pooler(hidden_states, attention_mask, image_mask, text_mask)
+00130 |         perturbed_condition = pooler(perturbed, attention_mask, image_mask, text_mask)
+00131 | 
+00132 |         assert condition.shape == (2, 16)
+00133 |         torch.testing.assert_close(condition, perturbed_condition, atol=0, rtol=0)
+00134 | 
+00135 |     def test_missing_modality_masks_are_supported(self):
+00136 |         pooler = VLMConditionPooler(input_dim=4, condition_dim=6)
+00137 |         result = pooler(torch.randn(2, 3, 4), torch.ones(2, 3, dtype=torch.bool))
+00138 |         assert result.shape == (2, 6)
+00139 | 
+00140 | 
+00141 | class TestTemporalTokenAutoencoder:
+00142 |     def test_token_encoder_decoder_shapes_masks_and_gradients(self):
+00143 |         encoder = ActionTrajectoryTokenEncoder(
+00144 |             action_dim=6,
+00145 |             trajectory_horizon=5,
+00146 |             token_dim=16,
+00147 |             num_embodiments=3,
+00148 |             conv_channels=(8, 12, 16),
+00149 |             kernel_size=5,
+00150 |         )
+00151 |         decoder = ActionTrajectoryTokenDecoder(
+00152 |             action_dim=6,
+00153 |             action_horizon=5,
+00154 |             token_dim=16,
+00155 |             hidden_dim=24,
+00156 |             num_embodiments=3,
+00157 |             num_blocks=4,
+00158 |         )
+00159 |         actions = torch.randn(3, 5, 6, requires_grad=True)
+00160 |         embodiment_ids = torch.tensor([0, 1, 2])
+00161 |         mask = torch.ones_like(actions, dtype=torch.bool)
+00162 |         mask[1, -1] = False
+00163 | 
+00164 |         tokens = encoder(actions, embodiment_ids, mask)
+00165 |         reconstruction = decoder(tokens, embodiment_ids, mask)
+00166 |         masked_l1_loss(reconstruction, actions, mask).backward()
+00167 | 
+00168 |         assert tokens.shape == (3, 5, 16)
+00169 |         assert reconstruction.shape == (3, 5, 6)
+00170 |         assert torch.count_nonzero(tokens[1, -1]) == 0
+00171 |         assert torch.count_nonzero(reconstruction[1, -1]) == 0
+00172 |         assert actions.grad is not None and torch.isfinite(actions.grad).all()
+00173 |         assert all(parameter.grad is not None for parameter in encoder.parameters())
+00174 |         assert all(parameter.grad is not None for parameter in decoder.parameters())
+00175 | 
+00176 |     def test_masked_token_values_cannot_leak_through_temporal_convolutions(self):
+00177 |         torch.manual_seed(17)
+00178 |         encoder = ActionTrajectoryTokenEncoder(
+00179 |             action_dim=6,
+00180 |             trajectory_horizon=5,
+00181 |             token_dim=16,
+00182 |             num_embodiments=2,
+00183 |             conv_channels=(8, 12, 16),
+00184 |             kernel_size=5,
+00185 |         ).eval()
+00186 |         actions = torch.randn(2, 5, 6)
+00187 |         mask = torch.ones_like(actions, dtype=torch.bool)
+00188 |         mask[:, :2] = False
+00189 |         perturbed = actions.clone()
+00190 |         perturbed[~mask] = torch.nan
+00191 |         embodiment_ids = torch.tensor([0, 1])
+00192 | 
+00193 |         expected = encoder(actions, embodiment_ids, mask)
+00194 |         actual = encoder(perturbed, embodiment_ids, mask)
+00195 | 
+00196 |         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+00197 |         torch.testing.assert_close(actual[:, :2], torch.zeros_like(actual[:, :2]))
+00198 | 
+00199 | 
+00200 | class TestLatentFlow:
+00201 |     def test_time_embedding_shape_for_odd_dimension(self):
+00202 |         embedding = SinusoidalTimeEmbedding(7)(torch.tensor([0.0, 0.5, 1.0]))
+00203 |         assert embedding.shape == (3, 7)
+00204 |         assert torch.isfinite(embedding).all()
+00205 | 
+00206 |     def test_four_block_flownet_shape_and_gradient(self):
+00207 |         flow = LatentFlowNet(
+00208 |             latent_dim=16,
+00209 |             condition_dim=12,
+00210 |             time_embedding_dim=8,
+00211 |             hidden_dim=32,
+00212 |             num_blocks=4,
+00213 |         )
+00214 |         latent = torch.randn(3, 16, requires_grad=True)
+00215 |         condition = torch.randn(3, 12, requires_grad=True)
+00216 |         velocity = flow(latent, torch.tensor([0.0, 0.4, 1.0]), condition)
+00217 |         velocity.square().mean().backward()
+00218 | 
+00219 |         assert velocity.shape == latent.shape
+00220 |         assert latent.grad is not None and torch.isfinite(latent.grad).all()
+00221 |         assert condition.grad is not None and torch.isfinite(condition.grad).all()
+00222 |         assert len(flow.blocks) == 4
+00223 | 
+00224 |     def test_differentiable_euler_matches_constant_velocity_oracle(self):
+00225 |         initial = torch.randn(2, 3, requires_grad=True)
+00226 |         condition = torch.randn(2, 3, requires_grad=True)
+00227 | 
+00228 |         def constant_velocity(latent, timesteps, flow_condition):
+00229 |             del latent, timesteps
+00230 |             return flow_condition
+00231 | 
+00232 |         result, trajectory = euler_integrate(
+00233 |             constant_velocity,
+00234 |             initial,
+00235 |             condition,
+00236 |             num_steps=4,
+00237 |             return_trajectory=True,
+00238 |         )
+00239 |         torch.testing.assert_close(result, initial + condition)
+00240 |         assert trajectory.shape == (2, 5, 3)
+00241 | 
+00242 |         result.sum().backward()
+00243 |         torch.testing.assert_close(initial.grad, torch.ones_like(initial))
+00244 |         torch.testing.assert_close(condition.grad, torch.ones_like(condition))
+00245 | 
+00246 |     def test_euler_rejects_wrong_velocity_shape(self):
+00247 |         with pytest.raises(ValueError, match="velocity field returned shape"):
+00248 |             euler_integrate(lambda latent, time: latent[:, :-1], torch.randn(2, 4))
+00249 | 
+00250 |     def test_temporal_dit_shape_gradient_and_time_attention(self):
+00251 |         torch.manual_seed(23)
+00252 |         flow = LatentDiTFlowNet(
+00253 |             token_dim=16,
+00254 |             num_tokens=5,
+00255 |             condition_dim=12,
+00256 |             time_embedding_dim=8,
+00257 |             num_layers=2,
+00258 |             num_heads=4,
+00259 |             mlp_ratio=2,
+00260 |         )
+00261 |         latent = torch.randn(3, 5, 16, requires_grad=True)
+00262 |         condition = torch.randn(3, 12, requires_grad=True)
+00263 |         token_mask = torch.tensor(
+00264 |             [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]],
+00265 |             dtype=torch.bool,
+00266 |         )
+00267 |         velocity = flow(
+00268 |             latent,
+00269 |             torch.tensor([0.0, 0.4, 1.0]),
+00270 |             condition,
+00271 |             token_mask,
+00272 |         )
+00273 |         velocity.square().mean().backward()
+00274 | 
+00275 |         assert velocity.shape == latent.shape
+00276 |         assert latent.grad is not None and torch.isfinite(latent.grad).all()
+00277 |         assert condition.grad is not None and torch.isfinite(condition.grad).all()
+00278 |         assert len(flow.blocks) == 2
+00279 |         assert all(block.attention.num_heads == 4 for block in flow.blocks)
+00280 | 
+00281 |     def test_temporal_dit_uses_validity_embedding_for_cold_start(self):
+00282 |         torch.manual_seed(29)
+00283 |         flow = LatentDiTFlowNet(
+00284 |             token_dim=8,
+00285 |             num_tokens=4,
+00286 |             condition_dim=8,
+00287 |             time_embedding_dim=8,
+00288 |             num_layers=1,
+00289 |             num_heads=2,
+00290 |             mlp_ratio=2,
+00291 |         ).eval()
+00292 |         latent = torch.zeros(1, 4, 8)
+00293 |         time = torch.zeros(1)
+00294 |         condition = torch.randn(1, 8)
+00295 | 
+00296 |         full = flow(latent, time, condition, torch.ones(1, 4, dtype=torch.bool))
+00297 |         cold = flow(
+00298 |             latent,
+00299 |             time,
+00300 |             condition,
+00301 |             torch.tensor([[0, 0, 0, 1]], dtype=torch.bool),
+00302 |         )
+00303 | 
+00304 |         assert not torch.allclose(full, cold)
+00305 | 
+00306 |     def test_temporal_attention_couples_different_action_timesteps(self):
+00307 |         torch.manual_seed(37)
+00308 |         flow = LatentDiTFlowNet(
+00309 |             token_dim=8,
+00310 |             num_tokens=4,
+00311 |             condition_dim=8,
+00312 |             time_embedding_dim=8,
+00313 |             num_layers=1,
+00314 |             num_heads=2,
+00315 |             mlp_ratio=2,
+00316 |         ).eval()
+00317 |         latent = torch.randn(1, 4, 8)
+00318 |         changed = latent.clone()
+00319 |         changed[:, 0] += torch.linspace(0.1, 0.8, 8)
+00320 |         time = torch.tensor([0.3])
+00321 |         condition = torch.randn(1, 8)
+00322 | 
+00323 |         baseline_velocity = flow(latent, time, condition)
+00324 |         changed_velocity = flow(changed, time, condition)
+00325 | 
+00326 |         # Token 3 was not modified directly. A changed output there proves that
+00327 |         # token 0 communicated through temporal self-attention.
+00328 |         assert not torch.allclose(baseline_velocity[:, 3], changed_velocity[:, 3])
+00329 | 
+00330 |     def test_euler_integrates_temporal_token_latents(self):
+00331 |         initial = torch.randn(2, 4, 8, requires_grad=True)
+00332 |         condition = torch.randn(2, 4, 8, requires_grad=True)
+00333 | 
+00334 |         def constant_velocity(latent, timesteps, flow_condition):
+00335 |             del latent, timesteps
+00336 |             return flow_condition
+00337 | 
+00338 |         result, trajectory = euler_integrate(
+00339 |             constant_velocity,
+00340 |             initial,
+00341 |             condition,
+00342 |             num_steps=2,
+00343 |             return_trajectory=True,
+00344 |         )
+00345 | 
+00346 |         torch.testing.assert_close(result, initial + condition)
+00347 |         assert trajectory.shape == (2, 3, 4, 8)
+00348 | 
+00349 | 
+00350 | class TestMaskedL1:
+00351 |     def test_uses_only_valid_entries(self):
+00352 |         prediction = torch.tensor([[[1.0, 100.0], [3.0, 100.0]]])
+00353 |         target = torch.zeros_like(prediction)
+00354 |         mask = torch.tensor([[[1, 0], [1, 0]]], dtype=torch.bool)
+00355 |         assert masked_l1_loss(prediction, target, mask).item() == 2.0
+00356 | 
+00357 |     def test_all_false_mask_is_differentiable_zero(self):
+00358 |         prediction = torch.randn(2, 3, requires_grad=True)
+00359 |         loss = masked_l1_loss(
+00360 |             prediction, torch.zeros_like(prediction), torch.zeros_like(prediction)
+00361 |         )
+00362 |         loss.backward()
+00363 |         assert loss.item() == 0.0
+00364 |         torch.testing.assert_close(prediction.grad, torch.zeros_like(prediction))

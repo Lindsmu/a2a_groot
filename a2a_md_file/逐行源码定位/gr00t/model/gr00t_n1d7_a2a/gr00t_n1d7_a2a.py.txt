@@ -1,0 +1,704 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | 
+00004 | """GR00T N1.7 with vector-MLP or temporal-token DiT A2A flow matching."""
+00005 | 
+00006 | from __future__ import annotations
+00007 | 
+00008 | import logging
+00009 | from typing import Any
+00010 | 
+00011 | import torch
+00012 | from torch import nn
+00013 | import torch.nn.functional as F
+00014 | from transformers import AutoConfig, AutoModel, PreTrainedModel
+00015 | from transformers.feature_extraction_utils import BatchFeature
+00016 | import tree
+00017 | 
+00018 | from gr00t.configs.model.gr00t_n1d7_a2a import Gr00tN1d7A2AConfig
+00019 | from gr00t.model.gr00t_n1d7.gr00t_n1d7 import get_backbone_cls
+00020 | from gr00t.model.modules.a2a_latent import (
+00021 |     ActionTrajectoryDecoder,
+00022 |     ActionTrajectoryEncoder,
+00023 |     ActionTrajectoryTokenDecoder,
+00024 |     ActionTrajectoryTokenEncoder,
+00025 |     LatentDiTFlowNet,
+00026 |     LatentFlowNet,
+00027 |     VLMConditionPooler,
+00028 |     euler_integrate,
+00029 |     masked_l1_loss,
+00030 | )
+00031 | from gr00t.model.modules.embodiment_conditioned_mlp import CategorySpecificMLP
+00032 | 
+00033 | 
+00034 | logger = logging.getLogger(__name__)
+00035 | 
+00036 | 
+00037 | def _masked_bce_with_logits(
+00038 |     logits: torch.Tensor, target: torch.Tensor, mask: torch.Tensor
+00039 | ) -> torch.Tensor:
+00040 |     valid = mask.to(device=logits.device, dtype=torch.bool)
+00041 |     safe_logits = torch.where(valid, logits, torch.zeros_like(logits))
+00042 |     safe_target = torch.where(valid, target, torch.zeros_like(target))
+00043 |     loss = F.binary_cross_entropy_with_logits(safe_logits, safe_target, reduction="none")
+00044 |     weights = valid.to(dtype=loss.dtype)
+00045 |     return torch.where(valid, loss, torch.zeros_like(loss)).sum() / weights.sum().clamp_min(1.0)
+00046 | 
+00047 | 
+00048 | def _masked_categorical_cross_entropy(
+00049 |     logits: torch.Tensor,
+00050 |     target: torch.Tensor,
+00051 |     mask: torch.Tensor,
+00052 |     group_index: torch.Tensor,
+00053 | ) -> torch.Tensor:
+00054 |     """Cross entropy for variable-width categorical groups in a padded action tensor."""
+00055 |     if group_index.shape != logits.shape:
+00056 |         raise ValueError("categorical_group_index must match the padded action shape")
+00057 |     losses = []
+00058 |     for batch_index in range(logits.shape[0]):
+00059 |         groups = torch.unique(group_index[batch_index][group_index[batch_index] >= 0])
+00060 |         for group in groups.tolist():
+00061 |             channel_mask = (group_index[batch_index] == group).any(dim=0)
+00062 |             if not torch.any(channel_mask):
+00063 |                 continue
+00064 |             group_mask = mask[batch_index, :, channel_mask].bool()
+00065 |             step_mask = group_mask.any(dim=-1)
+00066 |             if not torch.any(step_mask):
+00067 |                 continue
+00068 |             if not torch.all(group_mask[step_mask]):
+00069 |                 raise ValueError("A categorical group must mask all of its class channels together")
+00070 |             group_target = target[batch_index, :, channel_mask][step_mask]
+00071 |             if not torch.allclose(
+00072 |                 group_target.sum(dim=-1),
+00073 |                 torch.ones(group_target.shape[0], device=target.device, dtype=target.dtype),
+00074 |                 atol=1e-5,
+00075 |                 rtol=0,
+00076 |             ):
+00077 |                 raise ValueError("Categorical A2A targets must be one-hot on valid timesteps")
+00078 |             class_index = group_target.argmax(dim=-1)
+00079 |             group_logits = logits[batch_index, :, channel_mask][step_mask]
+00080 |             losses.append(F.cross_entropy(group_logits, class_index))
+00081 |     if not losses:
+00082 |         return logits.sum() * 0.0
+00083 |     return torch.stack(losses).mean()
+00084 | 
+00085 | 
+00086 | class Gr00tN1d7A2AActionHead(nn.Module):
+00087 |     """Latent A2A generator with a paper-core MLP or temporal-token DiT backend."""
+00088 | 
+00089 |     supports_gradient_checkpointing = True
+00090 | 
+00091 |     def __init__(self, config: Gr00tN1d7A2AConfig):
+00092 |         super().__init__()
+00093 |         self.config = config
+00094 |         self.action_dim = int(config.max_action_dim)
+00095 |         self.action_horizon = int(config.a2a_future_horizon)
+00096 |         self.latent_dim = int(config.a2a_latent_dim)
+00097 |         self.flow_backbone = str(config.a2a_flow_backbone)
+00098 |         self.num_inference_timesteps = int(config.a2a_num_inference_steps)
+00099 |         self.training_stage = str(config.a2a_training_stage)
+00100 |         if self.training_stage not in {"autoencoder", "flow_only", "joint"}:
+00101 |             raise ValueError(f"Unsupported A2A training stage: {self.training_stage}")
+00102 |         if self.training_stage in {"autoencoder", "joint"} and not config.tune_projector:
+00103 |             raise ValueError(
+00104 |                 f"A2A {self.training_stage} stage requires tune_projector=True so the "
+00105 |                 "trajectory encoder/decoder are trainable; use flow_only only after "
+00106 |                 "loading a trained A2A checkpoint"
+00107 |             )
+00108 |         if self.training_stage == "autoencoder" and (config.tune_llm or config.tune_visual):
+00109 |             raise ValueError(
+00110 |                 "A2A autoencoder stage bypasses the VLM backbone, so tune_llm and "
+00111 |                 "tune_visual must both be False"
+00112 |             )
+00113 |         if self.training_stage in {"flow_only", "joint"} and not config.tune_diffusion_model:
+00114 |             raise ValueError(f"A2A {self.training_stage} stage requires tune_diffusion_model=True")
+00115 |         if int(config.a2a_num_inference_steps) <= 0 or int(config.a2a_ic_train_steps) <= 0:
+00116 |             raise ValueError("A2A Euler step counts must be positive")
+00117 |         if config.a2a_history_noise_train_std < 0 or config.a2a_history_noise_infer_std < 0:
+00118 |             raise ValueError("A2A history noise standard deviations must be non-negative")
+00119 |         loss_weights = (
+00120 |             config.a2a_lambda_fm,
+00121 |             config.a2a_lambda_ae,
+00122 |             config.a2a_lambda_ic,
+00123 |             config.a2a_lambda_ic_action,
+00124 |             config.a2a_lambda_aux,
+00125 |         )
+00126 |         if any(weight < 0 for weight in loss_weights):
+00127 |             raise ValueError("A2A loss weights must be non-negative")
+00128 |         # Revalidate here as callers may mutate a config after construction.
+00129 |         config.validate_paper_architecture()
+00130 |         self.mask_token = None  # Compatibility with the base pipeline's loader checks.
+00131 | 
+00132 |         self.vlln = (
+00133 |             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
+00134 |         )
+00135 |         self.condition_pooler = VLMConditionPooler(
+00136 |             input_dim=config.backbone_embedding_dim,
+00137 |             condition_dim=self.latent_dim,
+00138 |         )
+00139 |         self.current_state_projection = None
+00140 |         if config.a2a_include_current_state_condition:
+00141 |             self.current_state_projection = CategorySpecificMLP(
+00142 |                 num_categories=config.max_num_embodiments,
+00143 |                 input_dim=config.max_state_dim,
+00144 |                 hidden_dim=self.latent_dim,
+00145 |                 output_dim=self.latent_dim,
+00146 |             )
+00147 |         if self.flow_backbone == "mlp":
+00148 |             # Original paper-core path: pool the complete trajectory to one
+00149 |             # latent vector and predict its velocity with four AdaLN MLPs.
+00150 |             self.trajectory_encoder = ActionTrajectoryEncoder(
+00151 |                 action_dim=self.action_dim,
+00152 |                 latent_dim=self.latent_dim,
+00153 |                 num_embodiments=config.max_num_embodiments,
+00154 |                 conv_channels=tuple(config.a2a_encoder_channels),
+00155 |                 kernel_size=config.a2a_encoder_kernel_size,
+00156 |             )
+00157 |             self.trajectory_decoder = ActionTrajectoryDecoder(
+00158 |                 action_dim=self.action_dim,
+00159 |                 action_horizon=self.action_horizon,
+00160 |                 latent_dim=self.latent_dim,
+00161 |                 hidden_dim=self.latent_dim,
+00162 |                 num_embodiments=config.max_num_embodiments,
+00163 |                 num_blocks=config.a2a_decoder_res_blocks,
+00164 |                 expansion_factor=config.a2a_flow_mlp_ratio,
+00165 |             )
+00166 |             self.flow_net = LatentFlowNet(
+00167 |                 latent_dim=self.latent_dim,
+00168 |                 condition_dim=self.latent_dim,
+00169 |                 hidden_dim=self.latent_dim * config.a2a_flow_mlp_ratio,
+00170 |                 num_blocks=config.a2a_flow_blocks,
+00171 |             )
+00172 |             self.latent_summary_projection = nn.Identity()
+00173 |         else:
+00174 |             # Temporal-token ablation: Conv1d retains H tokens instead of
+00175 |             # pooling them. Attention now has a genuine trajectory time axis.
+00176 |             token_dim = int(config.a2a_dit_token_dim)
+00177 |             self.trajectory_encoder = ActionTrajectoryTokenEncoder(
+00178 |                 action_dim=self.action_dim,
+00179 |                 trajectory_horizon=self.action_horizon,
+00180 |                 token_dim=token_dim,
+00181 |                 num_embodiments=config.max_num_embodiments,
+00182 |                 conv_channels=tuple(config.a2a_encoder_channels),
+00183 |                 kernel_size=config.a2a_encoder_kernel_size,
+00184 |             )
+00185 |             self.trajectory_decoder = ActionTrajectoryTokenDecoder(
+00186 |                 action_dim=self.action_dim,
+00187 |                 action_horizon=self.action_horizon,
+00188 |                 token_dim=token_dim,
+00189 |                 hidden_dim=self.latent_dim,
+00190 |                 num_embodiments=config.max_num_embodiments,
+00191 |                 num_blocks=config.a2a_decoder_res_blocks,
+00192 |                 expansion_factor=config.a2a_flow_mlp_ratio,
+00193 |             )
+00194 |             self.flow_net = LatentDiTFlowNet(
+00195 |                 token_dim=token_dim,
+00196 |                 num_tokens=self.action_horizon,
+00197 |                 condition_dim=self.latent_dim,
+00198 |                 num_layers=config.a2a_dit_num_layers,
+00199 |                 num_heads=config.a2a_dit_num_heads,
+00200 |                 mlp_ratio=config.a2a_dit_mlp_ratio,
+00201 |                 dropout=config.a2a_dit_dropout,
+00202 |             )
+00203 |             # Auxiliary action types still use the established 512-D interface.
+00204 |             # Pooling happens only after the DiT has produced future tokens.
+00205 |             self.latent_summary_projection = nn.Sequential(
+00206 |                 nn.LayerNorm(token_dim),
+00207 |                 nn.Linear(token_dim, self.latent_dim),
+00208 |             )
+00209 |         self.auxiliary_head = CategorySpecificMLP(
+00210 |             num_categories=config.max_num_embodiments,
+00211 |             input_dim=2 * self.latent_dim,
+00212 |             hidden_dim=self.latent_dim,
+00213 |             output_dim=self.action_horizon * self.action_dim,
+00214 |         )
+00215 |         self.set_trainable_parameters(
+00216 |             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
+00217 |         )
+00218 | 
+00219 |     def set_trainable_parameters(
+00220 |         self, tune_projector: bool, tune_flow: bool, tune_vlln: bool
+00221 |     ) -> None:
+00222 |         projector_modules = (
+00223 |             self.condition_pooler,
+00224 |             self.trajectory_encoder,
+00225 |             self.trajectory_decoder,
+00226 |             self.latent_summary_projection,
+00227 |             self.auxiliary_head,
+00228 |         )
+00229 |         for module in projector_modules:
+00230 |             module.requires_grad_(tune_projector)
+00231 |         if self.current_state_projection is not None:
+00232 |             self.current_state_projection.requires_grad_(tune_projector)
+00233 |         self.flow_net.requires_grad_(tune_flow)
+00234 |         self.vlln.requires_grad_(tune_vlln)
+00235 |         if self.training_stage == "autoencoder":
+00236 |             self.condition_pooler.requires_grad_(False)
+00237 |             if self.current_state_projection is not None:
+00238 |                 self.current_state_projection.requires_grad_(False)
+00239 |             self.auxiliary_head.requires_grad_(False)
+00240 |             self.flow_net.requires_grad_(False)
+00241 |             self.vlln.requires_grad_(False)
+00242 |         elif self.training_stage == "flow_only":
+00243 |             self.trajectory_encoder.requires_grad_(False)
+00244 |             self.trajectory_decoder.requires_grad_(False)
+00245 | 
+00246 |     def set_frozen_modules_to_eval_mode(self) -> None:
+00247 |         for module in (
+00248 |             self.vlln,
+00249 |             self.condition_pooler,
+00250 |             self.trajectory_encoder,
+00251 |             self.trajectory_decoder,
+00252 |             self.latent_summary_projection,
+00253 |             self.flow_net,
+00254 |             self.auxiliary_head,
+00255 |             self.current_state_projection,
+00256 |         ):
+00257 |             if module is not None and not any(
+00258 |                 parameter.requires_grad for parameter in module.parameters()
+00259 |             ):
+00260 |                 module.eval()
+00261 | 
+00262 |     def prepare_input(self, batch: dict) -> BatchFeature:
+00263 |         return BatchFeature(data=batch)
+00264 | 
+00265 |     def _condition(self, backbone_output: BatchFeature, action_input: BatchFeature) -> torch.Tensor:
+00266 |         features = self.vlln(backbone_output["backbone_features"])
+00267 |         attention_mask = backbone_output.get("backbone_attention_mask")
+00268 |         image_mask = backbone_output.get("image_mask")
+00269 |         text_mask = None
+00270 |         if image_mask is not None:
+00271 |             if attention_mask is None:
+00272 |                 text_mask = ~image_mask.bool()
+00273 |             else:
+00274 |                 text_mask = attention_mask.bool() & ~image_mask.bool()
+00275 |         condition = self.condition_pooler(features, attention_mask, image_mask, text_mask)
+00276 |         if self.current_state_projection is not None:
+00277 |             state = action_input["state"]
+00278 |             embodiment_id = action_input["embodiment_id"].long()
+00279 |             state_condition = self.current_state_projection(state, embodiment_id).mean(dim=1)
+00280 |             condition = condition + state_condition
+00281 |         return condition
+00282 | 
+00283 |     def _masks(self, action_input: BatchFeature) -> tuple[torch.Tensor, ...]:
+00284 |         masks = tuple(
+00285 |             action_input[name].to(dtype=action_input["history_action_canonical"].dtype)
+00286 |             for name in (
+00287 |                 "continuous_action_mask",
+00288 |                 "auxiliary_action_mask",
+00289 |                 "binary_action_mask",
+00290 |                 "categorical_action_mask",
+00291 |             )
+00292 |         )
+00293 |         continuous, auxiliary, binary, categorical = masks
+00294 |         for name, mask in zip(
+00295 |             ("continuous", "auxiliary", "binary", "categorical"), masks, strict=True
+00296 |         ):
+00297 |             if not torch.all(torch.isfinite(mask)) or not torch.all((mask == 0) | (mask == 1)):
+00298 |                 raise ValueError(f"A2A {name} channel mask must contain only finite 0/1 values")
+00299 |         covered = continuous + auxiliary + binary + categorical
+00300 |         if torch.any(covered > 1.0 + 1e-6):
+00301 |             raise ValueError("A2A channel masks overlap")
+00302 |         future_mask = action_input["future_action_mask"].to(dtype=covered.dtype)
+00303 |         if not torch.all(torch.isfinite(future_mask)) or not torch.all(
+00304 |             (future_mask == 0) | (future_mask == 1)
+00305 |         ):
+00306 |             raise ValueError("A2A future_action_mask must contain only finite 0/1 values")
+00307 |         if torch.any(future_mask.bool() & ~covered.bool()):
+00308 |             raise ValueError("A2A future action contains channels with no generation head")
+00309 |         if torch.any(covered.bool() & ~future_mask.bool()):
+00310 |             raise ValueError("A2A generation masks must be zero outside future_action_mask padding")
+00311 |         continuous_per_sample = continuous.flatten(1).sum(dim=-1)
+00312 |         if torch.any(continuous_per_sample <= 0):
+00313 |             bad = torch.nonzero(continuous_per_sample <= 0).flatten().tolist()
+00314 |             raise ValueError(
+00315 |                 "Latent A2A requires continuous mapped channels for every sample; "
+00316 |                 f"missing batch indices={bad}"
+00317 |             )
+00318 |         return masks
+00319 | 
+00320 |     def _validate_action_input(self, action_input: BatchFeature, require_future: bool) -> None:
+00321 |         embodiment_id = action_input["embodiment_id"]
+00322 |         if embodiment_id.ndim != 1:
+00323 |             raise ValueError("embodiment_id must have shape [B]")
+00324 |         batch_size = embodiment_id.shape[0]
+00325 |         if torch.any(embodiment_id < 0) or torch.any(
+00326 |             embodiment_id >= self.config.max_num_embodiments
+00327 |         ):
+00328 |             raise ValueError("embodiment_id is outside the configured category range")
+00329 |         history_shape = (
+00330 |             batch_size,
+00331 |             int(self.config.a2a_history_horizon),
+00332 |             self.action_dim,
+00333 |         )
+00334 |         future_shape = (batch_size, self.action_horizon, self.action_dim)
+00335 |         for name in ("history_action_canonical", "history_action_mask"):
+00336 |             if tuple(action_input[name].shape) != history_shape:
+00337 |                 raise ValueError(
+00338 |                     f"{name} must have shape {history_shape}, got {tuple(action_input[name].shape)}"
+00339 |                 )
+00340 |         future_names = (
+00341 |             "future_action_mask",
+00342 |             "continuous_action_mask",
+00343 |             "auxiliary_action_mask",
+00344 |             "binary_action_mask",
+00345 |             "categorical_action_mask",
+00346 |         )
+00347 |         if require_future:
+00348 |             future_names = ("future_action_canonical", *future_names)
+00349 |         for name in future_names:
+00350 |             if tuple(action_input[name].shape) != future_shape:
+00351 |                 raise ValueError(
+00352 |                     f"{name} must have shape {future_shape}, got {tuple(action_input[name].shape)}"
+00353 |                 )
+00354 |         history_mask = action_input["history_action_mask"]
+00355 |         if not torch.all(torch.isfinite(history_mask)) or not torch.all(
+00356 |             (history_mask == 0) | (history_mask == 1)
+00357 |         ):
+00358 |             raise ValueError("history_action_mask must contain only finite 0/1 values")
+00359 |         valid_history = history_mask.bool()
+00360 |         history = action_input["history_action_canonical"]
+00361 |         if torch.any(valid_history & ~torch.isfinite(history)):
+00362 |             raise ValueError("history_action_canonical is non-finite under its active mask")
+00363 |         if torch.any(valid_history.flatten(1).sum(dim=-1) <= 0):
+00364 |             raise ValueError("Every A2A sample must contain at least one real history value")
+00365 |         if require_future:
+00366 |             valid_future = action_input["future_action_mask"].bool()
+00367 |             future = action_input["future_action_canonical"]
+00368 |             if torch.any(valid_future & ~torch.isfinite(future)):
+00369 |                 raise ValueError("future_action_canonical is non-finite under its active mask")
+00370 |         if self.current_state_projection is not None:
+00371 |             expected_state_shape = (batch_size, 1, int(self.config.max_state_dim))
+00372 |             state = action_input.get("state")
+00373 |             if state is None or tuple(state.shape) != expected_state_shape:
+00374 |                 raise ValueError(
+00375 |                     f"Current-state A2A ablation requires state with shape {expected_state_shape}"
+00376 |                 )
+00377 |             if not torch.all(torch.isfinite(state)):
+00378 |                 raise ValueError("Current-state A2A condition contains NaN or infinity")
+00379 | 
+00380 |     @staticmethod
+00381 |     def _validate_continuous_channel_support(
+00382 |         history_mask: torch.Tensor, continuous_mask: torch.Tensor
+00383 |     ) -> None:
+00384 |         history_support = history_mask.bool().any(dim=1)
+00385 |         continuous_support = continuous_mask.bool().any(dim=1)
+00386 |         if not torch.equal(history_support, continuous_support):
+00387 |             raise ValueError(
+00388 |                 "A2A history and future continuous masks must describe the same channels"
+00389 |             )
+00390 | 
+00391 |     def _auxiliary_logits(
+00392 |         self, condition: torch.Tensor, latent: torch.Tensor, embodiment_id: torch.Tensor
+00393 |     ) -> torch.Tensor:
+00394 |         if latent.ndim == 2:
+00395 |             latent_summary = latent
+00396 |         elif latent.ndim == 3 and self.flow_backbone == "dit":
+00397 |             latent_summary = self.latent_summary_projection(latent.mean(dim=1))
+00398 |         else:
+00399 |             raise ValueError(f"Unexpected A2A latent shape: {tuple(latent.shape)}")
+00400 |         features = torch.cat((condition, latent_summary), dim=-1).unsqueeze(1)
+00401 |         output = self.auxiliary_head(features, embodiment_id).squeeze(1)
+00402 |         return output.reshape(-1, self.action_horizon, self.action_dim)
+00403 | 
+00404 |     def _flow_velocity(
+00405 |         self,
+00406 |         latent: torch.Tensor,
+00407 |         timesteps: torch.Tensor,
+00408 |         condition: torch.Tensor,
+00409 |         history_time_mask: torch.Tensor | None = None,
+00410 |     ) -> torch.Tensor:
+00411 |         """Dispatch to the selected velocity network without changing FM semantics."""
+00412 |         if self.flow_backbone == "dit":
+00413 |             return self.flow_net(
+00414 |                 latent,
+00415 |                 timesteps,
+00416 |                 condition,
+00417 |                 token_mask=history_time_mask,
+00418 |             )
+00419 |         return self.flow_net(latent, timesteps, condition)
+00420 | 
+00421 |     @staticmethod
+00422 |     def _latent_pair_distance(z0: torch.Tensor, z1: torch.Tensor) -> torch.Tensor:
+00423 |         """Report one Euclidean history/future distance per batch item."""
+00424 |         return (z1 - z0).flatten(1).norm(dim=-1).mean()
+00425 | 
+00426 |     def _decode_and_merge(
+00427 |         self,
+00428 |         latent: torch.Tensor,
+00429 |         condition: torch.Tensor,
+00430 |         embodiment_id: torch.Tensor,
+00431 |         masks: tuple[torch.Tensor, ...],
+00432 |     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+00433 |         continuous_mask, auxiliary_mask, binary_mask, categorical_mask = masks
+00434 |         continuous = self.trajectory_decoder(latent, embodiment_id, continuous_mask)
+00435 |         auxiliary_logits = self._auxiliary_logits(condition, latent, embodiment_id)
+00436 |         regression = torch.tanh(auxiliary_logits)
+00437 |         discrete = torch.sigmoid(auxiliary_logits)
+00438 |         action = (
+00439 |             continuous * continuous_mask
+00440 |             + regression * auxiliary_mask
+00441 |             + discrete * (binary_mask + categorical_mask)
+00442 |         )
+00443 |         return action, continuous, auxiliary_logits
+00444 | 
+00445 |     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
+00446 |         self.set_frozen_modules_to_eval_mode()
+00447 |         self._validate_action_input(action_input, require_future=True)
+00448 |         embodiment_id = action_input["embodiment_id"].long()
+00449 |         history = action_input["history_action_canonical"]
+00450 |         future = action_input["future_action_canonical"]
+00451 |         history_mask = action_input["history_action_mask"]
+00452 |         masks = self._masks(action_input)
+00453 |         continuous_mask, auxiliary_mask, binary_mask, categorical_mask = masks
+00454 |         self._validate_continuous_channel_support(history_mask, continuous_mask)
+00455 | 
+00456 |         noise_std = float(self.config.a2a_history_noise_train_std)
+00457 |         if self.training and noise_std > 0:
+00458 |             history = history + noise_std * torch.randn_like(history) * history_mask
+00459 | 
+00460 |         # The very same trajectory encoder maps executed history and future
+00461 |         # demonstration into z0/z1, as required by latent A2A.
+00462 |         z1 = self.trajectory_encoder(future, embodiment_id, continuous_mask)
+00463 |         future_reconstruction = self.trajectory_decoder(z1, embodiment_id, continuous_mask)
+00464 |         loss_ae = masked_l1_loss(future_reconstruction, future, continuous_mask)
+00465 |         if self.training_stage == "autoencoder":
+00466 |             z0 = self.trajectory_encoder(history, embodiment_id, history_mask)
+00467 |             zero = loss_ae * 0.0
+00468 |             return BatchFeature(
+00469 |                 data={
+00470 |                     "loss": loss_ae,
+00471 |                     "loss_fm": zero,
+00472 |                     "loss_ae": loss_ae,
+00473 |                     "loss_ic": zero,
+00474 |                     "loss_ic_latent": zero,
+00475 |                     "loss_ic_action": zero,
+00476 |                     "loss_aux": zero,
+00477 |                     "loss_aux_regression": zero,
+00478 |                     "loss_aux_binary": zero,
+00479 |                     "loss_aux_categorical": zero,
+00480 |                     "action_pred": future_reconstruction,
+00481 |                     "z0": z0,
+00482 |                     "z1": z1,
+00483 |                     "z1_inferred": z1,
+00484 |                     "latent_std": torch.cat((z0, z1), dim=0).std(unbiased=False),
+00485 |                     "latent_pair_distance": self._latent_pair_distance(z0, z1),
+00486 |                 }
+00487 |             )
+00488 | 
+00489 |         condition = self._condition(backbone_output, action_input)
+00490 |         z0 = self.trajectory_encoder(history, embodiment_id, history_mask)
+00491 |         tau = torch.rand(z0.shape[0], device=z0.device, dtype=torch.float32)
+00492 |         path_tau = tau.to(dtype=z0.dtype)
+00493 |         # Broadcast one sampled flow time over either [D] (MLP) or [H, D]
+00494 |         # (DiT). The linear OT path and target velocity are otherwise identical.
+00495 |         path_tau = path_tau.reshape((z0.shape[0],) + (1,) * (z0.ndim - 1))
+00496 |         z_tau = (1.0 - path_tau) * z0 + path_tau * z1
+00497 |         target_velocity = z1 - z0
+00498 |         history_time_mask = history_mask.bool().any(dim=-1)
+00499 |         predicted_velocity = self._flow_velocity(
+00500 |             z_tau,
+00501 |             tau,
+00502 |             condition,
+00503 |             history_time_mask,
+00504 |         )
+00505 |         loss_fm = F.mse_loss(predicted_velocity, target_velocity)
+00506 | 
+00507 |         def velocity_field(latent, timesteps, flow_condition):
+00508 |             # Capture the real-history validity pattern for every differentiable
+00509 |             # Euler step. Invalid cold-start queries still generate future tokens.
+00510 |             return self._flow_velocity(
+00511 |                 latent,
+00512 |                 timesteps,
+00513 |                 flow_condition,
+00514 |                 history_time_mask,
+00515 |             )
+00516 | 
+00517 |         z1_inferred = euler_integrate(
+00518 |             velocity_field,
+00519 |             z0,
+00520 |             condition,
+00521 |             num_steps=int(self.config.a2a_ic_train_steps),
+00522 |         )
+00523 |         action_inferred, _, auxiliary_logits = self._decode_and_merge(
+00524 |             z1_inferred, condition, embodiment_id, masks
+00525 |         )
+00526 |         loss_ic_latent = F.l1_loss(z1_inferred, z1)
+00527 |         loss_ic_action = masked_l1_loss(action_inferred, future, continuous_mask)
+00528 |         loss_ic = loss_ic_latent + self.config.a2a_lambda_ic_action * loss_ic_action
+00529 | 
+00530 |         loss_aux_regression = masked_l1_loss(torch.tanh(auxiliary_logits), future, auxiliary_mask)
+00531 |         loss_aux_binary = _masked_bce_with_logits(auxiliary_logits, future, binary_mask)
+00532 |         categorical_group_index = action_input.get("categorical_group_index")
+00533 |         if categorical_group_index is None:
+00534 |             if categorical_mask.sum() > 0:
+00535 |                 raise ValueError("categorical_group_index is required for categorical actions")
+00536 |             categorical_group_index = torch.full_like(categorical_mask, -1, dtype=torch.long)
+00537 |         loss_aux_categorical = _masked_categorical_cross_entropy(
+00538 |             auxiliary_logits,
+00539 |             future,
+00540 |             categorical_mask,
+00541 |             categorical_group_index.long(),
+00542 |         )
+00543 |         loss_aux = loss_aux_regression + loss_aux_binary + loss_aux_categorical
+00544 |         full_joint_loss = (
+00545 |             self.config.a2a_lambda_fm * loss_fm
+00546 |             + self.config.a2a_lambda_ae * loss_ae
+00547 |             + self.config.a2a_lambda_ic * loss_ic
+00548 |             + self.config.a2a_lambda_aux * loss_aux
+00549 |         )
+00550 |         if self.training_stage == "autoencoder":
+00551 |             loss = loss_ae
+00552 |         elif self.training_stage == "flow_only":
+00553 |             loss = (
+00554 |                 self.config.a2a_lambda_fm * loss_fm
+00555 |                 + self.config.a2a_lambda_ic * loss_ic
+00556 |                 + self.config.a2a_lambda_aux * loss_aux
+00557 |             )
+00558 |         else:
+00559 |             loss = full_joint_loss
+00560 | 
+00561 |         return BatchFeature(
+00562 |             data={
+00563 |                 "loss": loss,
+00564 |                 "loss_fm": loss_fm,
+00565 |                 "loss_ae": loss_ae,
+00566 |                 "loss_ic": loss_ic,
+00567 |                 "loss_ic_latent": loss_ic_latent,
+00568 |                 "loss_ic_action": loss_ic_action,
+00569 |                 "loss_aux": loss_aux,
+00570 |                 "loss_aux_regression": loss_aux_regression,
+00571 |                 "loss_aux_binary": loss_aux_binary,
+00572 |                 "loss_aux_categorical": loss_aux_categorical,
+00573 |                 "action_pred": action_inferred,
+00574 |                 "z0": z0,
+00575 |                 "z1": z1,
+00576 |                 "z1_inferred": z1_inferred,
+00577 |                 "latent_std": torch.cat((z0, z1), dim=0).std(unbiased=False),
+00578 |                 "latent_pair_distance": self._latent_pair_distance(z0, z1),
+00579 |             }
+00580 |         )
+00581 | 
+00582 |     @torch.no_grad()
+00583 |     def get_action(
+00584 |         self,
+00585 |         backbone_output: BatchFeature,
+00586 |         action_input: BatchFeature,
+00587 |         options: dict[str, Any] | None = None,
+00588 |     ) -> BatchFeature:
+00589 |         self.set_frozen_modules_to_eval_mode()
+00590 |         self._validate_action_input(action_input, require_future=False)
+00591 |         condition = self._condition(backbone_output, action_input)
+00592 |         embodiment_id = action_input["embodiment_id"].long()
+00593 |         history = action_input["history_action_canonical"]
+00594 |         history_mask = action_input["history_action_mask"]
+00595 |         masks = self._masks(action_input)
+00596 |         self._validate_continuous_channel_support(history_mask, masks[0])
+00597 |         noise_std = float(self.config.a2a_history_noise_infer_std)
+00598 |         if noise_std > 0:
+00599 |             history = history + noise_std * torch.randn_like(history) * history_mask
+00600 |         z0 = self.trajectory_encoder(history, embodiment_id, history_mask)
+00601 |         history_time_mask = history_mask.bool().any(dim=-1)
+00602 |         num_steps = self.num_inference_timesteps
+00603 |         if options is not None and "num_inference_steps" in options:
+00604 |             num_steps = int(options["num_inference_steps"])
+00605 | 
+00606 |         def velocity_field(latent, timesteps, flow_condition):
+00607 |             return self._flow_velocity(
+00608 |                 latent,
+00609 |                 timesteps,
+00610 |                 flow_condition,
+00611 |                 history_time_mask,
+00612 |             )
+00613 | 
+00614 |         z1_inferred = euler_integrate(velocity_field, z0, condition, num_steps=num_steps)
+00615 |         action, _, _ = self._decode_and_merge(z1_inferred, condition, embodiment_id, masks)
+00616 |         return BatchFeature(
+00617 |             data={
+00618 |                 "action_pred": action,
+00619 |                 "z0": z0,
+00620 |                 "z1_inferred": z1_inferred,
+00621 |                 "num_inference_steps": num_steps,
+00622 |             }
+00623 |         )
+00624 | 
+00625 | 
+00626 | class Gr00tN1d7A2A(PreTrainedModel):
+00627 |     """GR00T VLM backbone plus the latent A2A action head."""
+00628 | 
+00629 |     config_class = Gr00tN1d7A2AConfig
+00630 |     supports_gradient_checkpointing = True
+00631 | 
+00632 |     def __init__(
+00633 |         self,
+00634 |         config: Gr00tN1d7A2AConfig,
+00635 |         transformers_loading_kwargs: dict = {"trust_remote_code": True},
+00636 |     ):
+00637 |         super().__init__(config)
+00638 |         self.config = config
+00639 |         backbone_cls = get_backbone_cls(config)
+00640 |         self.backbone = backbone_cls(
+00641 |             model_name=config.model_name,
+00642 |             tune_llm=config.tune_llm,
+00643 |             tune_visual=config.tune_visual,
+00644 |             select_layer=config.select_layer,
+00645 |             reproject_vision=config.reproject_vision,
+00646 |             use_flash_attention=config.use_flash_attention,
+00647 |             load_bf16=config.load_bf16,
+00648 |             tune_top_llm_layers=config.tune_top_llm_layers,
+00649 |             trainable_params_fp32=config.backbone_trainable_params_fp32,
+00650 |             transformers_loading_kwargs=transformers_loading_kwargs,
+00651 |         )
+00652 |         self.action_head = Gr00tN1d7A2AActionHead(config)
+00653 |         from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7DataCollator
+00654 | 
+00655 |         self.collator = Gr00tN1d7DataCollator(
+00656 |             model_name=config.model_name,
+00657 |             model_type=config.backbone_model_type,
+00658 |             transformers_loading_kwargs=transformers_loading_kwargs,
+00659 |         )
+00660 | 
+00661 |     def prepare_input(self, inputs: dict) -> tuple[BatchFeature, BatchFeature]:
+00662 |         inputs = dict(inputs)
+00663 |         if "vlm_content" in inputs:
+00664 |             contents = inputs.pop("vlm_content")
+00665 |             if not isinstance(contents, list):
+00666 |                 contents = [contents]
+00667 |             inputs.update(
+00668 |                 self.collator([{"vlm_content": content} for content in contents])["inputs"]
+00669 |             )
+00670 |         backbone_inputs = self.backbone.prepare_input(inputs)
+00671 |         action_inputs = self.action_head.prepare_input(inputs)
+00672 | 
+00673 |         def move(value):
+00674 |             if torch.is_floating_point(value):
+00675 |                 return value.to(self.device, dtype=self.dtype)
+00676 |             return value.to(self.device)
+00677 | 
+00678 |         return (
+00679 |             tree.map_structure(move, backbone_inputs),
+00680 |             tree.map_structure(move, action_inputs),
+00681 |         )
+00682 | 
+00683 |     def forward(self, inputs: dict) -> BatchFeature:
+00684 |         backbone_inputs, action_inputs = self.prepare_input(inputs)
+00685 |         if self.action_head.training_stage == "autoencoder":
+00686 |             return self.action_head(None, action_inputs)
+00687 |         return self.action_head(self.backbone(backbone_inputs), action_inputs)
+00688 | 
+00689 |     @torch.no_grad()
+00690 |     def get_action(self, inputs: dict, options: dict[str, Any] | None = None) -> BatchFeature:
+00691 |         backbone_inputs, action_inputs = self.prepare_input(inputs)
+00692 |         return self.action_head.get_action(self.backbone(backbone_inputs), action_inputs, options)
+00693 | 
+00694 |     @property
+00695 |     def device(self):
+00696 |         return next(iter(self.parameters())).device
+00697 | 
+00698 |     @property
+00699 |     def dtype(self):
+00700 |         return next(iter(self.parameters())).dtype
+00701 | 
+00702 | 
+00703 | AutoConfig.register("Gr00tN1d7A2A", Gr00tN1d7A2AConfig)
+00704 | AutoModel.register(Gr00tN1d7A2AConfig, Gr00tN1d7A2A)

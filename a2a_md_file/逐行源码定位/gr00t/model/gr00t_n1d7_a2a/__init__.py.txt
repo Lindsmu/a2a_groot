@@ -1,0 +1,4 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Latent action-to-action GR00T N1.7 model variant."""
+00004 | 

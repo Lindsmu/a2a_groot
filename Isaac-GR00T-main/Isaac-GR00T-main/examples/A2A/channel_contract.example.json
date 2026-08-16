@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "embodiment": "new_embodiment",
+  "feature_dim": 132,
+  "history_horizon": 8,
+  "future_horizon": 8,
+  "channels": [
+    {
+      "action_key": "eef_pose_canonical",
+      "source_state_key": "eef_pose_canonical",
+      "kind": "continuous",
+      "start": 0,
+      "end": 9,
+      "canonical_format": "xyz_rot6d",
+      "source_format": "xyz_rot6d",
+      "target_format": "xyz_rot6d",
+      "source_unit": "meter_plus_dimensionless_rotation6d",
+      "target_unit": "meter_plus_dimensionless_rotation6d",
+      "source_frame": "robot_base",
+      "target_frame": "robot_base"
+    },
+    {
+      "action_key": "gripper_command",
+      "source_state_key": "gripper_command",
+      "kind": "binary",
+      "start": 9,
+      "end": 10,
+      "canonical_format": "scalar",
+      "source_format": null,
+      "target_format": null,
+      "source_unit": null,
+      "target_unit": null,
+      "source_frame": null,
+      "target_frame": null
+    }
+  ],
+  "provenance": {
+    "dataset": "REPLACE_WITH_IMMUTABLE_DATASET_ID",
+    "dataset_revision": "REPLACE_WITH_IMMUTABLE_REVISION",
+    "dataset_fingerprint_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+    "source_schema_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+    "canonicalizer": "identity_preprocessed",
+    "canonicalizer_version": "REPLACE_WITH_PREPROCESSOR_VERSION",
+    "canonicalizer_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_DIGITS",
+    "exporter_version": "1",
+    "target_definition": "absolute_eef_controller_target",
+    "time_alignment": "history_t_minus_7_to_t__future_t_to_t_plus_7"
+  },
+  "controller": {
+    "type": "REPLACE_WITH_ABSOLUTE_CONTROLLER_TYPE",
+    "version": "REPLACE_WITH_CONTROLLER_VERSION",
+    "frame": "robot_base",
+    "control_delta": false,
+    "rotation_composition": "rotation6d_to_matrix",
+    "scale": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  }
+}

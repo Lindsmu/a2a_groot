@@ -1,0 +1,145 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | from types import SimpleNamespace
+00004 | from unittest.mock import MagicMock, patch
+00005 | 
+00006 | from gr00t.data.dataset.a2a_single_step_dataset import (
+00007 |     A2AShardedSingleStepDataset,
+00008 |     compute_a2a_window_bounds,
+00009 |     extract_a2a_step_data,
+00010 |     get_modality_delta_bounds,
+00011 |     is_a2a_model_config,
+00012 |     validate_a2a_step_index,
+00013 | )
+00014 | from gr00t.data.embodiment_tags import EmbodimentTag
+00015 | from gr00t.data.types import ModalityConfig
+00016 | import numpy as np
+00017 | import pandas as pd
+00018 | import pytest
+00019 | 
+00020 | 
+00021 | def _a2a_modality_configs() -> dict[str, ModalityConfig]:
+00022 |     return {
+00023 |         "state": ModalityConfig(delta_indices=[-2, -1, 0], modality_keys=["joint"]),
+00024 |         "action": ModalityConfig(delta_indices=[0, 1], modality_keys=["joint"]),
+00025 |         "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+00026 |     }
+00027 | 
+00028 | 
+00029 | def test_window_bounds_use_every_modality_delta():
+00030 |     configs = {
+00031 |         "video": ModalityConfig(delta_indices=[0], modality_keys=["cam"]),
+00032 |         "state": ModalityConfig(delta_indices=list(range(-7, 1)), modality_keys=["joint"]),
+00033 |         "action": ModalityConfig(delta_indices=list(range(8)), modality_keys=["joint"]),
+00034 |         "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+00035 |     }
+00036 | 
+00037 |     bounds = compute_a2a_window_bounds(20, configs)
+00038 | 
+00039 |     assert bounds.valid_start == 7
+00040 |     assert bounds.valid_end == 12
+00041 |     assert bounds.num_steps == 6
+00042 |     assert (bounds.min_delta, bounds.max_delta) == (-7, 7)
+00043 | 
+00044 | 
+00045 | def test_window_bounds_support_all_negative_arbitrary_deltas():
+00046 |     configs = {
+00047 |         "state": ModalityConfig(delta_indices=[-3, -1], modality_keys=["joint"]),
+00048 |     }
+00049 | 
+00050 |     bounds = compute_a2a_window_bounds(10, configs)
+00051 | 
+00052 |     assert bounds.valid_start == 3
+00053 |     assert bounds.valid_end == 10
+00054 |     assert all(0 <= step + delta < 10 for step in range(3, 11) for delta in [-3, -1])
+00055 | 
+00056 | 
+00057 | def test_invalid_early_step_is_rejected_before_pandas_iloc_wraparound():
+00058 |     configs = _a2a_modality_configs()
+00059 |     episode = pd.DataFrame(
+00060 |         {
+00061 |             "state.joint": [np.array([index]) for index in range(6)],
+00062 |             "action.joint": [np.array([100 + index]) for index in range(6)],
+00063 |             "language.task": ["move"] * 6,
+00064 |         }
+00065 |     )
+00066 | 
+00067 |     with pytest.raises(IndexError, match=r"outside valid interval \[2, 4\]"):
+00068 |         extract_a2a_step_data(episode, 0, configs, EmbodimentTag.NEW_EMBODIMENT)
+00069 | 
+00070 |     step = extract_a2a_step_data(episode, 2, configs, EmbodimentTag.NEW_EMBODIMENT)
+00071 |     np.testing.assert_array_equal(step.states["joint"].ravel(), [0, 1, 2])
+00072 |     np.testing.assert_array_equal(step.actions["joint"].ravel(), [102, 103])
+00073 |     assert step.metadata["a2a_window"]["base_step_index"] == 2
+00074 | 
+00075 | 
+00076 | def test_validation_rejects_late_future_access():
+00077 |     with pytest.raises(IndexError, match="outside valid interval"):
+00078 |         validate_a2a_step_index(6, 5, _a2a_modality_configs())
+00079 | 
+00080 | 
+00081 | def test_delta_validation_rejects_empty_and_non_integer_values():
+00082 |     with pytest.raises(ValueError, match="no delta_indices"):
+00083 |         get_modality_delta_bounds(
+00084 |             {"state": ModalityConfig(delta_indices=[], modality_keys=["joint"])}
+00085 |         )
+00086 |     with pytest.raises(TypeError, match="non-integer"):
+00087 |         get_modality_delta_bounds(
+00088 |             {"state": ModalityConfig(delta_indices=[0, 0.5], modality_keys=["joint"])}
+00089 |         )
+00090 | 
+00091 | 
+00092 | def test_shards_contain_only_absolute_valid_steps():
+00093 |     configs = {
+00094 |         "state": ModalityConfig(delta_indices=[-2, 0], modality_keys=["joint"]),
+00095 |         "action": ModalityConfig(delta_indices=[0, 2], modality_keys=["joint"]),
+00096 |         "language": ModalityConfig(delta_indices=[0], modality_keys=["task"]),
+00097 |     }
+00098 |     with patch(
+00099 |         "gr00t.data.dataset.sharded_single_step_dataset.LeRobotEpisodeLoader"
+00100 |     ) as mock_loader_class:
+00101 |         mock_loader = MagicMock()
+00102 |         mock_loader.episode_lengths = [10]
+00103 |         mock_loader.get_episode_length.return_value = 10
+00104 |         mock_loader_class.return_value = mock_loader
+00105 | 
+00106 |         dataset = A2AShardedSingleStepDataset(
+00107 |             dataset_path="/fake/dataset",
+00108 |             embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+00109 |             modality_configs=configs,
+00110 |             shard_size=128,
+00111 |             episode_sampling_rate=1.0,
+00112 |             seed=7,
+00113 |         )
+00114 | 
+00115 |     sampled_steps = sorted(
+00116 |         int(step)
+00117 |         for shard in dataset.sharded_episodes
+00118 |         for _, step_indices in shard
+00119 |         for step in step_indices
+00120 |     )
+00121 |     assert sampled_steps == list(range(2, 8))
+00122 |     assert dataset.get_effective_episode_length(0) == 6
+00123 | 
+00124 | 
+00125 | def test_a2a_training_dataset_rejects_padding():
+00126 |     with pytest.raises(ValueError, match="allow_padding must be False"):
+00127 |         A2AShardedSingleStepDataset(
+00128 |             dataset_path="/unused",
+00129 |             embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
+00130 |             modality_configs=_a2a_modality_configs(),
+00131 |             allow_padding=True,
+00132 |         )
+00133 | 
+00134 | 
+00135 | @pytest.mark.parametrize(
+00136 |     ("model_config", "expected"),
+00137 |     [
+00138 |         (SimpleNamespace(model_type="Gr00tN1d7A2A"), True),
+00139 |         (SimpleNamespace(model_type="other", a2a_history_horizon=8), True),
+00140 |         (SimpleNamespace(model_type="Gr00tN1d7"), False),
+00141 |         (MagicMock(), False),
+00142 |     ],
+00143 | )
+00144 | def test_a2a_model_config_detection_is_explicit(model_config, expected):
+00145 |     assert is_a2a_model_config(model_config) is expected

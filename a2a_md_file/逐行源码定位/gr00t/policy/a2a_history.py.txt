@@ -1,0 +1,587 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """Actual-proprio history buffering for action-to-action inference.
+00017 | 
+00018 | The A2A source trajectory must describe what the robot actually executed.  This
+00019 | module therefore deliberately has no API for actions predicted or commanded by
+00020 | the policy.  Callers must feed measured proprioception from robot/environment
+00021 | observations through :meth:`A2AProprioHistoryBuffer.append_actual` or
+00022 | :meth:`A2AProprioHistoryBuffer.resolve`.
+00023 | 
+00024 | All public histories use ``[batch, horizon, feature]`` layout.  The buffer is
+00025 | model-independent and keeps each state key separate so a later processor can
+00026 | perform embodiment-specific canonicalization.
+00027 | """
+00028 | 
+00029 | from __future__ import annotations
+00030 | 
+00031 | from collections.abc import Mapping, Sequence
+00032 | from dataclasses import dataclass
+00033 | from typing import Any, Literal, TypeAlias
+00034 | 
+00035 | import numpy as np
+00036 | 
+00037 | 
+00038 | HistorySource: TypeAlias = Literal["external", "ring_buffer", "repeat_first_state"]
+00039 | TimestampLike: TypeAlias = float | int | Sequence[float] | np.ndarray
+00040 | 
+00041 | 
+00042 | @dataclass(frozen=True)
+00043 | class A2AHistoryBatch:
+00044 |     """A fixed-horizon batch of measured proprioception.
+00045 | 
+00046 |     Attributes:
+00047 |         states: State arrays in ``[B, H, D_key]`` layout.  Arrays are defensive
+00048 |             copies and may be safely modified by a downstream processor.
+00049 |         timestamps: Per-batch timestamps in ``[B, H]`` layout.  Cold-start
+00050 |             padding repeats the first real timestamp, just as it repeats the
+00051 |             first real state.
+00052 |         valid_mask: Boolean ``[B, H]`` mask.  ``False`` marks synthetic
+00053 |             cold-start positions; external and full-buffer histories are all
+00054 |             valid.
+00055 |         metadata: Integration-friendly source and shape information.  In
+00056 |             particular, ``metadata["source"]`` identifies whether the result
+00057 |             came from an external history, a full ring buffer, or
+00058 |             ``repeat_first_state`` cold-start padding.
+00059 |     """
+00060 | 
+00061 |     states: dict[str, np.ndarray]
+00062 |     timestamps: np.ndarray
+00063 |     valid_mask: np.ndarray
+00064 |     metadata: dict[str, Any]
+00065 | 
+00066 | 
+00067 | class A2AProprioHistoryBuffer:
+00068 |     """Fixed-horizon ring buffer containing only measured proprioception.
+00069 | 
+00070 |     Args:
+00071 |         horizon: Number of historical samples returned to the A2A encoder.
+00072 |         state_keys: Optional exact set/order of state keys.  If omitted, the
+00073 |             first measured sample or external history establishes the schema.
+00074 |         max_time_gap_s: Optional maximum allowed interval between consecutive
+00075 |             measured samples.  Timestamps are always required, finite, and
+00076 |             strictly increasing even when this limit is disabled.
+00077 | 
+00078 |     Notes:
+00079 |         ``reset()`` starts a new episode and clears samples and timestamps while
+00080 |         preserving the established key/feature schema.  Batch size may change
+00081 |         after a reset.
+00082 | 
+00083 |         An external history is treated as an authoritative history of *actual
+00084 |         measured proprioception*.  It takes priority over a simultaneously
+00085 |         supplied current sample and re-seeds the local ring buffer, allowing a
+00086 |         later local sample to continue from it.
+00087 |     """
+00088 | 
+00089 |     def __init__(
+00090 |         self,
+00091 |         horizon: int,
+00092 |         *,
+00093 |         state_keys: Sequence[str] | None = None,
+00094 |         max_time_gap_s: float | None = None,
+00095 |     ) -> None:
+00096 |         if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0:
+00097 |             raise ValueError(f"horizon must be a positive integer, got {horizon!r}")
+00098 |         if max_time_gap_s is not None:
+00099 |             if (
+00100 |                 isinstance(max_time_gap_s, bool)
+00101 |                 or not np.isfinite(max_time_gap_s)
+00102 |                 or max_time_gap_s <= 0
+00103 |             ):
+00104 |                 raise ValueError(
+00105 |                     "max_time_gap_s must be a finite positive number or None, "
+00106 |                     f"got {max_time_gap_s!r}"
+00107 |                 )
+00108 | 
+00109 |         configured_keys: tuple[str, ...] | None = None
+00110 |         if state_keys is not None:
+00111 |             if isinstance(state_keys, str):
+00112 |                 raise ValueError("state_keys must be a sequence of keys, not a single string")
+00113 |             configured_keys = tuple(state_keys)
+00114 |             if not configured_keys:
+00115 |                 raise ValueError("state_keys must contain at least one key")
+00116 |             if any(not isinstance(key, str) or not key for key in configured_keys):
+00117 |                 raise ValueError("every state key must be a non-empty string")
+00118 |             if len(configured_keys) != len(set(configured_keys)):
+00119 |                 raise ValueError(f"state_keys contains duplicates: {configured_keys!r}")
+00120 | 
+00121 |         self.horizon = horizon
+00122 |         self.max_time_gap_s = max_time_gap_s
+00123 |         self._state_keys = configured_keys
+00124 |         self._state_dims: dict[str, int] = {}
+00125 |         self._state_dtypes: dict[str, np.dtype[Any]] = {}
+00126 | 
+00127 |         self._buffers: dict[str, np.ndarray] = {}
+00128 |         self._timestamp_buffer: np.ndarray | None = None
+00129 |         self._batch_size: int | None = None
+00130 |         self._size = 0
+00131 |         self._write_index = 0
+00132 | 
+00133 |     @property
+00134 |     def size(self) -> int:
+00135 |         """Number of real measured samples currently stored."""
+00136 | 
+00137 |         return self._size
+00138 | 
+00139 |     @property
+00140 |     def is_ready(self) -> bool:
+00141 |         """Whether the ring contains ``horizon`` real samples (no cold padding)."""
+00142 | 
+00143 |         return self._size == self.horizon
+00144 | 
+00145 |     @property
+00146 |     def state_keys(self) -> tuple[str, ...] | None:
+00147 |         """Established state-key order, or ``None`` before schema inference."""
+00148 | 
+00149 |         return self._state_keys
+00150 | 
+00151 |     def reset(self) -> None:
+00152 |         """Clear episode-local history without discarding the state schema."""
+00153 | 
+00154 |         self._buffers = {}
+00155 |         self._timestamp_buffer = None
+00156 |         self._batch_size = None
+00157 |         self._size = 0
+00158 |         self._write_index = 0
+00159 | 
+00160 |     def append_actual(
+00161 |         self,
+00162 |         actual_proprio: Mapping[str, np.ndarray],
+00163 |         *,
+00164 |         timestamp: TimestampLike,
+00165 |     ) -> None:
+00166 |         """Append one timestep of actually measured proprioception.
+00167 | 
+00168 |         Each value must have shape ``[B, D]`` or ``[B, 1, D]``.  A temporal
+00169 |         dimension larger than one is rejected so a predicted action chunk
+00170 |         cannot accidentally be passed through the ordinary update path.
+00171 |         """
+00172 | 
+00173 |         states, keys, batch_size, dimensions, dtypes = self._validate_current(actual_proprio)
+00174 |         timestamps = self._normalize_current_timestamps(timestamp, batch_size)
+00175 |         self._validate_new_timestamp(timestamps)
+00176 |         self._commit_schema(keys, batch_size, dimensions, dtypes)
+00177 |         self._ensure_storage(states)
+00178 | 
+00179 |         for key in keys:
+00180 |             self._buffers[key][self._write_index] = states[key]
+00181 |         assert self._timestamp_buffer is not None
+00182 |         self._timestamp_buffer[self._write_index] = timestamps
+00183 | 
+00184 |         self._write_index = (self._write_index + 1) % self.horizon
+00185 |         self._size = min(self._size + 1, self.horizon)
+00186 | 
+00187 |     # A short alias is useful to policy integrations, while its keyword name
+00188 |     # still makes the measured-only contract explicit at every call site.
+00189 |     def append(
+00190 |         self,
+00191 |         actual_proprio: Mapping[str, np.ndarray],
+00192 |         *,
+00193 |         timestamp: TimestampLike,
+00194 |     ) -> None:
+00195 |         """Alias for :meth:`append_actual`; accepts measured proprio only."""
+00196 | 
+00197 |         self.append_actual(actual_proprio, timestamp=timestamp)
+00198 | 
+00199 |     def get_history(self) -> A2AHistoryBatch:
+00200 |         """Return the ordered, fixed-horizon local history.
+00201 | 
+00202 |         Before the buffer fills, missing leading positions repeat the first
+00203 |         measured state.  ``valid_mask`` and metadata distinguish this synthetic
+00204 |         prefix from real observations.
+00205 |         """
+00206 | 
+00207 |         if self._size == 0:
+00208 |             raise RuntimeError("proprio history is empty; append a measured sample first")
+00209 |         return self._snapshot(
+00210 |             source="ring_buffer" if self.is_ready else "repeat_first_state",
+00211 |             external_current_ignored=False,
+00212 |         )
+00213 | 
+00214 |     def use_external_history(
+00215 |         self,
+00216 |         external_history: Mapping[str, np.ndarray],
+00217 |         *,
+00218 |         timestamps: TimestampLike,
+00219 |     ) -> A2AHistoryBatch:
+00220 |         """Validate and install an authoritative full measured history.
+00221 | 
+00222 |         ``external_history`` must contain exactly ``horizon`` samples per state
+00223 |         key in ``[B, H, D]`` layout.  ``timestamps`` must be ``[H]`` (shared by
+00224 |         the batch) or ``[B, H]``.  This method re-seeds the local ring buffer.
+00225 |         """
+00226 | 
+00227 |         states, keys, batch_size, dimensions, dtypes = self._validate_external(external_history)
+00228 |         external_timestamps = self._normalize_external_timestamps(timestamps, batch_size)
+00229 |         self._validate_timestamp_sequence(external_timestamps)
+00230 |         self._commit_schema(keys, batch_size, dimensions, dtypes)
+00231 | 
+00232 |         # External history is already oldest-to-newest.  With a full ring, index
+00233 |         # zero is the next write position and therefore the oldest item.
+00234 |         self._buffers = {
+00235 |             key: np.ascontiguousarray(np.swapaxes(states[key], 0, 1)).copy() for key in keys
+00236 |         }
+00237 |         self._timestamp_buffer = np.ascontiguousarray(external_timestamps.T).copy()
+00238 |         self._size = self.horizon
+00239 |         self._write_index = 0
+00240 |         return self._snapshot(source="external", external_current_ignored=False)
+00241 | 
+00242 |     def resolve(
+00243 |         self,
+00244 |         actual_proprio: Mapping[str, np.ndarray] | None = None,
+00245 |         *,
+00246 |         timestamp: TimestampLike | None = None,
+00247 |         external_history: Mapping[str, np.ndarray] | None = None,
+00248 |         external_timestamps: TimestampLike | None = None,
+00249 |     ) -> A2AHistoryBatch:
+00250 |         """Resolve the history for one inference request.
+00251 | 
+00252 |         A supplied full external measured history has priority and re-seeds the
+00253 |         local ring.  Otherwise, this method appends ``actual_proprio`` and
+00254 |         returns the local fixed-horizon snapshot.  ``actual_proprio`` is ignored
+00255 |         when an external history is present; metadata records that fact.
+00256 |         """
+00257 | 
+00258 |         if external_history is not None:
+00259 |             if external_timestamps is None:
+00260 |                 raise ValueError("external_timestamps is required with external_history")
+00261 |             result = self.use_external_history(
+00262 |                 external_history,
+00263 |                 timestamps=external_timestamps,
+00264 |             )
+00265 |             if actual_proprio is None:
+00266 |                 return result
+00267 |             metadata = dict(result.metadata)
+00268 |             metadata["external_current_ignored"] = True
+00269 |             return A2AHistoryBatch(
+00270 |                 states=result.states,
+00271 |                 timestamps=result.timestamps,
+00272 |                 valid_mask=result.valid_mask,
+00273 |                 metadata=metadata,
+00274 |             )
+00275 | 
+00276 |         if external_timestamps is not None:
+00277 |             raise ValueError("external_timestamps was provided without external_history")
+00278 |         if actual_proprio is None:
+00279 |             raise ValueError("actual_proprio is required when external_history is absent")
+00280 |         if timestamp is None:
+00281 |             raise ValueError("timestamp is required when appending actual_proprio")
+00282 | 
+00283 |         self.append_actual(actual_proprio, timestamp=timestamp)
+00284 |         return self.get_history()
+00285 | 
+00286 |     def _validate_current(
+00287 |         self, states: Mapping[str, np.ndarray]
+00288 |     ) -> tuple[
+00289 |         dict[str, np.ndarray],
+00290 |         tuple[str, ...],
+00291 |         int,
+00292 |         dict[str, int],
+00293 |         dict[str, np.dtype[Any]],
+00294 |     ]:
+00295 |         if not isinstance(states, Mapping) or not states:
+00296 |             raise ValueError("actual_proprio must be a non-empty mapping of state arrays")
+00297 |         keys = self._validate_keys(states)
+00298 | 
+00299 |         normalized: dict[str, np.ndarray] = {}
+00300 |         dimensions: dict[str, int] = {}
+00301 |         dtypes: dict[str, np.dtype[Any]] = {}
+00302 |         batch_size: int | None = None
+00303 |         for key in keys:
+00304 |             value = self._validate_numeric_array(states[key], key=key)
+00305 |             if value.ndim == 3:
+00306 |                 if value.shape[1] != 1:
+00307 |                     raise ValueError(
+00308 |                         f"actual proprio key {key!r} must contain one timestep; "
+00309 |                         f"expected [B, D] or [B, 1, D], got {value.shape}"
+00310 |                     )
+00311 |                 value = value[:, 0, :]
+00312 |             elif value.ndim != 2:
+00313 |                 raise ValueError(
+00314 |                     f"actual proprio key {key!r} must have shape [B, D] or [B, 1, D], "
+00315 |                     f"got {value.shape}"
+00316 |                 )
+00317 |             if value.shape[0] <= 0 or value.shape[1] <= 0:
+00318 |                 raise ValueError(
+00319 |                     f"actual proprio key {key!r} has an empty dimension: {value.shape}"
+00320 |                 )
+00321 |             batch_size = self._merge_batch_size(batch_size, value.shape[0], key)
+00322 |             normalized[key] = np.ascontiguousarray(value)
+00323 |             dimensions[key] = value.shape[1]
+00324 |             dtypes[key] = value.dtype
+00325 | 
+00326 |         assert batch_size is not None
+00327 |         self._validate_existing_schema(keys, batch_size, dimensions, dtypes)
+00328 |         return normalized, keys, batch_size, dimensions, dtypes
+00329 | 
+00330 |     def _validate_external(
+00331 |         self, states: Mapping[str, np.ndarray]
+00332 |     ) -> tuple[
+00333 |         dict[str, np.ndarray],
+00334 |         tuple[str, ...],
+00335 |         int,
+00336 |         dict[str, int],
+00337 |         dict[str, np.dtype[Any]],
+00338 |     ]:
+00339 |         if not isinstance(states, Mapping) or not states:
+00340 |             raise ValueError("external_history must be a non-empty mapping of state arrays")
+00341 |         keys = self._validate_keys(states)
+00342 | 
+00343 |         normalized: dict[str, np.ndarray] = {}
+00344 |         dimensions: dict[str, int] = {}
+00345 |         dtypes: dict[str, np.dtype[Any]] = {}
+00346 |         batch_size: int | None = None
+00347 |         for key in keys:
+00348 |             value = self._validate_numeric_array(states[key], key=key)
+00349 |             if value.ndim != 3 or value.shape[1] != self.horizon:
+00350 |                 raise ValueError(
+00351 |                     f"external history key {key!r} must have shape [B, {self.horizon}, D], "
+00352 |                     f"got {value.shape}"
+00353 |                 )
+00354 |             if value.shape[0] <= 0 or value.shape[2] <= 0:
+00355 |                 raise ValueError(
+00356 |                     f"external history key {key!r} has an empty dimension: {value.shape}"
+00357 |                 )
+00358 |             batch_size = self._merge_batch_size(batch_size, value.shape[0], key)
+00359 |             normalized[key] = np.ascontiguousarray(value)
+00360 |             dimensions[key] = value.shape[2]
+00361 |             dtypes[key] = value.dtype
+00362 | 
+00363 |         assert batch_size is not None
+00364 |         self._validate_existing_schema(keys, batch_size, dimensions, dtypes)
+00365 |         return normalized, keys, batch_size, dimensions, dtypes
+00366 | 
+00367 |     def _validate_keys(self, states: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+00368 |         supplied = tuple(states.keys())
+00369 |         if any(not isinstance(key, str) or not key for key in supplied):
+00370 |             raise ValueError("every state key must be a non-empty string")
+00371 |         expected = self._state_keys
+00372 |         if expected is None:
+00373 |             return supplied
+00374 |         if set(supplied) != set(expected):
+00375 |             missing = sorted(set(expected) - set(supplied))
+00376 |             extra = sorted(set(supplied) - set(expected))
+00377 |             raise ValueError(f"state keys do not match schema; missing={missing}, extra={extra}")
+00378 |         return expected
+00379 | 
+00380 |     @staticmethod
+00381 |     def _validate_numeric_array(value: np.ndarray, *, key: str) -> np.ndarray:
+00382 |         if not isinstance(value, np.ndarray):
+00383 |             raise TypeError(f"state key {key!r} must be a numpy array, got {type(value).__name__}")
+00384 |         if not np.issubdtype(value.dtype, np.floating):
+00385 |             raise TypeError(f"state key {key!r} must have a floating dtype, got {value.dtype}")
+00386 |         if not np.all(np.isfinite(value)):
+00387 |             raise ValueError(f"state key {key!r} contains NaN or infinity")
+00388 |         return value
+00389 | 
+00390 |     @staticmethod
+00391 |     def _merge_batch_size(current: int | None, candidate: int, key: str) -> int:
+00392 |         if current is not None and current != candidate:
+00393 |             raise ValueError(
+00394 |                 f"all state keys must share one batch size; key {key!r} has {candidate}, "
+00395 |                 f"expected {current}"
+00396 |             )
+00397 |         return candidate
+00398 | 
+00399 |     def _validate_existing_schema(
+00400 |         self,
+00401 |         keys: tuple[str, ...],
+00402 |         batch_size: int,
+00403 |         dimensions: Mapping[str, int],
+00404 |         dtypes: Mapping[str, np.dtype[Any]],
+00405 |     ) -> None:
+00406 |         if self._state_keys is not None and keys != self._state_keys:
+00407 |             raise ValueError(f"state-key order mismatch: got {keys}, expected {self._state_keys}")
+00408 |         if self._batch_size is not None and batch_size != self._batch_size:
+00409 |             raise ValueError(
+00410 |                 f"batch size changed from {self._batch_size} to {batch_size}; call reset() "
+00411 |                 "before starting a new batch/episode"
+00412 |             )
+00413 |         for key in keys:
+00414 |             if key in self._state_dims and dimensions[key] != self._state_dims[key]:
+00415 |                 raise ValueError(
+00416 |                     f"feature dimension for state key {key!r} changed from "
+00417 |                     f"{self._state_dims[key]} to {dimensions[key]}"
+00418 |                 )
+00419 |             if key in self._state_dtypes and dtypes[key] != self._state_dtypes[key]:
+00420 |                 raise TypeError(
+00421 |                     f"dtype for state key {key!r} changed from {self._state_dtypes[key]} "
+00422 |                     f"to {dtypes[key]}"
+00423 |                 )
+00424 | 
+00425 |     def _commit_schema(
+00426 |         self,
+00427 |         keys: tuple[str, ...],
+00428 |         batch_size: int,
+00429 |         dimensions: Mapping[str, int],
+00430 |         dtypes: Mapping[str, np.dtype[Any]],
+00431 |     ) -> None:
+00432 |         if self._state_keys is None:
+00433 |             self._state_keys = keys
+00434 |         if not self._state_dims:
+00435 |             self._state_dims = dict(dimensions)
+00436 |             self._state_dtypes = dict(dtypes)
+00437 |         self._batch_size = batch_size
+00438 | 
+00439 |     def _ensure_storage(self, states: Mapping[str, np.ndarray]) -> None:
+00440 |         if self._buffers:
+00441 |             return
+00442 |         assert self._state_keys is not None
+00443 |         assert self._batch_size is not None
+00444 |         self._buffers = {
+00445 |             key: np.empty(
+00446 |                 (self.horizon, self._batch_size, self._state_dims[key]),
+00447 |                 dtype=states[key].dtype,
+00448 |             )
+00449 |             for key in self._state_keys
+00450 |         }
+00451 |         self._timestamp_buffer = np.empty((self.horizon, self._batch_size), dtype=np.float64)
+00452 | 
+00453 |     @staticmethod
+00454 |     def _normalize_current_timestamps(timestamp: TimestampLike, batch_size: int) -> np.ndarray:
+00455 |         value = np.asarray(timestamp, dtype=np.float64)
+00456 |         if value.ndim == 0:
+00457 |             value = np.full((batch_size,), value.item(), dtype=np.float64)
+00458 |         elif value.shape != (batch_size,):
+00459 |             raise ValueError(
+00460 |                 f"current timestamp must be scalar or shape [{batch_size}], got {value.shape}"
+00461 |             )
+00462 |         if not np.all(np.isfinite(value)):
+00463 |             raise ValueError("timestamp contains NaN or infinity")
+00464 |         return value
+00465 | 
+00466 |     def _normalize_external_timestamps(
+00467 |         self, timestamps: TimestampLike, batch_size: int
+00468 |     ) -> np.ndarray:
+00469 |         value = np.asarray(timestamps, dtype=np.float64)
+00470 |         if value.shape == (self.horizon,):
+00471 |             value = np.broadcast_to(value[None, :], (batch_size, self.horizon)).copy()
+00472 |         elif value.shape != (batch_size, self.horizon):
+00473 |             raise ValueError(
+00474 |                 "external timestamps must have shape "
+00475 |                 f"[{self.horizon}] or [{batch_size}, {self.horizon}], got {value.shape}"
+00476 |             )
+00477 |         if not np.all(np.isfinite(value)):
+00478 |             raise ValueError("external timestamps contain NaN or infinity")
+00479 |         return value
+00480 | 
+00481 |     def _validate_new_timestamp(self, timestamps: np.ndarray) -> None:
+00482 |         if self._size == 0:
+00483 |             return
+00484 |         assert self._timestamp_buffer is not None
+00485 |         previous = self._timestamp_buffer[(self._write_index - 1) % self.horizon]
+00486 |         gaps = timestamps - previous
+00487 |         if np.any(gaps <= 0):
+00488 |             bad = np.flatnonzero(gaps <= 0).tolist()
+00489 |             raise ValueError(
+00490 |                 "timestamps must be strictly increasing for every batch item; "
+00491 |                 f"invalid batch indices={bad}"
+00492 |             )
+00493 |         self._validate_max_gap(gaps)
+00494 | 
+00495 |     def _validate_timestamp_sequence(self, timestamps: np.ndarray) -> None:
+00496 |         if self.horizon <= 1:
+00497 |             return
+00498 |         gaps = np.diff(timestamps, axis=1)
+00499 |         if np.any(gaps <= 0):
+00500 |             bad = np.argwhere(gaps <= 0).tolist()
+00501 |             raise ValueError(
+00502 |                 "external timestamps must be strictly increasing along history; "
+00503 |                 f"invalid [batch, interval] indices={bad}"
+00504 |             )
+00505 |         self._validate_max_gap(gaps)
+00506 | 
+00507 |     def _validate_max_gap(self, gaps: np.ndarray) -> None:
+00508 |         if self.max_time_gap_s is None:
+00509 |             return
+00510 |         if np.any(gaps > self.max_time_gap_s):
+00511 |             bad = np.argwhere(gaps > self.max_time_gap_s).tolist()
+00512 |             maximum = float(np.max(gaps))
+00513 |             raise ValueError(
+00514 |                 f"timestamp gap {maximum:.9g}s exceeds max_time_gap_s="
+00515 |                 f"{self.max_time_gap_s:.9g}; invalid indices={bad}"
+00516 |             )
+00517 | 
+00518 |     def _ordered_indices(self) -> np.ndarray:
+00519 |         if self._size < self.horizon:
+00520 |             return np.arange(self._size)
+00521 |         return (np.arange(self.horizon) + self._write_index) % self.horizon
+00522 | 
+00523 |     def _snapshot(
+00524 |         self,
+00525 |         *,
+00526 |         source: HistorySource,
+00527 |         external_current_ignored: bool,
+00528 |     ) -> A2AHistoryBatch:
+00529 |         assert self._state_keys is not None
+00530 |         assert self._batch_size is not None
+00531 |         assert self._timestamp_buffer is not None
+00532 | 
+00533 |         indices = self._ordered_indices()
+00534 |         ordered_states = {
+00535 |             key: np.swapaxes(self._buffers[key][indices], 0, 1) for key in self._state_keys
+00536 |         }
+00537 |         ordered_timestamps = self._timestamp_buffer[indices].T
+00538 |         padded_steps = self.horizon - self._size
+00539 | 
+00540 |         if padded_steps:
+00541 |             states = {}
+00542 |             for key, value in ordered_states.items():
+00543 |                 prefix = np.repeat(value[:, :1, :], padded_steps, axis=1)
+00544 |                 states[key] = np.ascontiguousarray(np.concatenate((prefix, value), axis=1))
+00545 |             timestamp_prefix = np.repeat(
+00546 |                 ordered_timestamps[:, :1],
+00547 |                 padded_steps,
+00548 |                 axis=1,
+00549 |             )
+00550 |             result_timestamps = np.ascontiguousarray(
+00551 |                 np.concatenate((timestamp_prefix, ordered_timestamps), axis=1)
+00552 |             )
+00553 |             valid_mask = np.concatenate(
+00554 |                 (
+00555 |                     np.zeros((self._batch_size, padded_steps), dtype=bool),
+00556 |                     np.ones((self._batch_size, self._size), dtype=bool),
+00557 |                 ),
+00558 |                 axis=1,
+00559 |             )
+00560 |         else:
+00561 |             states = {
+00562 |                 key: np.ascontiguousarray(value).copy()
+00563 |                 for key, value in ordered_states.items()
+00564 |             }
+00565 |             result_timestamps = np.ascontiguousarray(ordered_timestamps).copy()
+00566 |             valid_mask = np.ones((self._batch_size, self.horizon), dtype=bool)
+00567 | 
+00568 |         metadata: dict[str, Any] = {
+00569 |             "source": source,
+00570 |             "history_horizon": self.horizon,
+00571 |             "valid_steps": self._size,
+00572 |             "padded_steps": padded_steps,
+00573 |             "batch_size": self._batch_size,
+00574 |             "state_keys": self._state_keys,
+00575 |             "timestamps_validated": True,
+00576 |             "max_time_gap_s": self.max_time_gap_s,
+00577 |             "external_current_ignored": external_current_ignored,
+00578 |         }
+00579 |         return A2AHistoryBatch(
+00580 |             states=states,
+00581 |             timestamps=result_timestamps,
+00582 |             valid_mask=np.ascontiguousarray(valid_mask),
+00583 |             metadata=metadata,
+00584 |         )
+00585 | 
+00586 | 
+00587 | __all__ = ["A2AHistoryBatch", "A2AProprioHistoryBuffer", "HistorySource"]

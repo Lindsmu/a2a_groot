@@ -1,0 +1,130 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """CPU ONNX oracle for the temporal-token A2A DiT action head."""
+00004 | 
+00005 | from __future__ import annotations
+00006 | 
+00007 | from gr00t.configs.model.gr00t_n1d7_a2a import Gr00tN1d7A2AConfig
+00008 | from gr00t.model.gr00t_n1d7_a2a.gr00t_n1d7_a2a import Gr00tN1d7A2AActionHead
+00009 | import numpy as np
+00010 | import pytest
+00011 | from scripts.deployment.a2a_trt_model_forward import A2A_ENGINE_INPUT_NAMES
+00012 | from scripts.deployment.export_onnx_n1d7_a2a import A2AActionHeadExportWrapper, _verify_a2a_onnx
+00013 | import torch
+00014 | 
+00015 | 
+00016 | def _dit_config() -> Gr00tN1d7A2AConfig:
+00017 |     return Gr00tN1d7A2AConfig(
+00018 |         backbone_embedding_dim=16,
+00019 |         max_action_dim=4,
+00020 |         action_horizon=4,
+00021 |         max_num_embodiments=2,
+00022 |         a2a_history_horizon=4,
+00023 |         a2a_future_horizon=4,
+00024 |         a2a_latent_dim=16,
+00025 |         a2a_encoder_channels=(8, 12, 16),
+00026 |         a2a_encoder_kernel_size=5,
+00027 |         a2a_decoder_res_blocks=2,
+00028 |         a2a_flow_mlp_ratio=2,
+00029 |         a2a_flow_backbone="dit",
+00030 |         a2a_dit_token_dim=16,
+00031 |         a2a_dit_num_layers=1,
+00032 |         a2a_dit_num_heads=4,
+00033 |         a2a_dit_mlp_ratio=2,
+00034 |         a2a_dit_dropout=0.0,
+00035 |         a2a_strict_paper_architecture=False,
+00036 |         a2a_history_noise_infer_std=0.0,
+00037 |         use_vlln=True,
+00038 |         tune_projector=True,
+00039 |         tune_diffusion_model=True,
+00040 |         tune_vlln=True,
+00041 |     )
+00042 | 
+00043 | 
+00044 | def test_temporal_dit_action_head_onnx_matches_pytorch(tmp_path):
+00045 |     pytest.importorskip("onnx")
+00046 |     ort = pytest.importorskip("onnxruntime")
+00047 |     torch.manual_seed(31)
+00048 |     config = _dit_config()
+00049 |     wrapper = A2AActionHeadExportWrapper(Gr00tN1d7A2AActionHead(config).float().eval())
+00050 |     batch_size = 1
+00051 |     sequence_length = 5
+00052 |     history_shape = (batch_size, config.a2a_history_horizon, config.max_action_dim)
+00053 |     future_shape = (batch_size, config.a2a_future_horizon, config.max_action_dim)
+00054 |     continuous = torch.ones(future_shape)
+00055 |     zeros = torch.zeros(future_shape)
+00056 |     inputs = (
+00057 |         torch.randn(batch_size, sequence_length, config.backbone_embedding_dim),
+00058 |         torch.ones(batch_size, sequence_length, dtype=torch.long),
+00059 |         torch.tensor([[1, 1, 0, 0, 0]], dtype=torch.bool),
+00060 |         torch.randn(history_shape),
+00061 |         torch.ones(history_shape),
+00062 |         continuous,
+00063 |         zeros,
+00064 |         zeros,
+00065 |         zeros,
+00066 |         torch.zeros(batch_size, dtype=torch.long),
+00067 |     )
+00068 |     output_path = tmp_path / "a2a_dit_action_head.onnx"
+00069 | 
+00070 |     torch.onnx.export(
+00071 |         wrapper,
+00072 |         inputs,
+00073 |         output_path,
+00074 |         input_names=list(A2A_ENGINE_INPUT_NAMES),
+00075 |         output_names=["action_pred"],
+00076 |         dynamic_axes={
+00077 |             **{name: {0: "batch_size"} for name in A2A_ENGINE_INPUT_NAMES},
+00078 |             "backbone_features": {0: "batch_size", 1: "vl_sequence"},
+00079 |             "backbone_attention_mask": {0: "batch_size", 1: "vl_sequence"},
+00080 |             "image_mask": {0: "batch_size", 1: "vl_sequence"},
+00081 |             "action_pred": {0: "batch_size"},
+00082 |         },
+00083 |         opset_version=18,
+00084 |         do_constant_folding=True,
+00085 |         dynamo=False,
+00086 |     )
+00087 |     _verify_a2a_onnx(output_path, wrapper, inputs, list(A2A_ENGINE_INPUT_NAMES))
+00088 | 
+00089 |     # The production export declares dynamic batch and VLM sequence axes. Use a
+00090 |     # second shape to prove that the traced DiT graph did not bake in batch=1.
+00091 |     dynamic_batch = 2
+00092 |     dynamic_sequence = 7
+00093 |     dynamic_history_shape = (
+00094 |         dynamic_batch,
+00095 |         config.a2a_history_horizon,
+00096 |         config.max_action_dim,
+00097 |     )
+00098 |     dynamic_future_shape = (
+00099 |         dynamic_batch,
+00100 |         config.a2a_future_horizon,
+00101 |         config.max_action_dim,
+00102 |     )
+00103 |     dynamic_continuous = torch.ones(dynamic_future_shape)
+00104 |     dynamic_zeros = torch.zeros(dynamic_future_shape)
+00105 |     dynamic_inputs = (
+00106 |         torch.randn(dynamic_batch, dynamic_sequence, config.backbone_embedding_dim),
+00107 |         torch.ones(dynamic_batch, dynamic_sequence, dtype=torch.long),
+00108 |         torch.tensor(
+00109 |             [[1, 1, 0, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0]],
+00110 |             dtype=torch.bool,
+00111 |         ),
+00112 |         torch.randn(dynamic_history_shape),
+00113 |         torch.ones(dynamic_history_shape),
+00114 |         dynamic_continuous,
+00115 |         dynamic_zeros,
+00116 |         dynamic_zeros,
+00117 |         dynamic_zeros,
+00118 |         torch.tensor([0, 1], dtype=torch.long),
+00119 |     )
+00120 |     with torch.inference_mode():
+00121 |         expected = wrapper(*dynamic_inputs).numpy()
+00122 |     session = ort.InferenceSession(str(output_path), providers=["CPUExecutionProvider"])
+00123 |     actual = session.run(
+00124 |         ["action_pred"],
+00125 |         {
+00126 |             name: value.numpy()
+00127 |             for name, value in zip(A2A_ENGINE_INPUT_NAMES, dynamic_inputs, strict=True)
+00128 |         },
+00129 |     )[0]
+00130 |     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-4)

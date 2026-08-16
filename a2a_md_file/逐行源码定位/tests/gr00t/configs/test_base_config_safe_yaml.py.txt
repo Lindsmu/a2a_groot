@@ -1,0 +1,227 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | """CPU-only regression tests for the safe-YAML contract on
+00017 | :class:`gr00t.configs.base_config.Config`: the save side must emit
+00018 | plain-dict YAML (no ``!!python/`` tags) and the load sides
+00019 | (``Config.load`` / ``Config.from_pretrained``) must refuse to
+00020 | instantiate any Python object from a maliciously crafted config."""
+00021 | 
+00022 | from __future__ import annotations
+00023 | 
+00024 | import pytest
+00025 | 
+00026 | 
+00027 | def _import_config():
+00028 |     """Lazy import — ``Config`` pulls heavy deps that the CPU-only test
+00029 |     venv may lack at collection time. Skip if unimportable."""
+00030 |     try:
+00031 |         from gr00t.configs.base_config import Config, get_default_config
+00032 |     except Exception as e:  # pragma: no cover - skip path
+00033 |         pytest.skip(f"gr00t.configs.base_config not importable in this env: {e}")
+00034 |     return Config, get_default_config
+00035 | 
+00036 | 
+00037 | # ---------------------------------------------------------------------------
+00038 | # Security: the !!python/object tag must never instantiate
+00039 | # ---------------------------------------------------------------------------
+00040 | 
+00041 | 
+00042 | def test_save_does_not_emit_python_object_tags(tmp_path):
+00043 |     """Save() output must be plain-dict YAML — no ``!!python/`` tag
+00044 |     anywhere, so the file cannot reopen the construct-from-disk path."""
+00045 |     Config, get_default_config = _import_config()
+00046 |     cfg = get_default_config()
+00047 | 
+00048 |     out = tmp_path / "config.yaml"
+00049 |     cfg.save(out)
+00050 |     text = out.read_text()
+00051 | 
+00052 |     assert "!!python/" not in text, (
+00053 |         "Config.save() must not emit !!python/ tags — those re-open the RCE "
+00054 |         "path the safe loader is meant to close. Found python tags in:\n"
+00055 |         f"{text[:500]}"
+00056 |     )
+00057 | 
+00058 | 
+00059 | def test_load_rejects_malicious_python_object_tag(tmp_path, monkeypatch):
+00060 |     """``!!python/object/apply:os.system`` must surface a ``ValueError``
+00061 |     with a migration hint and execute no side effect — proven by the
+00062 |     untouched canary file."""
+00063 |     Config, _ = _import_config()
+00064 |     canary = tmp_path / "canary.txt"
+00065 |     assert not canary.exists()
+00066 | 
+00067 |     # PyYAML RCE template equivalent to ``os.system(f"touch {canary}")``.
+00068 |     malicious = tmp_path / "malicious.yaml"
+00069 |     malicious.write_text(f"!!python/object/apply:os.system\n- 'touch {canary}'\n")
+00070 | 
+00071 |     with pytest.raises(ValueError) as excinfo:
+00072 |         Config().load(malicious)
+00073 | 
+00074 |     assert not canary.exists(), (
+00075 |         "Loading the malicious YAML must not have executed the os.system "
+00076 |         "payload — that would mean the safe loader is not in effect."
+00077 |     )
+00078 |     msg = str(excinfo.value)
+00079 |     assert "rejected unsafe legacy config YAML" in msg or "python/object" in msg.lower(), (
+00080 |         "Migration error should clearly signal that the legacy unsafe YAML "
+00081 |         f"format was rejected. Got: {msg!r}"
+00082 |     )
+00083 | 
+00084 | 
+00085 | def test_from_pretrained_rejects_malicious_python_object_tag(tmp_path):
+00086 |     """The class-level loader shares the same safe-loader contract — pin
+00087 |     the RCE rejection here so a future refactor cannot diverge the two
+00088 |     code paths."""
+00089 |     Config, _ = _import_config()
+00090 |     canary = tmp_path / "canary_classmethod.txt"
+00091 |     malicious = tmp_path / "malicious.yaml"
+00092 |     malicious.write_text(f"!!python/object/apply:os.system\n- 'touch {canary}'\n")
+00093 |     with pytest.raises(ValueError):
+00094 |         Config.from_pretrained(malicious)
+00095 |     assert not canary.exists()
+00096 | 
+00097 | 
+00098 | def test_load_rejects_non_mapping_top_level(tmp_path):
+00099 |     """``Config.save()`` always emits a top-level mapping; a YAML that
+00100 |     decodes to e.g. a list must fail loud rather than silently produce
+00101 |     an inert Config."""
+00102 |     Config, _ = _import_config()
+00103 |     odd = tmp_path / "odd.yaml"
+00104 |     odd.write_text("- a\n- b\n- c\n")
+00105 |     with pytest.raises(ValueError, match="Expected a YAML mapping"):
+00106 |         Config().load(odd)
+00107 | 
+00108 | 
+00109 | # ---------------------------------------------------------------------------
+00110 | # Round-trip — save → load reconstructs equivalent dict-form fields
+00111 | # ---------------------------------------------------------------------------
+00112 | 
+00113 | 
+00114 | def test_safe_dump_yaml_can_be_loaded_back(tmp_path):
+00115 |     """``save()`` output must be safe-loadable and reconstruct the
+00116 |     top-level dataclasses that :meth:`Config.load_dict` knows how to
+00117 |     rebuild (``model`` / ``data`` / ``training``). Nested dict-typed
+00118 |     fields (e.g. ``data.modality_configs``) come back as raw dicts
+00119 |     under ``yaml.safe_load`` — that's the deliberate type-erasure cost
+00120 |     of dropping ``!!python/object``; recovering nested dataclass types
+00121 |     would belong to a separate load_dict enhancement."""
+00122 |     Config, get_default_config = _import_config()
+00123 |     from dataclasses import asdict
+00124 | 
+00125 |     cfg = get_default_config()
+00126 |     out = tmp_path / "config.yaml"
+00127 |     cfg.save(out)
+00128 | 
+00129 |     # Round-trip succeeds: no RepresenterError on enums (save side),
+00130 |     # no ConstructorError on safe_load (load side).
+00131 |     loaded = Config().load(out)
+00132 | 
+00133 |     assert type(loaded.training) is type(cfg.training)
+00134 |     assert type(loaded.data) is type(cfg.data)
+00135 |     assert asdict(loaded.training) == asdict(cfg.training)
+00136 |     assert loaded.data.datasets == cfg.data.datasets
+00137 | 
+00138 | 
+00139 | def test_save_serialises_enum_action_configs(tmp_path):
+00140 |     """``ActionConfig`` carries ``ActionRepresentation`` / ``ActionType`` /
+00141 |     ``ActionFormat`` enum fields and is reachable from the default
+00142 |     ``MODALITY_CONFIGS``. ``yaml.safe_dump`` refuses raw ``Enum``
+00143 |     instances, so ``Config.save()`` must lower them to ``.value``
+00144 |     strings via ``_build_safe_tree`` before dumping — otherwise the
+00145 |     pre-fix production save path (``experiment.py``) regresses to a
+00146 |     ``RepresenterError`` at training start."""
+00147 |     Config, get_default_config = _import_config()
+00148 |     cfg = get_default_config()
+00149 |     out = tmp_path / "config.yaml"
+00150 |     cfg.save(out)
+00151 |     text = out.read_text()
+00152 | 
+00153 |     assert "!!python" not in text
+00154 |     # No enum repr leaks (e.g. ``ActionRepresentation.RELATIVE``); only
+00155 |     # the bare ``.value`` strings should appear.
+00156 |     assert "ActionRepresentation" not in text
+00157 |     assert "ActionFormat" not in text
+00158 |     assert "ActionType" not in text
+00159 |     # At least one known enum value from the default MODALITY_CONFIGS
+00160 |     # made it to disk as a plain string.
+00161 |     assert "relative" in text
+00162 | 
+00163 | 
+00164 | def test_save_creates_parent_directory(tmp_path):
+00165 |     """Nested target directories must still be created — pin
+00166 |     ``mkdir(parents=True)`` so the safe-yaml refactor cannot drop it."""
+00167 |     Config, get_default_config = _import_config()
+00168 |     cfg = get_default_config()
+00169 |     nested = tmp_path / "a" / "b" / "c" / "config.yaml"
+00170 |     cfg.save(nested)
+00171 |     assert nested.exists()
+00172 | 
+00173 | 
+00174 | def test_load_dict_restores_registered_a2a_model_subclass():
+00175 |     """Selecting A2A at the standard finetune entry must not retain N1.7 defaults."""
+00176 |     Config, _ = _import_config()
+00177 |     from gr00t.configs.model.gr00t_n1d7_a2a import Gr00tN1d7A2AConfig
+00178 | 
+00179 |     loaded = Config().load_dict({"model": {"model_type": "Gr00tN1d7A2A"}})
+00180 | 
+00181 |     assert isinstance(loaded.model, Gr00tN1d7A2AConfig)
+00182 |     assert loaded.model.action_horizon == 8
+00183 |     assert loaded.model.a2a_latent_dim == 512
+00184 | 
+00185 | 
+00186 | def test_load_dict_preserves_temporal_dit_architecture_fields():
+00187 |     """DiT experiments must survive the same registered config loading path."""
+00188 |     Config, _ = _import_config()
+00189 | 
+00190 |     loaded = Config().load_dict(
+00191 |         {
+00192 |             "model": {
+00193 |                 "model_type": "Gr00tN1d7A2A",
+00194 |                 "a2a_flow_backbone": "dit",
+00195 |                 "a2a_dit_token_dim": 64,
+00196 |                 "a2a_dit_num_layers": 6,
+00197 |                 "a2a_dit_num_heads": 8,
+00198 |                 "a2a_strict_paper_architecture": False,
+00199 |             }
+00200 |         }
+00201 |     )
+00202 | 
+00203 |     assert loaded.model.a2a_flow_backbone == "dit"
+00204 |     assert loaded.model.a2a_dit_token_dim == 64
+00205 |     assert loaded.model.a2a_dit_num_layers == 6
+00206 |     assert loaded.model.a2a_dit_num_heads == 8
+00207 |     assert loaded.model.a2a_architecture["latent_layout"] == "8_temporal_tokens_x_64"
+00208 | 
+00209 | 
+00210 | # ---------------------------------------------------------------------------
+00211 | # Belt-and-suspenders: canary file must never appear during teardown.
+00212 | # ---------------------------------------------------------------------------
+00213 | 
+00214 | 
+00215 | @pytest.fixture(autouse=True)
+00216 | def _no_stray_canary(tmp_path):
+00217 |     """Teardown safety net: if any security test accidentally executed
+00218 |     its YAML payload, the canary file would exist under ``tmp_path``.
+00219 |     Assert per-test rather than per-process (a stray ``/tmp/canary.txt``
+00220 |     from an unrelated CI workload would otherwise cause spurious
+00221 |     failures with a misleading regression message)."""
+00222 |     yield
+00223 |     for canary_name in ("canary.txt", "canary_classmethod.txt"):
+00224 |         assert not (tmp_path / canary_name).exists(), (
+00225 |             f"{canary_name} must not exist — its presence proves a malicious "
+00226 |             "YAML payload executed and the RCE fix regressed."
+00227 |         )

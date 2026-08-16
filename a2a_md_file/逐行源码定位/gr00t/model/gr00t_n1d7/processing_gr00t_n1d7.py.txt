@@ -1,0 +1,901 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | from copy import deepcopy
+00017 | import json
+00018 | import logging
+00019 | import os
+00020 | from pathlib import Path
+00021 | import random
+00022 | import re
+00023 | from typing import Any, Dict
+00024 | import warnings
+00025 | 
+00026 | import albumentations as A
+00027 | import numpy as np
+00028 | from PIL import Image
+00029 | import torch
+00030 | import torchvision.transforms.v2 as transforms
+00031 | from transformers import AutoProcessor
+00032 | from transformers.feature_extraction_utils import BatchFeature
+00033 | from transformers.utils import cached_file
+00034 | 
+00035 | from gr00t.configs.data.embodiment_configs import ModalityConfig
+00036 | from gr00t.data.embodiment_tags import EmbodimentTag
+00037 | from gr00t.data.interfaces import BaseProcessor
+00038 | from gr00t.data.state_action.state_action_processor import StateActionProcessor
+00039 | from gr00t.data.utils import parse_modality_configs, to_json_serializable
+00040 | 
+00041 | from .image_augmentations import (
+00042 |     apply_with_replay,
+00043 |     build_image_transformations,
+00044 |     build_image_transformations_albumentations,
+00045 | )
+00046 | 
+00047 | 
+00048 | try:
+00049 |     from transformers import Qwen3VLProcessor
+00050 | except ImportError:
+00051 |     Qwen3VLProcessor = None
+00052 | 
+00053 | # Suppress protobuf deprecation warnings
+00054 | warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.protobuf")
+00055 | 
+00056 | logger = logging.getLogger(__name__)
+00057 | 
+00058 | ### Projector-index assignments, declared as ``{projector_index: {tags}}``.
+00059 | #
+00060 | # This grouped form is the source of truth: a tag only shares a projector with
+00061 | # another tag if it is deliberately placed inside that index's set, so an
+00062 | # accidental collision can't slip in unnoticed. Multiple tags share an index
+00063 | # only when they describe the *same physical embodiment*. To add a brand-new
+00064 | # embodiment, give it an unused index; to add a data-source/subtask variant of
+00065 | # an existing one, add its tag to that group.
+00066 | #
+00067 | # ``EMBODIMENT_TAG_TO_PROJECTOR_INDEX`` below is derived from this and is the
+00068 | # public, tag-keyed lookup used everywhere else.
+00069 | _PROJECTOR_INDEX_GROUPS: dict[int, set[str]] = {
+00070 |     0: {"simpler_env_google"},
+00071 |     1: {"simpler_env_widowx"},
+00072 |     2: {"libero_sim"},
+00073 |     # Finetune placeholder projector; sim-eval robocasa tags piggyback on
+00074 |     # `new_embodiment`.
+00075 |     10: {"new_embodiment", "robocasa_panda_omron", "robocasa_gr1_tabletop"},
+00076 |     11: {"unitree_g1_sonic"},
+00077 |     24: {"oxe_droid_relative_eef_relative_joint"},
+00078 |     # Same G1 embodiment either side of the pretrain/posttrain boundary
+00079 |     # (`real_g1_*` is pretrain, `unitree_g1_full_body_*` is posttrain).
+00080 |     25: {
+00081 |         "real_g1_relative_eef_relative_joints",
+00082 |         "unitree_g1_full_body_with_waist_height_nav_cmd",
+00083 |     },
+00084 |     # One R1 Pro Sharpa robot, four data-source variants.
+00085 |     26: {
+00086 |         "real_r1_pro_sharpa_relative_eef",
+00087 |         "real_r1_pro_sharpa_relative_eef_human",
+00088 |         "real_r1_pro_sharpa_relative_eef_maxinsights",
+00089 |         "real_r1_pro_sharpa_relative_eef_mecka",
+00090 |     },
+00091 |     # xdof base + subtask refinement.
+00092 |     27: {
+00093 |         "xdof_relative_eef_relative_joint",
+00094 |         "xdof_relative_eef_relative_joint_subtask",
+00095 |     },
+00096 | }
+00097 | 
+00098 | 
+00099 | def _build_tag_to_projector_index(groups: dict[int, set[str]]) -> dict[str, int]:
+00100 |     """Flatten ``{index: {tags}}`` into ``{tag: index}``.
+00101 | 
+00102 |     Guards against a tag accidentally appearing in two groups, which would
+00103 |     otherwise be silently resolved by insertion order into a single mapping.
+00104 |     """
+00105 |     mapping: dict[str, int] = {}
+00106 |     for index, tags in groups.items():
+00107 |         for tag in tags:
+00108 |             if tag in mapping:
+00109 |                 raise ValueError(
+00110 |                     f"Embodiment tag {tag!r} is assigned to multiple projector "
+00111 |                     f"indices ({mapping[tag]} and {index}) in "
+00112 |                     "_PROJECTOR_INDEX_GROUPS; each tag must map to exactly one index."
+00113 |                 )
+00114 |             mapping[tag] = index
+00115 |     return mapping
+00116 | 
+00117 | 
+00118 | EMBODIMENT_TAG_TO_PROJECTOR_INDEX: dict[str, int] = _build_tag_to_projector_index(
+00119 |     _PROJECTOR_INDEX_GROUPS
+00120 | )
+00121 | 
+00122 | 
+00123 | def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3VLProcessor:
+00124 |     if Qwen3VLProcessor is None:
+00125 |         raise ImportError(
+00126 |             "Qwen3VLProcessor is not available. "
+00127 |             "Please upgrade transformers: pip install transformers>=4.52.0"
+00128 |         )
+00129 |     return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+00130 | 
+00131 | 
+00132 | def validate_action_horizons(modality_configs, max_action_horizon: int) -> None:
+00133 |     """Fail at processor construction if any configured embodiment's action horizon
+00134 |     (the number of action ``delta_indices``) exceeds ``max_action_horizon``.
+00135 | 
+00136 |     ``max_action_horizon`` is set from the model's ``action_horizon``; without this
+00137 |     check a horizon/model mismatch (e.g. a 50-step embodiment on a 40-step model)
+00138 |     surfaces only deep in the first forward, after the model and dataset are built.
+00139 |     """
+00140 |     offenders: dict[str, int] = {}
+00141 |     for tag, config in modality_configs.items():
+00142 |         action = config.get("action") if isinstance(config, dict) else None
+00143 |         delta_indices = getattr(action, "delta_indices", None)
+00144 |         if delta_indices is None:
+00145 |             continue
+00146 |         horizon = len(delta_indices)
+00147 |         if horizon > max_action_horizon:
+00148 |             offenders[tag] = horizon
+00149 |     if offenders:
+00150 |         required = max(offenders.values())
+00151 |         details = ", ".join(f"{tag}={horizon}" for tag, horizon in sorted(offenders.items()))
+00152 |         raise ValueError(
+00153 |             f"Embodiment action horizon exceeds max_action_horizon ({max_action_horizon}): "
+00154 |             f"{details}. Increase model config action_horizon to >= {required} (or reduce the "
+00155 |             "embodiment action delta_indices)."
+00156 |         )
+00157 | 
+00158 | 
+00159 | class Gr00tN1d7DataCollator:
+00160 |     def __init__(
+00161 |         self,
+00162 |         model_name: str,
+00163 |         model_type: str = "qwen",
+00164 |         transformers_loading_kwargs: dict = {},
+00165 |     ):
+00166 |         ### We need to use the same processor for padding input ids and concat
+00167 |         self.processor = build_processor(model_name, transformers_loading_kwargs)
+00168 |         # Set padding side to 'left' for Flash Attention compatibility
+00169 |         self.processor.tokenizer.padding_side = "left"
+00170 |         self.model_type = model_type
+00171 |         self.model_name = model_name
+00172 | 
+00173 |     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
+00174 |         batch = {}
+00175 |         keys = list(set().union(*(elem.keys() for elem in features)))
+00176 | 
+00177 |         for key in keys:
+00178 |             values = [elem[key] for elem in features if key in elem]
+00179 |             if key == "vlm_content":
+00180 |                 # Handle vlm_content specially - extract text and images
+00181 |                 text_list = []
+00182 |                 image_inputs = []
+00183 |                 for v in values:
+00184 |                     curr_text_list = [v["text"]]
+00185 | 
+00186 |                     text_list += curr_text_list
+00187 |                     curr_image_inputs = v["images"]
+00188 |                     image_inputs += curr_image_inputs
+00189 | 
+00190 |                 vlm_inputs = self.processor(
+00191 |                     text=text_list,
+00192 |                     images=image_inputs,
+00193 |                     return_tensors="pt",
+00194 |                     padding=True,
+00195 |                 )
+00196 |                 for k, v in vlm_inputs.items():
+00197 |                     batch[k] = v
+00198 |             elif key in (
+00199 |                 "pixel_values",
+00200 |                 "image_grid_thw",
+00201 |                 "attention_mask",
+00202 |                 "input_ids",
+00203 |             ):
+00204 |                 raise Exception("Not implemented")
+00205 |             else:
+00206 |                 # state, state_mask, action and action_mask - stack to form batch dimension
+00207 |                 batch[key] = torch.from_numpy(np.stack(values))
+00208 |         return BatchFeature(data={"inputs": batch})
+00209 | 
+00210 |     def __str__(self):
+00211 |         return f"Gr00tN1d7DataCollator(model_name={self.model_name}, model_type={self.model_type})"
+00212 | 
+00213 | 
+00214 | class Gr00tN1d7Processor(BaseProcessor):
+00215 |     data_collator_class = Gr00tN1d7DataCollator
+00216 | 
+00217 |     def __init__(
+00218 |         self,
+00219 |         modality_configs: dict[str, dict[str, ModalityConfig]],
+00220 |         statistics: (dict[str, dict[str, dict[str, dict[str, list[float]]]]] | None) = None,
+00221 |         use_percentiles: bool = False,
+00222 |         clip_outliers: bool = True,
+00223 |         image_crop_size: list[int] = None,
+00224 |         image_target_size: list[int] = None,
+00225 |         shortest_image_edge: int = 256,
+00226 |         crop_fraction: float = 0.95,
+00227 |         random_rotation_angle: int | None = None,
+00228 |         color_jitter_params: dict[str, float] | None = None,
+00229 |         formalize_language: bool = True,
+00230 |         model_name: str = "nvidia/Cosmos-Reason2-2B",
+00231 |         model_type: str = "qwen",
+00232 |         max_state_dim: int = 29,
+00233 |         max_action_dim: int = 29,
+00234 |         max_action_horizon: int = 50,
+00235 |         apply_sincos_state_encoding: bool = False,
+00236 |         use_albumentations: bool = False,
+00237 |         extra_augmentation_config: dict | None = None,
+00238 |         use_relative_action: bool = False,
+00239 |         embodiment_id_mapping: dict[str, int] | None = None,
+00240 |         transformers_loading_kwargs: dict = {"trust_remote_code": True},
+00241 |         # State augmentation
+00242 |         exclude_state: bool = False,
+00243 |         state_dropout_prob: float = 0.0,
+00244 |         # Normalization
+00245 |         use_mean_std: bool = False,
+00246 |         letter_box_transform: bool = False,
+00247 |     ):
+00248 |         self.modality_configs = parse_modality_configs(modality_configs)
+00249 | 
+00250 |         # Initialize StateActionProcessor for state/action normalization
+00251 |         self.state_action_processor = StateActionProcessor(
+00252 |             modality_configs=modality_configs,
+00253 |             statistics=statistics,
+00254 |             use_percentiles=use_percentiles,
+00255 |             clip_outliers=clip_outliers,
+00256 |             apply_sincos_state_encoding=apply_sincos_state_encoding,
+00257 |             use_relative_action=use_relative_action,
+00258 |         )
+00259 | 
+00260 |         # Save state action processor settings
+00261 |         self.use_percentiles = use_percentiles
+00262 |         self.use_mean_std = use_mean_std
+00263 |         self.clip_outliers = clip_outliers
+00264 |         self.apply_sincos_state_encoding = apply_sincos_state_encoding
+00265 |         self.use_relative_action = use_relative_action
+00266 |         self.extra_augmentation_config = extra_augmentation_config
+00267 | 
+00268 |         # State augmentation settings
+00269 |         self.exclude_state = exclude_state
+00270 |         self.state_dropout_prob = state_dropout_prob
+00271 | 
+00272 |         self.letter_box_transform = letter_box_transform
+00273 | 
+00274 |         # Save VLM settings
+00275 |         self.formalize_language = formalize_language
+00276 |         self.model_name = model_name
+00277 |         self.model_type = model_type
+00278 | 
+00279 |         self.max_state_dim = max_state_dim
+00280 |         self.max_action_dim = max_action_dim
+00281 |         self.max_action_horizon = max_action_horizon
+00282 |         validate_action_horizons(self.modality_configs, self.max_action_horizon)
+00283 | 
+00284 |         # Save image processing settings
+00285 |         self.image_crop_size = image_crop_size
+00286 |         self.image_target_size = image_target_size
+00287 |         self.random_rotation_angle = random_rotation_angle
+00288 |         self.color_jitter_params = color_jitter_params
+00289 |         self.processor = build_processor(model_name, transformers_loading_kwargs)
+00290 |         # Set padding side to 'left' for Flash Attention compatibility
+00291 |         self.processor.tokenizer.padding_side = "left"
+00292 |         self.embodiment_id_mapping = embodiment_id_mapping or EMBODIMENT_TAG_TO_PROJECTOR_INDEX
+00293 |         # Merge any missing pre-trained embodiment tags into the custom mapping
+00294 |         for k, v in EMBODIMENT_TAG_TO_PROJECTOR_INDEX.items():
+00295 |             if k not in self.embodiment_id_mapping:
+00296 |                 self.embodiment_id_mapping[k] = v
+00297 |         self.shortest_image_edge = shortest_image_edge
+00298 |         self.crop_fraction = crop_fraction
+00299 | 
+00300 |         # Statistics cache (mirrors state_action_processor.statistics for serialization)
+00301 |         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
+00302 | 
+00303 |         # Choose between torchvision and albumentations transforms
+00304 |         self.use_albumentations = use_albumentations
+00305 |         if use_albumentations:
+00306 |             self.train_image_transform, self.eval_image_transform = (
+00307 |                 build_image_transformations_albumentations(
+00308 |                     image_target_size,
+00309 |                     image_crop_size,
+00310 |                     random_rotation_angle,
+00311 |                     color_jitter_params,
+00312 |                     shortest_image_edge,
+00313 |                     crop_fraction,
+00314 |                     extra_augmentation_config=self.extra_augmentation_config,
+00315 |                     letter_box_transform=self.letter_box_transform,
+00316 |                 )
+00317 |             )
+00318 |         else:
+00319 |             self.train_image_transform, self.eval_image_transform = build_image_transformations(
+00320 |                 image_target_size,
+00321 |                 image_crop_size,
+00322 |                 random_rotation_angle,
+00323 |                 color_jitter_params,
+00324 |                 letter_box_transform=self.letter_box_transform,
+00325 |             )
+00326 |         self._collator = self.data_collator_class(
+00327 |             model_name=model_name,
+00328 |             model_type=model_type,
+00329 |             transformers_loading_kwargs=transformers_loading_kwargs,
+00330 |         )
+00331 |         self.train()
+00332 | 
+00333 |     @property
+00334 |     def collator(self):
+00335 |         return self._collator
+00336 | 
+00337 |     def train(self):
+00338 |         super().train()
+00339 |         self.state_action_processor.train()
+00340 | 
+00341 |     def eval(self):
+00342 |         super().eval()
+00343 |         self.state_action_processor.eval()
+00344 | 
+00345 |     def set_statistics(
+00346 |         self,
+00347 |         statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]],
+00348 |         override: bool = False,
+00349 |     ) -> None:
+00350 |         """Set dataset statistics for normalization."""
+00351 |         for key in statistics:
+00352 |             if key not in self.statistics or override:
+00353 |                 if override:
+00354 |                     logger.info("Overriding statistics for embodiment %r", key)
+00355 |                 self.statistics[key] = deepcopy(statistics[key])
+00356 |             else:
+00357 |                 # Surfaced as a warning (not print) because callers running with
+00358 |                 # override_pretraining_statistics=False on a mixture dataset will
+00359 |                 # otherwise silently keep the pre-existing pretraining stats and
+00360 |                 # discard newly-merged per-dataset stats — training proceeds with
+00361 |                 # the wrong mean/std and only an easy-to-miss stdout line records
+00362 |                 # the drop.
+00363 |                 logger.warning(
+00364 |                     "Statistics for embodiment %r already present; new stats "
+00365 |                     "DISCARDED (override=False). If the new data differs from "
+00366 |                     "the existing distribution this will cause silent "
+00367 |                     "normalization mismatch — pass override=True (or "
+00368 |                     "override_pretraining_statistics=True at the dataset level) "
+00369 |                     "to use the merged stats instead.",
+00370 |                     key,
+00371 |                 )
+00372 | 
+00373 |         self.state_action_processor.set_statistics(statistics, override=override)
+00374 | 
+00375 |         # Compute action dimensions for convenience
+00376 |         self.action_dim = {}
+00377 |         for embodiment_tag in self.state_action_processor.statistics:
+00378 |             self.action_dim[embodiment_tag] = self.state_action_processor.get_action_dim(
+00379 |                 embodiment_tag
+00380 |             )
+00381 | 
+00382 |     def decode_action(
+00383 |         self,
+00384 |         action: np.ndarray,
+00385 |         embodiment_tag: EmbodimentTag,
+00386 |         state: dict[str, np.ndarray] | None = None,
+00387 |     ):
+00388 |         """Undo action normalization and convert relative actions to absolute."""
+00389 |         # Split concatenated action into joint groups
+00390 |         out_dict = {}
+00391 |         start_idx = 0
+00392 |         joint_groups = self.modality_configs[embodiment_tag.value]["action"].modality_keys
+00393 |         action_horizon = len(self.modality_configs[embodiment_tag.value]["action"].delta_indices)
+00394 |         for key in joint_groups:
+00395 |             joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["action"][
+00396 |                 key
+00397 |             ]["dim"].item()
+00398 |             out_dict[key] = action[..., :action_horizon, start_idx : start_idx + joint_dim]
+00399 |             start_idx += joint_dim
+00400 | 
+00401 |         # Use StateActionProcessor to unnormalize and convert to absolute
+00402 |         return self.state_action_processor.unapply_action(
+00403 |             out_dict, embodiment_tag.value, state=state
+00404 |         )
+00405 | 
+00406 |     def unapply(
+00407 |         self,
+00408 |         action: np.ndarray,
+00409 |         embodiment_tag: EmbodimentTag,
+00410 |         state: dict[str, np.ndarray] | None = None,
+00411 |         prev_action: dict[str, np.ndarray] | None = None,
+00412 |     ) -> dict[str, np.ndarray]:
+00413 |         """Undo action normalization and convert relative→absolute.
+00414 | 
+00415 |         Args:
+00416 |             action: Normalized action array of shape (..., action_horizon, action_dim)
+00417 |             embodiment_tag: Embodiment tag
+00418 |             state: State observations with "state." prefixed keys (for relative actions)
+00419 |             prev_action: Unused (kept for API compatibility)
+00420 | 
+00421 |         Returns:
+00422 |             Dict mapping "action.<key>" to unnormalized (absolute) action arrays.
+00423 |         """
+00424 |         out_dict = {}
+00425 |         start_idx = 0
+00426 |         joint_groups = self.modality_configs[embodiment_tag.value]["action"].modality_keys
+00427 |         action_horizon = len(self.modality_configs[embodiment_tag.value]["action"].delta_indices)
+00428 |         for key in joint_groups:
+00429 |             joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["action"][
+00430 |                 key
+00431 |             ]["dim"].item()
+00432 |             out_dict[key] = action[..., :action_horizon, start_idx : start_idx + joint_dim]
+00433 |             start_idx += joint_dim
+00434 | 
+00435 |         # Strip "state." prefix for StateActionProcessor
+00436 |         stripped_state = None
+00437 |         if state is not None:
+00438 |             stripped_state = {k.replace("state.", ""): v for k, v in state.items()}
+00439 | 
+00440 |         result = self.state_action_processor.unapply_action(
+00441 |             out_dict, embodiment_tag.value, state=stripped_state
+00442 |         )
+00443 |         return {f"action.{key}": value for key, value in result.items()}
+00444 | 
+00445 |     def process_observation(self, observation: dict[str, Any], embodiment_tag: EmbodimentTag):
+00446 |         """Process batched observation tensors for inference.
+00447 | 
+00448 |         Args:
+00449 |             observation: Dict with keys like "video.<view>", "state.<key>", "<language_key>"
+00450 |                 Video values expected as numpy arrays of shape (B, T, H, W, C).
+00451 |             embodiment_tag: Embodiment tag identifying the robot configuration.
+00452 | 
+00453 |         Returns:
+00454 |             BatchFeature with tokenized VLM inputs, state, embodiment_id, and action_mask.
+00455 |         """
+00456 |         modality_config = self.modality_configs[embodiment_tag.value]
+00457 |         transformed_observation = {}
+00458 | 
+00459 |         # Normalize states
+00460 |         state_keys = modality_config["state"].modality_keys
+00461 |         state_data = {key: observation[f"state.{key}"] for key in state_keys}
+00462 |         exclude_state = self.exclude_state or getattr(
+00463 |             modality_config["state"], "exclude_state", False
+00464 |         )
+00465 |         if exclude_state:
+00466 |             normalized_states = torch.cat(
+00467 |                 [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
+00468 |             )
+00469 |         else:
+00470 |             norm_state_dict = self.state_action_processor.apply_state(
+00471 |                 state=state_data, embodiment_tag=embodiment_tag.value
+00472 |             )
+00473 |             normalized_states = torch.cat(
+00474 |                 [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
+00475 |             )
+00476 | 
+00477 |         assert normalized_states.shape[1] <= self.max_state_dim, (
+00478 |             f"State dimension {normalized_states.shape[1]} exceeds max_state_dim {self.max_state_dim}"
+00479 |         )
+00480 |         padding_shape = (
+00481 |             *normalized_states.shape[:-1],
+00482 |             self.max_state_dim - normalized_states.shape[-1],
+00483 |         )
+00484 |         normalized_states = torch.cat([normalized_states, torch.zeros(padding_shape)], dim=-1)
+00485 |         transformed_observation["state"] = normalized_states
+00486 | 
+00487 |         # Process images: observation values are (B, T, H, W, C) numpy arrays
+00488 |         image_keys = modality_config["video"].modality_keys
+00489 |         images_dict = {view: torch.from_numpy(observation[f"video.{view}"]) for view in image_keys}
+00490 |         images = torch.stack(
+00491 |             [images_dict[view] for view in image_keys], dim=2
+00492 |         )  # (B, T, V, H, W, C)
+00493 |         assert images.ndim == 6
+00494 |         B, T, V, img_H, img_W, img_C = images.shape
+00495 | 
+00496 |         if self.use_albumentations:
+00497 |             images_flat = images.reshape(B * T * V, img_H, img_W, img_C)
+00498 |             pil_images = [Image.fromarray(img.numpy()) for img in images_flat]
+00499 |             transformed_pil, _ = apply_with_replay(self.eval_image_transform, pil_images)
+00500 |             transformed_stacked = torch.stack(transformed_pil)  # (B*T*V, C, H_new, W_new)
+00501 |             _, img_C_new, img_H_new, img_W_new = transformed_stacked.shape
+00502 |             transformed_images = transformed_stacked.reshape(
+00503 |                 B, T * V, img_C_new, img_H_new, img_W_new
+00504 |             ).numpy()
+00505 |         else:
+00506 |             # Rearrange (B, T, V, H, W, C) → (B, T*V, C, H, W) for torchvision
+00507 |             images_perm = images.permute(0, 1, 2, 5, 3, 4).reshape(B, T * V, img_C, img_H, img_W)
+00508 |             transformed_images = self.eval_image_transform(images_perm).numpy()
+00509 | 
+00510 |         language_key = modality_config["language"].modality_keys[0]
+00511 |         language = [
+00512 |             re.sub(r"[^\w\s]", "", lang.lower()) if self.formalize_language else lang
+00513 |             for lang in observation[language_key]
+00514 |         ]
+00515 | 
+00516 |         texts, all_images = [], []
+00517 |         for i in range(B):
+00518 |             vlm_inputs = self._apply_vlm_processing(transformed_images[i], language[i])
+00519 |             vc = vlm_inputs["vlm_content"]
+00520 |             texts.append(vc["text"])
+00521 |             all_images.extend(vc["images"])
+00522 |         tokenized = self.processor(text=texts, images=all_images, return_tensors="pt", padding=True)
+00523 |         for k, v in tokenized.items():
+00524 |             transformed_observation[k] = v
+00525 | 
+00526 |         embodiment_id = (
+00527 |             torch.ones(B, dtype=torch.int32) * self.embodiment_id_mapping[embodiment_tag.value]
+00528 |         )
+00529 |         transformed_observation["embodiment_id"] = embodiment_id
+00530 | 
+00531 |         # Action mask: shape (B, max_action_horizon), 1 in the valid horizon window
+00532 |         action_config = modality_config["action"]
+00533 |         action_horizon = len(action_config.delta_indices)
+00534 |         assert action_horizon <= self.max_action_horizon, (
+00535 |             f"Action horizon {action_horizon} (from delta_indices) exceeds"
+00536 |             f" max_action_horizon {self.max_action_horizon}. Increase model config"
+00537 |             f" action_horizon to >= {action_horizon}."
+00538 |         )
+00539 |         action_mask = torch.zeros((B, self.max_action_horizon), dtype=torch.float32)
+00540 |         if action_horizon > 0:
+00541 |             action_mask[:, :action_horizon] = 1.0
+00542 |         transformed_observation["action_mask"] = action_mask
+00543 | 
+00544 |         return BatchFeature(transformed_observation)
+00545 | 
+00546 |     def _apply_vlm_processing(self, images: np.ndarray, language: str) -> BatchFeature:
+00547 |         """
+00548 |         Args:
+00549 |             batch:
+00550 |                 video: [T, C, H, W]
+00551 |         Returns: vlm_content format for collation
+00552 |         """
+00553 |         frames = [torch.as_tensor(v) for v in images]
+00554 | 
+00555 |         # Create conversation with images and text
+00556 |         conversation = [
+00557 |             {
+00558 |                 "role": "user",
+00559 |                 "content": [
+00560 |                     *[{"type": "image", "image": img} for img in frames],
+00561 |                     {"type": "text", "text": language},
+00562 |                 ],
+00563 |             }
+00564 |         ]
+00565 | 
+00566 |         # Apply chat template but don't process yet - let collator handle it
+00567 |         text = self.processor.apply_chat_template(
+00568 |             conversation, tokenize=False, add_generation_prompt=False
+00569 |         )
+00570 | 
+00571 |         # Return vlm_content format for collation
+00572 |         return {
+00573 |             "vlm_content": {
+00574 |                 "text": text,
+00575 |                 "images": frames,
+00576 |                 "conversation": conversation,
+00577 |             }
+00578 |         }
+00579 | 
+00580 |     def __call__(
+00581 |         self,
+00582 |         messages: list[dict[str, Any]],
+00583 |     ):
+00584 |         assert len(messages) == 1
+00585 |         content = messages[0]["content"]
+00586 |         embodiment_tag = content.embodiment
+00587 |         action_data = content.actions
+00588 |         state_data = content.states
+00589 | 
+00590 |         # Use StateActionProcessor to handle relative conversion and normalization
+00591 |         norm_state_dict, normalized_actions = self.state_action_processor.apply(
+00592 |             state=state_data,
+00593 |             action=action_data,
+00594 |             embodiment_tag=embodiment_tag.value,
+00595 |         )
+00596 | 
+00597 |         if normalized_actions:
+00598 |             # Concatenate actions
+00599 |             action_keys = self.modality_configs[embodiment_tag.value]["action"].modality_keys
+00600 |             normalized_actions = torch.cat(
+00601 |                 [torch.from_numpy(normalized_actions[key]) for key in action_keys],
+00602 |                 dim=-1,
+00603 |             )  # (t, d)
+00604 |             action_dim = normalized_actions.shape[1]
+00605 |             # Pad action to max_action_dim
+00606 |             normalized_actions = torch.cat(
+00607 |                 [
+00608 |                     normalized_actions,
+00609 |                     torch.zeros(
+00610 |                         normalized_actions.shape[0],
+00611 |                         self.max_action_dim - normalized_actions.shape[1],
+00612 |                     ),
+00613 |                 ],
+00614 |                 dim=-1,
+00615 |             )  # (t, max_action_dim)
+00616 |             # Pad action to max_action_horizon
+00617 |             action_horizon = normalized_actions.shape[0]
+00618 |             assert action_horizon <= self.max_action_horizon, (
+00619 |                 f"Action sequence length {action_horizon} exceeds max_action_horizon"
+00620 |                 f" {self.max_action_horizon}. Increase model config action_horizon to"
+00621 |                 f" >= {action_horizon}."
+00622 |             )
+00623 |             normalized_actions = torch.cat(
+00624 |                 [
+00625 |                     normalized_actions,
+00626 |                     torch.zeros(
+00627 |                         self.max_action_horizon - normalized_actions.shape[0],
+00628 |                         self.max_action_dim,
+00629 |                     ),
+00630 |                 ],
+00631 |                 dim=0,
+00632 |             )  # (max_action_horizon, max_action_dim)
+00633 |             # Create action mask
+00634 |             action_mask = torch.ones_like(normalized_actions)
+00635 |             action_mask[action_horizon:] = 0
+00636 |             action_mask[:, action_dim:] = 0
+00637 |         else:
+00638 |             assert not self.training, "Action is required in training mode"
+00639 |             normalized_actions = None
+00640 |             action_mask = None
+00641 | 
+00642 |         # Concatenate states with optional dropout/noise augmentation
+00643 |         state_keys = self.modality_configs[embodiment_tag.value]["state"].modality_keys
+00644 |         exclude_state = self.exclude_state or getattr(
+00645 |             self.modality_configs[embodiment_tag.value]["state"], "exclude_state", False
+00646 |         )
+00647 |         if exclude_state or (
+00648 |             self.state_dropout_prob > 0
+00649 |             and random.random() < self.state_dropout_prob
+00650 |             and self.training
+00651 |         ):
+00652 |             normalized_states = torch.cat(
+00653 |                 [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
+00654 |             )
+00655 |         else:
+00656 |             normalized_states = torch.cat(
+00657 |                 [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
+00658 |             )
+00659 |         normalized_states = torch.cat(
+00660 |             [
+00661 |                 normalized_states,
+00662 |                 torch.zeros(
+00663 |                     normalized_states.shape[0],
+00664 |                     self.max_state_dim - normalized_states.shape[1],
+00665 |                 ),
+00666 |             ],
+00667 |             dim=-1,
+00668 |         )
+00669 | 
+00670 |         # Crop and resize images.
+00671 |         if self.training:
+00672 |             image_transform = self.train_image_transform
+00673 |         else:
+00674 |             image_transform = self.eval_image_transform
+00675 |         image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
+00676 | 
+00677 |         if self.formalize_language:
+00678 |             language = content.text.lower()
+00679 |             language = re.sub(r"[^\w\s]", "", language)
+00680 |         else:
+00681 |             language = content.text
+00682 | 
+00683 |         vlm_inputs = self._get_vlm_inputs(
+00684 |             image_keys=image_keys,
+00685 |             images=content.images,
+00686 |             masks=content.masks,
+00687 |             image_transform=image_transform,
+00688 |             language=language,
+00689 |         )
+00690 | 
+00691 |         transformed_inputs = {
+00692 |             "state": normalized_states.to(torch.get_default_dtype()),
+00693 |         }
+00694 |         if normalized_actions is not None:
+00695 |             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
+00696 |         # Add VLM inputs
+00697 |         transformed_inputs.update(vlm_inputs)
+00698 |         if action_mask is not None:
+00699 |             transformed_inputs["action_mask"] = action_mask
+00700 |         transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
+00701 |         return transformed_inputs
+00702 | 
+00703 |     def _get_vlm_inputs(
+00704 |         self,
+00705 |         image_keys: list[str],
+00706 |         images: list[Image.Image],
+00707 |         masks: dict[str, list[np.ndarray]] | None,
+00708 |         image_transform: transforms.Compose | A.Compose,
+00709 |         language: str,
+00710 |     ):
+00711 |         temporal_stacked_images = {}
+00712 | 
+00713 |         if self.use_albumentations:
+00714 |             # Use albumentations transforms
+00715 |             replay = None
+00716 |             for view in image_keys:
+00717 |                 assert view in images, f"{view} not in {images}"
+00718 |                 if masks is not None:
+00719 |                     assert view in masks, f"{view} not in masks"
+00720 |                 view_masks = masks.get(view) if masks else None
+00721 |                 view_images = images[view]
+00722 | 
+00723 |                 # Apply transforms with replay for consistency
+00724 |                 transformed_images, replay = apply_with_replay(
+00725 |                     image_transform, view_images, view_masks, replay
+00726 |                 )
+00727 |                 temporal_stacked_images[view] = torch.stack(transformed_images)  # (T, C, H, W)
+00728 |         else:
+00729 |             if masks is not None:
+00730 |                 raise ValueError(
+00731 |                     "Mask transforms require albumentations. Set use_albumentations_transforms=True."
+00732 |                 )
+00733 |             # Use torchvision transforms
+00734 |             for view in image_keys:
+00735 |                 assert view in images, f"{view} not in {images}"
+00736 |                 temporal_stacked_images[view] = torch.stack(
+00737 |                     [image_transform(img) for img in images[view]]
+00738 |                 )  # (T, C, H, W)
+00739 | 
+00740 |         for k, v in temporal_stacked_images.items():
+00741 |             assert isinstance(k, str), f"{k} is not a string"
+00742 |             assert isinstance(v, torch.Tensor), f"{v} is not a torch tensor"
+00743 |             assert v.ndim == 4, f"{v} is not a 4D tensor"
+00744 |             assert v.dtype == torch.uint8, f"{v} is not a uint8 tensor"
+00745 |             assert v.shape[1] == 3, f"{v} is not a 3 channel tensor"
+00746 | 
+00747 |         stacked_images = torch.stack(
+00748 |             [temporal_stacked_images[view] for view in image_keys], dim=1
+00749 |         ).flatten(0, 1)  # (T*V, C, H, W)
+00750 | 
+00751 |         vlm_inputs = self._apply_vlm_processing(stacked_images, language)
+00752 |         return vlm_inputs
+00753 | 
+00754 |     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
+00755 |         save_directory = Path(save_directory)
+00756 |         save_directory.mkdir(parents=True, exist_ok=True)
+00757 |         main_config_file = save_directory / "processor_config.json"
+00758 |         statistics_file = save_directory / "statistics.json"
+00759 |         embodiment_id_file = save_directory / "embodiment_id.json"
+00760 | 
+00761 |         config = {
+00762 |             "processor_class": self.__class__.__name__,
+00763 |             "processor_kwargs": {
+00764 |                 "modality_configs": to_json_serializable(self.modality_configs),
+00765 |                 # Image processing settings
+00766 |                 "image_crop_size": self.image_crop_size,
+00767 |                 "image_target_size": self.image_target_size,
+00768 |                 "use_albumentations": self.use_albumentations,
+00769 |                 "random_rotation_angle": self.random_rotation_angle,
+00770 |                 "color_jitter_params": self.color_jitter_params,
+00771 |                 "shortest_image_edge": self.shortest_image_edge,
+00772 |                 "crop_fraction": self.crop_fraction,
+00773 |                 "letter_box_transform": self.letter_box_transform,
+00774 |                 # VLM settings
+00775 |                 "model_name": self.model_name,
+00776 |                 "model_type": self.model_type,
+00777 |                 "formalize_language": self.formalize_language,
+00778 |                 # State action dimensions
+00779 |                 "max_state_dim": self.max_state_dim,
+00780 |                 "max_action_dim": self.max_action_dim,
+00781 |                 "max_action_horizon": self.max_action_horizon,
+00782 |                 # StateActionProcessor settings
+00783 |                 "use_percentiles": self.use_percentiles,
+00784 |                 "use_mean_std": self.use_mean_std,
+00785 |                 "clip_outliers": self.clip_outliers,
+00786 |                 "apply_sincos_state_encoding": self.apply_sincos_state_encoding,
+00787 |                 "use_relative_action": self.use_relative_action,
+00788 |                 # State augmentation
+00789 |                 "exclude_state": self.exclude_state,
+00790 |                 "state_dropout_prob": self.state_dropout_prob,
+00791 |             },
+00792 |         }
+00793 |         with open(main_config_file, "w") as f:
+00794 |             json.dump(config, f, indent=2)
+00795 |         # Save statistics
+00796 |         with open(statistics_file, "w") as f:
+00797 |             json.dump(
+00798 |                 to_json_serializable(self.state_action_processor.statistics),
+00799 |                 f,
+00800 |                 indent=2,
+00801 |             )
+00802 |         # Save embodiment id mapping
+00803 |         with open(embodiment_id_file, "w") as f:
+00804 |             json.dump(self.embodiment_id_mapping, f, indent=2)
+00805 |         return [main_config_file, statistics_file, embodiment_id_file]
+00806 | 
+00807 |     @classmethod
+00808 |     def from_pretrained(cls, pretrained_model_name_or_path: str | Path, **kwargs):
+00809 |         transformers_loading_kwargs = kwargs.pop(
+00810 |             "transformers_loading_kwargs", {"trust_remote_code": True}
+00811 |         )
+00812 |         hub_keys = (
+00813 |             "_commit_hash",
+00814 |             "cache_dir",
+00815 |             "force_download",
+00816 |             "local_files_only",
+00817 |             "proxies",
+00818 |             "revision",
+00819 |             "subfolder",
+00820 |             "token",
+00821 |         )
+00822 |         hub_kwargs = {key: kwargs.pop(key) for key in hub_keys if key in kwargs}
+00823 |         use_auth_token = kwargs.pop("use_auth_token", None)
+00824 |         if "token" not in hub_kwargs and use_auth_token is not None:
+00825 |             hub_kwargs["token"] = use_auth_token
+00826 |         pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
+00827 |         config_file = pretrained_model_name_or_path / "processor_config.json"
+00828 |         statistics_file = pretrained_model_name_or_path / "statistics.json"
+00829 |         embodiment_id_file = pretrained_model_name_or_path / "embodiment_id.json"
+00830 |         is_local = os.path.isdir(pretrained_model_name_or_path)
+00831 |         if not is_local:
+00832 |             config_file = Path(
+00833 |                 cached_file(pretrained_model_name_or_path, "processor_config.json", **hub_kwargs)
+00834 |             )
+00835 |             statistics_file = Path(
+00836 |                 cached_file(pretrained_model_name_or_path, "statistics.json", **hub_kwargs)
+00837 |             )
+00838 |             embodiment_id_file = Path(
+00839 |                 cached_file(pretrained_model_name_or_path, "embodiment_id.json", **hub_kwargs)
+00840 |             )
+00841 | 
+00842 |         with open(config_file, "r") as f:
+00843 |             config = json.load(f)
+00844 |         with open(statistics_file, "r") as f:
+00845 |             statistics = json.load(f)
+00846 |         if embodiment_id_file.exists():
+00847 |             with open(embodiment_id_file, "r") as f:
+00848 |                 embodiment_id_mapping = json.load(f)
+00849 |         else:
+00850 |             embodiment_id_mapping = None
+00851 |         processor_kwargs = config["processor_kwargs"]
+00852 |         processor_kwargs["statistics"] = statistics
+00853 |         processor_kwargs["embodiment_id_mapping"] = embodiment_id_mapping
+00854 | 
+00855 |         # Backfill fields that older checkpoints may not have serialized.
+00856 |         # Without these, __init__ defaults silently apply — correct today but
+00857 |         # fragile if defaults ever change.
+00858 |         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
+00859 |         processor_kwargs.setdefault("model_type", "qwen")
+00860 |         processor_kwargs.setdefault("clip_outliers", True)
+00861 | 
+00862 |         # Directly override other processor kwargs
+00863 |         if kwargs:
+00864 |             # Override modality configs while keeping pretrained embodiment configs
+00865 |             modality_configs = kwargs.pop("modality_configs", {})
+00866 |             for embodiment_tag, modality_config in modality_configs.items():
+00867 |                 processor_kwargs["modality_configs"][embodiment_tag] = modality_config
+00868 |             override_keys = [
+00869 |                 "random_rotation_angle",
+00870 |                 "color_jitter_params",
+00871 |                 "use_relative_action",
+00872 |                 "exclude_state",
+00873 |                 "state_dropout_prob",
+00874 |                 "use_mean_std",
+00875 |                 "model_name",
+00876 |                 "model_type",
+00877 |                 "max_action_horizon",
+00878 |                 "max_state_dim",
+00879 |                 "max_action_dim",
+00880 |                 # Latent A2A processor contract. These keys are ignored by the
+00881 |                 # original processor because its pipeline never supplies them,
+00882 |                 # but must remain overridable when resuming an A2A checkpoint.
+00883 |                 "a2a_history_horizon",
+00884 |                 "a2a_future_horizon",
+00885 |                 "a2a_channel_specs",
+00886 |                 "a2a_cold_start",
+00887 |                 "a2a_canonical_statistics",
+00888 |                 "a2a_require_canonical_statistics",
+00889 |                 "a2a_require_explicit_channel_specs",
+00890 |                 "a2a_require_semantic_metadata",
+00891 |                 "a2a_expected_contract_sha256",
+00892 |             ]
+00893 |             for key in override_keys:
+00894 |                 if key in kwargs:
+00895 |                     override = kwargs.pop(key)
+00896 |                     if override is not None:
+00897 |                         processor_kwargs[key] = override
+00898 |         return cls(**processor_kwargs, transformers_loading_kwargs=transformers_loading_kwargs)
+00899 | 
+00900 | 
+00901 | AutoProcessor.register("Gr00tN1d7", Gr00tN1d7Processor)

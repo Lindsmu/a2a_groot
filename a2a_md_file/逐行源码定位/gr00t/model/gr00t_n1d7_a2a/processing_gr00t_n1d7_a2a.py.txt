@@ -1,0 +1,742 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | 
+00004 | """Processor for canonical executed-history to future-action trajectories."""
+00005 | 
+00006 | from __future__ import annotations
+00007 | 
+00008 | from dataclasses import asdict
+00009 | import json
+00010 | from pathlib import Path
+00011 | from typing import Any
+00012 | 
+00013 | import numpy as np
+00014 | import torch
+00015 | from transformers import AutoProcessor
+00016 | 
+00017 | from gr00t.data.a2a_contract import canonical_statistics_sha256, validate_channel_contract
+00018 | from gr00t.data.types import A2AChannelSpec
+00019 | from gr00t.data.utils import normalize_values_minmax, unnormalize_values_minmax
+00020 | from gr00t.model.gr00t_n1d7.processing_gr00t_n1d7 import Gr00tN1d7Processor
+00021 | 
+00022 | 
+00023 | _RAW_LIBERO_CONTROLLER_KEYS = {"x", "y", "z", "roll", "pitch", "yaw", "gripper"}
+00024 | 
+00025 | 
+00026 | def _as_numpy(value: Any) -> np.ndarray:
+00027 |     if isinstance(value, torch.Tensor):
+00028 |         return value.detach().cpu().numpy()
+00029 |     return np.asarray(value)
+00030 | 
+00031 | 
+00032 | class Gr00tN1d7A2AProcessor(Gr00tN1d7Processor):
+00033 |     """Build source and target trajectories in one shared, absolute space.
+00034 | 
+00035 |     Strict training requires explicit :class:`A2AChannelSpec` metadata and a
+00036 |     hash-bound canonical statistics artifact. The equal-dimension inference
+00037 |     fallback is retained only for deliberately non-strict exploratory runs.
+00038 |     """
+00039 | 
+00040 |     def __init__(
+00041 |         self,
+00042 |         *args,
+00043 |         a2a_history_horizon: int = 8,
+00044 |         a2a_future_horizon: int = 8,
+00045 |         a2a_channel_specs: dict[str, list[dict[str, Any]]] | None = None,
+00046 |         a2a_cold_start: str = "repeat_first_state",
+00047 |         a2a_canonical_statistics: dict[str, Any] | None = None,
+00048 |         a2a_canonical_statistics_path: str | Path | None = None,
+00049 |         a2a_require_canonical_statistics: bool = False,
+00050 |         a2a_require_explicit_channel_specs: bool = False,
+00051 |         a2a_require_semantic_metadata: bool = False,
+00052 |         a2a_expected_contract_sha256: str | None = None,
+00053 |         **kwargs,
+00054 |     ):
+00055 |         self.a2a_history_horizon = int(a2a_history_horizon)
+00056 |         self.a2a_future_horizon = int(a2a_future_horizon)
+00057 |         if self.a2a_history_horizon <= 0 or self.a2a_future_horizon <= 0:
+00058 |             raise ValueError("A2A history/future horizons must be positive")
+00059 |         if self.a2a_history_horizon != self.a2a_future_horizon:
+00060 |             raise ValueError(
+00061 |                 "The strict latent A2A implementation requires equal history/future horizons"
+00062 |             )
+00063 |         if a2a_cold_start not in {"repeat_first_state", "require_full_history"}:
+00064 |             raise ValueError(f"Unsupported A2A cold-start mode: {a2a_cold_start}")
+00065 |         self.a2a_cold_start = a2a_cold_start
+00066 |         if a2a_canonical_statistics is not None and a2a_canonical_statistics_path is not None:
+00067 |             raise ValueError(
+00068 |                 "Provide either embedded a2a_canonical_statistics or "
+00069 |                 "a2a_canonical_statistics_path, not both"
+00070 |             )
+00071 |         if a2a_canonical_statistics_path is not None:
+00072 |             statistics_path = Path(a2a_canonical_statistics_path)
+00073 |             with statistics_path.open("r", encoding="utf-8") as handle:
+00074 |                 a2a_canonical_statistics = json.load(handle)
+00075 |         self.a2a_canonical_statistics = a2a_canonical_statistics
+00076 |         self.a2a_require_canonical_statistics = bool(a2a_require_canonical_statistics)
+00077 |         self.a2a_require_explicit_channel_specs = bool(a2a_require_explicit_channel_specs)
+00078 |         self.a2a_require_semantic_metadata = bool(a2a_require_semantic_metadata)
+00079 |         self.a2a_expected_contract_sha256 = a2a_expected_contract_sha256
+00080 |         self._configured_channel_specs = a2a_channel_specs or {}
+00081 |         self._resolved_channel_specs: dict[str, list[A2AChannelSpec]] = {}
+00082 |         self.a2a_statistics: dict[str, dict[str, dict[str, list[float]]]] = {}
+00083 |         self.a2a_norm_params: dict[str, dict[str, dict[str, np.ndarray]]] = {}
+00084 |         super().__init__(*args, **kwargs)
+00085 |         if self.state_action_processor.statistics:
+00086 |             self._rebuild_a2a_parameters(self.state_action_processor.statistics)
+00087 | 
+00088 |     def set_statistics(self, statistics: dict, override: bool = False) -> None:
+00089 |         super().set_statistics(statistics, override=override)
+00090 |         self._rebuild_a2a_parameters(self.state_action_processor.statistics)
+00091 | 
+00092 |     def _explicit_specs(self, embodiment: str) -> list[A2AChannelSpec] | None:
+00093 |         configured = self._configured_channel_specs.get(embodiment)
+00094 |         if configured is None:
+00095 |             return None
+00096 |         return [spec if isinstance(spec, A2AChannelSpec) else A2AChannelSpec(**spec) for spec in configured]
+00097 | 
+00098 |     @staticmethod
+00099 |     def _dimension(stats: dict[str, Any]) -> int:
+00100 |         return int(np.asarray(stats["mean"]).shape[-1])
+00101 | 
+00102 |     def _resolve_specs(self, embodiment: str, statistics: dict) -> list[A2AChannelSpec]:
+00103 |         action_cfg = self.modality_configs[embodiment]["action"]
+00104 |         action_keys = action_cfg.modality_keys
+00105 |         action_configs = action_cfg.action_configs
+00106 |         explicit = self._explicit_specs(embodiment)
+00107 |         if self.a2a_require_explicit_channel_specs and explicit is None:
+00108 |             raise ValueError(
+00109 |                 f"Strict A2A requires explicit a2a_channel_specs for {embodiment!r}; "
+00110 |                 "equal tensor dimensions do not prove matching physical semantics"
+00111 |             )
+00112 |         explicit_by_key = {spec.action_key: spec for spec in explicit or []}
+00113 |         unknown = set(explicit_by_key) - set(action_keys)
+00114 |         if unknown:
+00115 |             raise ValueError(f"A2A specs reference unknown action keys for {embodiment}: {sorted(unknown)}")
+00116 |         if self.a2a_require_explicit_channel_specs:
+00117 |             missing = set(action_keys) - set(explicit_by_key)
+00118 |             if missing:
+00119 |                 raise ValueError(
+00120 |                     f"Strict A2A specs do not classify action keys for {embodiment}: "
+00121 |                     f"{sorted(missing)}"
+00122 |                 )
+00123 | 
+00124 |         resolved: list[A2AChannelSpec] = []
+00125 |         for index, action_key in enumerate(action_keys):
+00126 |             configured = explicit_by_key.get(action_key)
+00127 |             action_config = action_configs[index] if action_configs is not None else None
+00128 |             source_key = (
+00129 |                 configured.source_state_key
+00130 |                 if configured is not None and configured.source_state_key is not None
+00131 |                 else getattr(action_config, "state_key", None) or action_key
+00132 |             )
+00133 |             action_stats = statistics[embodiment]["action"][action_key]
+00134 |             action_dim = self._dimension(action_stats)
+00135 |             state_stats = statistics[embodiment].get("state", {}).get(source_key)
+00136 |             state_dim = self._dimension(state_stats) if state_stats is not None else None
+00137 |             if configured is not None and configured.dim is not None:
+00138 |                 if int(configured.dim) != action_dim:
+00139 |                     raise ValueError(
+00140 |                         f"A2A spec {embodiment}/{action_key} declares dim={configured.dim}, "
+00141 |                         f"but dataset statistics report {action_dim}"
+00142 |                     )
+00143 | 
+00144 |             kind = configured.kind if configured is not None else "auto"
+00145 |             if self.a2a_require_explicit_channel_specs and kind == "auto":
+00146 |                 raise ValueError(
+00147 |                     f"Strict A2A spec {embodiment}/{action_key} must choose an explicit kind"
+00148 |                 )
+00149 |             if kind == "auto":
+00150 |                 kind = "continuous" if state_dim == action_dim else "regression"
+00151 |             if kind == "continuous" and state_dim != action_dim:
+00152 |                 raise ValueError(
+00153 |                     f"A2A continuous channel {embodiment}/{action_key} requires matching state "
+00154 |                     f"dimension, got state {source_key!r}={state_dim}, action={action_dim}"
+00155 |                 )
+00156 |             if (
+00157 |                 kind == "continuous"
+00158 |                 and self.a2a_require_semantic_metadata
+00159 |                 and embodiment == "libero_sim"
+00160 |                 and action_key in _RAW_LIBERO_CONTROLLER_KEYS
+00161 |             ):
+00162 |                 raise ValueError(
+00163 |                     "Raw LIBERO state columns are absolute measured EEF pose while its "
+00164 |                     "same-named action columns are normalized OSC delta commands. Strict "
+00165 |                     "A2A requires newly preprocessed canonical column names and a versioned "
+00166 |                     "forward/inverse controller adapter."
+00167 |                 )
+00168 |             if kind == "continuous" and self.a2a_require_semantic_metadata:
+00169 |                 assert configured is not None
+00170 |                 semantic_pairs = {
+00171 |                     "format": (configured.source_format, configured.target_format),
+00172 |                     "unit": (configured.source_unit, configured.target_unit),
+00173 |                     "frame": (configured.source_frame, configured.target_frame),
+00174 |                 }
+00175 |                 for semantic, (source_value, target_value) in semantic_pairs.items():
+00176 |                     if source_value is None or target_value is None:
+00177 |                         raise ValueError(
+00178 |                             f"Strict continuous channel {embodiment}/{action_key} must declare "
+00179 |                             f"source_{semantic} and target_{semantic}"
+00180 |                         )
+00181 |                     if source_value != target_value:
+00182 |                         raise ValueError(
+00183 |                             f"Continuous channel {embodiment}/{action_key} has mismatched "
+00184 |                             f"{semantic}: source={source_value!r}, target={target_value!r}"
+00185 |                         )
+00186 |                 if configured.canonical_format == "auto":
+00187 |                     raise ValueError(
+00188 |                         f"Strict continuous channel {embodiment}/{action_key} must declare "
+00189 |                         "canonical_format"
+00190 |                     )
+00191 |                 if configured.canonical_format != configured.source_format:
+00192 |                     raise ValueError(
+00193 |                         f"Canonical format for {embodiment}/{action_key} must equal the "
+00194 |                         "already-canonical source/target format"
+00195 |                     )
+00196 |             if kind == "categorical":
+00197 |                 if configured is None or configured.num_classes is None:
+00198 |                     raise ValueError(
+00199 |                         f"Categorical A2A channel {embodiment}/{action_key} requires num_classes"
+00200 |                     )
+00201 |                 if action_dim != configured.num_classes:
+00202 |                     raise ValueError(
+00203 |                         "Categorical channels must be stored as one-hot action groups whose "
+00204 |                         "dimension equals num_classes"
+00205 |                     )
+00206 |             if kind == "unsupported":
+00207 |                 raise ValueError(
+00208 |                     f"Action channel {embodiment}/{action_key} is marked unsupported; remove it "
+00209 |                     "from the action modality or choose an explicit auxiliary kind"
+00210 |                 )
+00211 |             resolved.append(
+00212 |                 A2AChannelSpec(
+00213 |                     action_key=action_key,
+00214 |                     source_state_key=source_key,
+00215 |                     kind=kind,
+00216 |                     canonical_format=(configured.canonical_format if configured else "auto"),
+00217 |                     source_format=(configured.source_format if configured else None),
+00218 |                     target_format=(configured.target_format if configured else None),
+00219 |                     source_unit=(configured.source_unit if configured else None),
+00220 |                     target_unit=(configured.target_unit if configured else None),
+00221 |                     source_frame=(configured.source_frame if configured else None),
+00222 |                     target_frame=(configured.target_frame if configured else None),
+00223 |                     dim=action_dim,
+00224 |                     num_classes=(configured.num_classes if configured else None),
+00225 |                 )
+00226 |             )
+00227 |         if not any(spec.kind == "continuous" for spec in resolved):
+00228 |             raise ValueError(
+00229 |                 f"Latent A2A requires at least one executed-history continuous channel for "
+00230 |                 f"{embodiment!r}"
+00231 |             )
+00232 |         return resolved
+00233 | 
+00234 |     def _bounds(self, stats: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+00235 |         lower_key, upper_key = ("q01", "q99") if self.use_percentiles else ("min", "max")
+00236 |         return np.asarray(stats[lower_key], dtype=np.float32), np.asarray(
+00237 |             stats[upper_key], dtype=np.float32
+00238 |         )
+00239 | 
+00240 |     def _canonical_statistics_for_embodiment(
+00241 |         self, embodiment: str
+00242 |     ) -> dict[str, Any] | None:
+00243 |         statistics = self.a2a_canonical_statistics
+00244 |         if statistics is None:
+00245 |             return None
+00246 |         if "feature_dim" in statistics:
+00247 |             configured_embodiments = [
+00248 |                 name
+00249 |                 for name in self.modality_configs
+00250 |                 if name in self.state_action_processor.statistics
+00251 |             ]
+00252 |             if len(configured_embodiments) > 1:
+00253 |                 raise ValueError(
+00254 |                     "A flat canonical statistics file can only be used with one embodiment; "
+00255 |                     "provide an embodiment-keyed mapping for mixtures"
+00256 |                 )
+00257 |             return statistics
+00258 |         selected = statistics.get(embodiment)
+00259 |         if selected is None:
+00260 |             raise ValueError(
+00261 |                 f"Canonical A2A statistics do not contain embodiment {embodiment!r}"
+00262 |             )
+00263 |         if not isinstance(selected, dict) or "feature_dim" not in selected:
+00264 |             raise ValueError(
+00265 |                 f"Invalid canonical statistics entry for embodiment {embodiment!r}"
+00266 |             )
+00267 |         return selected
+00268 | 
+00269 |     def _canonical_bounds(
+00270 |         self, statistics: dict[str, Any], start: int, end: int, embodiment: str, key: str
+00271 |     ) -> tuple[np.ndarray, np.ndarray]:
+00272 |         if statistics.get("input_space") != "unnormalized_canonical_physical":
+00273 |             raise ValueError(
+00274 |                 "Canonical A2A statistics must be built from unnormalized physical trajectories"
+00275 |             )
+00276 |         feature_dim = int(statistics.get("feature_dim", -1))
+00277 |         if feature_dim < end:
+00278 |             raise ValueError(
+00279 |                 f"Canonical statistics feature_dim={feature_dim} does not cover "
+00280 |                 f"{embodiment}/{key} at channels [{start}:{end}]"
+00281 |             )
+00282 |         active = np.asarray(statistics.get("active_channel_mask"), dtype=bool)
+00283 |         if active.shape != (feature_dim,) or not np.all(active[start:end]):
+00284 |             raise ValueError(
+00285 |                 f"Canonical statistics mark continuous channel {embodiment}/{key} inactive"
+00286 |             )
+00287 |         if self.use_percentiles:
+00288 |             lower_values = statistics.get("q_low", statistics.get("q01"))
+00289 |             upper_values = statistics.get("q_high", statistics.get("q99"))
+00290 |         else:
+00291 |             lower_values = statistics.get("min")
+00292 |             upper_values = statistics.get("max")
+00293 |         lower = np.asarray(lower_values, dtype=np.float32)
+00294 |         upper = np.asarray(upper_values, dtype=np.float32)
+00295 |         if lower.shape != (feature_dim,) or upper.shape != (feature_dim,):
+00296 |             raise ValueError("Canonical A2A bounds must be one vector per feature")
+00297 |         if not np.all(np.isfinite(lower[start:end])) or not np.all(
+00298 |             np.isfinite(upper[start:end])
+00299 |         ):
+00300 |             raise ValueError(f"Canonical bounds for {embodiment}/{key} are non-finite")
+00301 |         if np.any(upper[start:end] < lower[start:end]):
+00302 |             raise ValueError(f"Canonical bounds for {embodiment}/{key} are reversed")
+00303 |         return lower[start:end], upper[start:end]
+00304 | 
+00305 |     def _validate_canonical_channel_contract(
+00306 |         self,
+00307 |         statistics: dict[str, Any],
+00308 |         embodiment: str,
+00309 |         specs: list[A2AChannelSpec],
+00310 |     ) -> None:
+00311 |         if statistics.get("version") != 1:
+00312 |             raise ValueError(
+00313 |                 f"Unsupported canonical A2A statistics version: {statistics.get('version')!r}"
+00314 |             )
+00315 |         if statistics.get("normalization") != (
+00316 |             "shared_history_future_continuous_intersection"
+00317 |         ):
+00318 |             raise ValueError("Canonical A2A statistics use an unexpected normalization contract")
+00319 |         if int(statistics.get("history_horizon", -1)) != self.a2a_history_horizon or int(
+00320 |             statistics.get("future_horizon", -1)
+00321 |         ) != self.a2a_future_horizon:
+00322 |             raise ValueError(
+00323 |                 "Canonical A2A statistics horizons do not match the processor configuration"
+00324 |             )
+00325 |         if int(statistics.get("feature_dim", -1)) != self.max_action_dim:
+00326 |             raise ValueError(
+00327 |                 "Canonical A2A statistics feature_dim must equal processor max_action_dim"
+00328 |             )
+00329 |         if int(statistics.get("num_windows", 0)) <= 0:
+00330 |             raise ValueError("Canonical A2A statistics must contain at least one window")
+00331 |         if int(statistics.get("nonfinite_active_count", -1)) != 0:
+00332 |             raise ValueError("Canonical A2A statistics report non-finite active values")
+00333 |         stored_statistics_hash = statistics.get("statistics_sha256")
+00334 |         if stored_statistics_hash != canonical_statistics_sha256(statistics):
+00335 |             raise ValueError("Canonical A2A statistics SHA-256 does not match the payload")
+00336 |         feature_dim = int(statistics["feature_dim"])
+00337 |         vector_keys = (
+00338 |             "mean",
+00339 |             "std",
+00340 |             "min",
+00341 |             "max",
+00342 |             "q_low",
+00343 |             "q_high",
+00344 |             "valid_count",
+00345 |             "history_valid_count",
+00346 |             "future_valid_count",
+00347 |             "active_channel_mask",
+00348 |             "constant_mask",
+00349 |         )
+00350 |         vectors = {key: np.asarray(statistics.get(key)) for key in vector_keys}
+00351 |         if any(vector.shape != (feature_dim,) for vector in vectors.values()):
+00352 |             raise ValueError("Canonical A2A statistics vectors must all match feature_dim")
+00353 |         for key in ("mean", "std", "min", "max", "q_low", "q_high"):
+00354 |             if not np.all(np.isfinite(vectors[key].astype(np.float64))):
+00355 |                 raise ValueError(f"Canonical A2A statistics {key} contains non-finite values")
+00356 |         if np.any(vectors["std"].astype(np.float64) <= 0):
+00357 |             raise ValueError("Canonical A2A statistics std must be positive")
+00358 |         for key in ("valid_count", "history_valid_count", "future_valid_count"):
+00359 |             values = vectors[key].astype(np.float64)
+00360 |             if (
+00361 |                 not np.all(np.isfinite(values))
+00362 |                 or np.any(values < 0)
+00363 |                 or not np.all(values == np.floor(values))
+00364 |             ):
+00365 |                 raise ValueError(f"Canonical A2A statistics {key} must be non-negative integers")
+00366 |         for key in ("active_channel_mask", "constant_mask"):
+00367 |             values = vectors[key]
+00368 |             if not (
+00369 |                 np.issubdtype(values.dtype, np.bool_)
+00370 |                 or (
+00371 |                     np.issubdtype(values.dtype, np.number)
+00372 |                     and np.all(np.isfinite(values))
+00373 |                     and np.all(np.isin(values, [0, 1]))
+00374 |                 )
+00375 |             ):
+00376 |                 raise ValueError(f"Canonical A2A statistics {key} must be boolean/0-1")
+00377 |         minimum = vectors["min"].astype(np.float64)
+00378 |         maximum = vectors["max"].astype(np.float64)
+00379 |         q_low = vectors["q_low"].astype(np.float64)
+00380 |         q_high = vectors["q_high"].astype(np.float64)
+00381 |         if np.any(minimum > q_low) or np.any(q_low > q_high) or np.any(q_high > maximum):
+00382 |             raise ValueError("Canonical A2A quantiles must lie monotonically inside min/max")
+00383 |         active = vectors["active_channel_mask"].astype(bool)
+00384 |         valid_count = vectors["valid_count"].astype(np.int64)
+00385 |         history_count = vectors["history_valid_count"].astype(np.int64)
+00386 |         future_count = vectors["future_valid_count"].astype(np.int64)
+00387 |         if np.any(valid_count[active] <= 0) or np.any(history_count[active] <= 0) or np.any(
+00388 |             future_count[active] <= 0
+00389 |         ):
+00390 |             raise ValueError("Every active canonical channel needs history and future samples")
+00391 |         if np.any(valid_count != history_count + future_count):
+00392 |             raise ValueError("Canonical valid_count must equal history_count + future_count")
+00393 |         if (
+00394 |             np.any(valid_count[~active] != 0)
+00395 |             or np.any(history_count[~active] != 0)
+00396 |             or np.any(future_count[~active] != 0)
+00397 |         ):
+00398 |             raise ValueError("Inactive canonical channels must have zero sample counts")
+00399 |         if np.any(vectors["constant_mask"].astype(bool) & active):
+00400 |             raise ValueError("Strict A2A rejects active constant canonical channels")
+00401 |         contract = statistics.get("channel_contract")
+00402 |         if contract is None:
+00403 |             if self.a2a_require_semantic_metadata:
+00404 |                 raise ValueError(
+00405 |                     "Strict A2A canonical statistics must embed a versioned channel_contract"
+00406 |                 )
+00407 |             return
+00408 |         contract = validate_channel_contract(
+00409 |             contract,
+00410 |             feature_dim=int(statistics["feature_dim"]),
+00411 |             history_horizon=self.a2a_history_horizon,
+00412 |             future_horizon=self.a2a_future_horizon,
+00413 |         )
+00414 |         if self.a2a_require_semantic_metadata:
+00415 |             if self.a2a_expected_contract_sha256 is None:
+00416 |                 raise ValueError(
+00417 |                     "Strict A2A requires a2a_expected_contract_sha256 in the model config"
+00418 |                 )
+00419 |             if contract["sha256"] != self.a2a_expected_contract_sha256:
+00420 |                 raise ValueError(
+00421 |                     "Canonical statistics contract does not match "
+00422 |                     "a2a_expected_contract_sha256"
+00423 |                 )
+00424 |         if contract["embodiment"] != embodiment:
+00425 |             raise ValueError(
+00426 |                 f"Canonical statistics are bound to {contract['embodiment']!r}, "
+00427 |                 f"not {embodiment!r}"
+00428 |             )
+00429 |         expected_channels = []
+00430 |         cursor = 0
+00431 |         for spec in specs:
+00432 |             end = cursor + int(spec.dim)
+00433 |             expected_channels.append(
+00434 |                 {
+00435 |                     "action_key": spec.action_key,
+00436 |                     "source_state_key": spec.source_state_key,
+00437 |                     "kind": spec.kind,
+00438 |                     "start": cursor,
+00439 |                     "end": end,
+00440 |                     "canonical_format": spec.canonical_format,
+00441 |                     "source_format": spec.source_format,
+00442 |                     "target_format": spec.target_format,
+00443 |                     "source_unit": spec.source_unit,
+00444 |                     "target_unit": spec.target_unit,
+00445 |                     "source_frame": spec.source_frame,
+00446 |                     "target_frame": spec.target_frame,
+00447 |                 }
+00448 |             )
+00449 |             cursor = end
+00450 |         if contract["channels"] != expected_channels:
+00451 |             raise ValueError(
+00452 |                 "Canonical statistics channel order/semantics do not match a2a_channel_specs"
+00453 |             )
+00454 | 
+00455 |     def _rebuild_a2a_parameters(self, statistics: dict) -> None:
+00456 |         self._resolved_channel_specs = {}
+00457 |         self.a2a_statistics = {}
+00458 |         self.a2a_norm_params = {}
+00459 |         for embodiment in self.modality_configs:
+00460 |             if embodiment not in statistics or "action" not in statistics[embodiment]:
+00461 |                 continue
+00462 |             specs = self._resolve_specs(embodiment, statistics)
+00463 |             canonical_statistics = self._canonical_statistics_for_embodiment(embodiment)
+00464 |             if canonical_statistics is None and self.a2a_require_canonical_statistics:
+00465 |                 raise ValueError(
+00466 |                     "Strict latent A2A requires canonical statistics generated by "
+00467 |                     "scripts/a2a/build_canonical_stats.py; set "
+00468 |                     "model.a2a_canonical_statistics_path"
+00469 |                 )
+00470 |             if canonical_statistics is not None:
+00471 |                 self._validate_canonical_channel_contract(
+00472 |                     canonical_statistics, embodiment, specs
+00473 |                 )
+00474 |             self._resolved_channel_specs[embodiment] = specs
+00475 |             self.a2a_statistics[embodiment] = {}
+00476 |             self.a2a_norm_params[embodiment] = {}
+00477 |             cursor = 0
+00478 |             for spec in specs:
+00479 |                 action_stats = statistics[embodiment]["action"][spec.action_key]
+00480 |                 action_min, action_max = self._bounds(action_stats)
+00481 |                 if spec.kind == "continuous":
+00482 |                     if canonical_statistics is not None:
+00483 |                         lower, upper = self._canonical_bounds(
+00484 |                             canonical_statistics,
+00485 |                             cursor,
+00486 |                             cursor + int(spec.dim),
+00487 |                             embodiment,
+00488 |                             spec.action_key,
+00489 |                         )
+00490 |                     else:
+00491 |                         # Explicit non-strict fallback for exploratory runs.
+00492 |                         # Both sides still use these shared union bounds.
+00493 |                         state_stats = statistics[embodiment]["state"][spec.source_state_key]
+00494 |                         state_min, state_max = self._bounds(state_stats)
+00495 |                         lower = np.minimum(state_min, action_min)
+00496 |                         upper = np.maximum(state_max, action_max)
+00497 |                 else:
+00498 |                     lower, upper = action_min, action_max
+00499 |                 params = {
+00500 |                     "min": lower.astype(np.float32),
+00501 |                     "max": upper.astype(np.float32),
+00502 |                 }
+00503 |                 self.a2a_norm_params[embodiment][spec.action_key] = params
+00504 |                 self.a2a_statistics[embodiment][spec.action_key] = {
+00505 |                     "min": params["min"].tolist(),
+00506 |                     "max": params["max"].tolist(),
+00507 |                     "kind": spec.kind,
+00508 |                     "source_state_key": spec.source_state_key,
+00509 |                 }
+00510 |                 cursor += int(spec.dim)
+00511 | 
+00512 |     def _require_parameters(self, embodiment: str) -> list[A2AChannelSpec]:
+00513 |         if embodiment not in self._resolved_channel_specs:
+00514 |             raise RuntimeError(
+00515 |                 f"A2A statistics for {embodiment!r} are not initialized. Build the dataset or "
+00516 |                 "load a checkpoint processor before processing samples."
+00517 |             )
+00518 |         return self._resolved_channel_specs[embodiment]
+00519 | 
+00520 |     def _normalize(self, values: np.ndarray, embodiment: str, key: str) -> np.ndarray:
+00521 |         normalized = normalize_values_minmax(
+00522 |             values.astype(np.float32), self.a2a_norm_params[embodiment][key]
+00523 |         )
+00524 |         return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+00525 | 
+00526 |     def _history_window(
+00527 |         self, values: np.ndarray, supplied_valid_time: np.ndarray | None = None
+00528 |     ) -> tuple[np.ndarray, np.ndarray]:
+00529 |         values = np.asarray(values, dtype=np.float32)
+00530 |         if values.ndim != 2:
+00531 |             raise ValueError(f"Expected state trajectory [T,D], got {values.shape}")
+00532 |         if values.shape[0] == 0:
+00533 |             raise ValueError("A2A state trajectory cannot be empty")
+00534 |         if not np.all(np.isfinite(values)):
+00535 |             raise ValueError("A2A state trajectory contains NaN or infinity")
+00536 |         horizon = self.a2a_history_horizon
+00537 |         if supplied_valid_time is not None:
+00538 |             supplied_valid_time = np.asarray(supplied_valid_time)
+00539 |             if supplied_valid_time.shape != (values.shape[0],):
+00540 |                 raise ValueError(
+00541 |                     "A2A history valid mask must have one entry per supplied state timestep"
+00542 |                 )
+00543 |             if not np.all(np.isin(supplied_valid_time, [0, 1])):
+00544 |                 raise ValueError("A2A history valid mask must contain only 0/1 values")
+00545 |             supplied_valid_time = supplied_valid_time.astype(np.float32)
+00546 |         else:
+00547 |             supplied_valid_time = np.ones(values.shape[0], dtype=np.float32)
+00548 |         if self.a2a_cold_start == "require_full_history" and (
+00549 |             values.shape[0] < horizon or not np.all(supplied_valid_time[-horizon:])
+00550 |         ):
+00551 |             raise ValueError(
+00552 |                 f"A2A requires {horizon} real history steps; padded/invalid steps were supplied"
+00553 |             )
+00554 |         if values.shape[0] >= horizon:
+00555 |             return values[-horizon:], supplied_valid_time[-horizon:]
+00556 |         if self.a2a_cold_start == "require_full_history":
+00557 |             raise ValueError(f"A2A requires {horizon} history steps, got {values.shape[0]}")
+00558 |         pad_count = horizon - values.shape[0]
+00559 |         padded = np.concatenate([np.repeat(values[:1], pad_count, axis=0), values], axis=0)
+00560 |         valid = np.concatenate([np.zeros(pad_count, dtype=np.float32), supplied_valid_time])
+00561 |         return padded, valid
+00562 | 
+00563 |     def _build_a2a_inputs(self, content) -> dict[str, torch.Tensor]:
+00564 |         embodiment = content.embodiment.value
+00565 |         specs = self._require_parameters(embodiment)
+00566 |         history = np.zeros(
+00567 |             (self.a2a_history_horizon, self.max_action_dim), dtype=np.float32
+00568 |         )
+00569 |         future = np.zeros((self.a2a_future_horizon, self.max_action_dim), dtype=np.float32)
+00570 |         history_mask = np.zeros_like(history)
+00571 |         future_mask = np.zeros_like(future)
+00572 |         continuous_mask = np.zeros_like(future)
+00573 |         auxiliary_mask = np.zeros_like(future)
+00574 |         binary_mask = np.zeros_like(future)
+00575 |         categorical_mask = np.zeros_like(future)
+00576 |         categorical_group_index = np.full(future.shape, -1, dtype=np.int64)
+00577 | 
+00578 |         supplied_history_mask = content.metadata.get("a2a_history_valid_mask")
+00579 |         if supplied_history_mask is not None:
+00580 |             supplied_history_mask = _as_numpy(supplied_history_mask)
+00581 |         categorical_group = 0
+00582 | 
+00583 |         cursor = 0
+00584 |         for spec in specs:
+00585 |             dim = int(spec.dim)
+00586 |             end = cursor + dim
+00587 |             if end > self.max_action_dim:
+00588 |                 raise ValueError(
+00589 |                     f"Canonical action dimension exceeds max_action_dim={self.max_action_dim}"
+00590 |                 )
+00591 |             if spec.kind == "continuous":
+00592 |                 source, valid_time = self._history_window(
+00593 |                     _as_numpy(content.states[spec.source_state_key]), supplied_history_mask
+00594 |                 )
+00595 |                 history[:, cursor:end] = self._normalize(
+00596 |                     source, embodiment, spec.action_key
+00597 |                 )
+00598 |                 history_mask[:, cursor:end] = valid_time[:, None]
+00599 |                 continuous_mask[:, cursor:end] = 1.0
+00600 | 
+00601 |             if content.actions and spec.action_key in content.actions:
+00602 |                 target = _as_numpy(content.actions[spec.action_key]).astype(np.float32)
+00603 |                 if target.ndim != 2 or target.shape[1] != dim:
+00604 |                     raise ValueError(
+00605 |                         f"A2A target {embodiment}/{spec.action_key} must have shape "
+00606 |                         f"[T,{dim}], got {target.shape}"
+00607 |                     )
+00608 |                 if target.shape[0] != self.a2a_future_horizon:
+00609 |                     raise ValueError(
+00610 |                         f"Strict A2A target {embodiment}/{spec.action_key} must contain "
+00611 |                         f"exactly {self.a2a_future_horizon} steps, got {target.shape[0]}"
+00612 |                     )
+00613 |                 if not np.all(np.isfinite(target)):
+00614 |                     raise ValueError(
+00615 |                         f"A2A target {embodiment}/{spec.action_key} contains NaN or infinity"
+00616 |                     )
+00617 |                 valid_steps = self.a2a_future_horizon
+00618 |                 if spec.kind == "binary":
+00619 |                     lower = self.a2a_norm_params[embodiment][spec.action_key]["min"]
+00620 |                     upper = self.a2a_norm_params[embodiment][spec.action_key]["max"]
+00621 |                     threshold = (lower + upper) / 2.0
+00622 |                     future[:valid_steps, cursor:end] = (target > threshold).astype(np.float32)
+00623 |                 elif spec.kind == "categorical":
+00624 |                     if not np.all((target == 0) | (target == 1)) or not np.allclose(
+00625 |                         target.sum(axis=-1), 1.0
+00626 |                     ):
+00627 |                         raise ValueError(
+00628 |                             f"Categorical target {embodiment}/{spec.action_key} must be one-hot"
+00629 |                         )
+00630 |                     future[:valid_steps, cursor:end] = target
+00631 |                 else:
+00632 |                     future[:valid_steps, cursor:end] = self._normalize(
+00633 |                         target, embodiment, spec.action_key
+00634 |                     )
+00635 |                 future_mask[:valid_steps, cursor:end] = 1.0
+00636 |             else:
+00637 |                 # Inference still needs output masks even without a target.
+00638 |                 future_mask[:, cursor:end] = 1.0
+00639 | 
+00640 |             if spec.kind == "regression":
+00641 |                 auxiliary_mask[:, cursor:end] = 1.0
+00642 |             elif spec.kind == "binary":
+00643 |                 binary_mask[:, cursor:end] = 1.0
+00644 |             elif spec.kind == "categorical":
+00645 |                 categorical_mask[:, cursor:end] = 1.0
+00646 |                 categorical_group_index[:, cursor:end] = categorical_group
+00647 |                 categorical_group += 1
+00648 |             cursor = end
+00649 | 
+00650 |         # Only masks for valid future steps participate during training.
+00651 |         continuous_mask *= future_mask
+00652 |         auxiliary_mask *= future_mask
+00653 |         binary_mask *= future_mask
+00654 |         categorical_mask *= future_mask
+00655 |         return {
+00656 |             "history_action_canonical": torch.from_numpy(history),
+00657 |             "future_action_canonical": torch.from_numpy(future),
+00658 |             "history_action_mask": torch.from_numpy(history_mask),
+00659 |             "future_action_mask": torch.from_numpy(future_mask),
+00660 |             "continuous_action_mask": torch.from_numpy(continuous_mask),
+00661 |             "auxiliary_action_mask": torch.from_numpy(auxiliary_mask),
+00662 |             "binary_action_mask": torch.from_numpy(binary_mask),
+00663 |             "categorical_action_mask": torch.from_numpy(categorical_mask),
+00664 |             "categorical_group_index": torch.from_numpy(categorical_group_index),
+00665 |         }
+00666 | 
+00667 |     def __call__(self, messages: list[dict[str, Any]]):
+00668 |         content = messages[0]["content"]
+00669 |         transformed = super().__call__(messages)
+00670 |         # A2A consumes the full proprio history separately; keep only the current
+00671 |         # state in the legacy field for optional state-conditioning ablations.
+00672 |         transformed["state"] = transformed["state"][-1:]
+00673 |         transformed.pop("action", None)
+00674 |         transformed.pop("action_mask", None)
+00675 |         transformed.update(self._build_a2a_inputs(content))
+00676 |         return transformed
+00677 | 
+00678 |     def decode_action(self, action: np.ndarray, embodiment_tag, state=None):
+00679 |         del state  # Canonical outputs are already absolute physical targets.
+00680 |         embodiment = embodiment_tag.value
+00681 |         specs = self._require_parameters(embodiment)
+00682 |         action = _as_numpy(action).astype(np.float32)
+00683 |         horizon = self.a2a_future_horizon
+00684 |         output: dict[str, np.ndarray] = {}
+00685 |         cursor = 0
+00686 |         for spec in specs:
+00687 |             end = cursor + int(spec.dim)
+00688 |             values = action[..., :horizon, cursor:end]
+00689 |             if spec.kind == "binary":
+00690 |                 output[spec.action_key] = (values >= 0.5).astype(np.float32)
+00691 |             elif spec.kind == "categorical":
+00692 |                 index = values.argmax(axis=-1)
+00693 |                 output[spec.action_key] = np.eye(int(spec.num_classes), dtype=np.float32)[index]
+00694 |             else:
+00695 |                 output[spec.action_key] = unnormalize_values_minmax(
+00696 |                     values, self.a2a_norm_params[embodiment][spec.action_key]
+00697 |                 ).astype(np.float32)
+00698 |             cursor = end
+00699 |         return output
+00700 | 
+00701 |     def save_pretrained(self, save_directory: str | Path) -> list[Path]:
+00702 |         files = super().save_pretrained(save_directory)
+00703 |         save_directory = Path(save_directory)
+00704 |         config_path = save_directory / "processor_config.json"
+00705 |         with config_path.open("r", encoding="utf-8") as handle:
+00706 |             config = json.load(handle)
+00707 |         config["processor_class"] = self.__class__.__name__
+00708 |         kwargs = config["processor_kwargs"]
+00709 |         kwargs.update(
+00710 |             {
+00711 |                 "a2a_history_horizon": self.a2a_history_horizon,
+00712 |                 "a2a_future_horizon": self.a2a_future_horizon,
+00713 |                 "a2a_channel_specs": {
+00714 |                     embodiment: [asdict(spec) for spec in specs]
+00715 |                     for embodiment, specs in self._resolved_channel_specs.items()
+00716 |                 },
+00717 |                 "a2a_cold_start": self.a2a_cold_start,
+00718 |                 "a2a_canonical_statistics": self.a2a_canonical_statistics,
+00719 |                 "a2a_require_canonical_statistics": self.a2a_require_canonical_statistics,
+00720 |                 "a2a_require_explicit_channel_specs": (
+00721 |                     self.a2a_require_explicit_channel_specs
+00722 |                 ),
+00723 |                 "a2a_require_semantic_metadata": self.a2a_require_semantic_metadata,
+00724 |                 "a2a_expected_contract_sha256": self.a2a_expected_contract_sha256,
+00725 |             }
+00726 |         )
+00727 |         with config_path.open("w", encoding="utf-8") as handle:
+00728 |             json.dump(config, handle, indent=2)
+00729 |         a2a_stats_path = save_directory / "a2a_statistics.json"
+00730 |         with a2a_stats_path.open("w", encoding="utf-8") as handle:
+00731 |             json.dump(
+00732 |                 {
+00733 |                     "canonical_statistics": self.a2a_canonical_statistics,
+00734 |                     "normalization_by_embodiment": self.a2a_statistics,
+00735 |                 },
+00736 |                 handle,
+00737 |                 indent=2,
+00738 |             )
+00739 |         return [*files, a2a_stats_path]
+00740 | 
+00741 | 
+00742 | AutoProcessor.register("Gr00tN1d7A2A", Gr00tN1d7A2AProcessor)

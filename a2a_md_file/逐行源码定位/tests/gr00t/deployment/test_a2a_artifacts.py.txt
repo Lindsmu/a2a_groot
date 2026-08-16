@@ -1,0 +1,42 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | import json
+00004 | 
+00005 | from gr00t.deployment.a2a_artifacts import (
+00006 |     canonical_json_sha256,
+00007 |     canonical_statistics_sha256,
+00008 |     checkpoint_sha256,
+00009 |     sha256_file,
+00010 | )
+00011 | import pytest
+00012 | 
+00013 | 
+00014 | def test_sha256_file_and_canonical_json_are_deterministic(tmp_path):
+00015 |     artifact = tmp_path / "artifact.bin"
+00016 |     artifact.write_bytes(b"latent-a2a")
+00017 |     assert sha256_file(artifact) == sha256_file(artifact)
+00018 |     assert canonical_json_sha256({"b": 2, "a": 1}) == canonical_json_sha256(
+00019 |         {"a": 1, "b": 2}
+00020 |     )
+00021 | 
+00022 | 
+00023 | def test_checkpoint_sha_binds_config_weights_and_relative_name(tmp_path):
+00024 |     checkpoint = tmp_path / "checkpoint"
+00025 |     checkpoint.mkdir()
+00026 |     (checkpoint / "config.json").write_text(json.dumps({"model_type": "A2A"}))
+00027 |     weights = checkpoint / "model.safetensors"
+00028 |     weights.write_bytes(b"weights-v1")
+00029 |     first = checkpoint_sha256(checkpoint)
+00030 |     weights.write_bytes(b"weights-v2")
+00031 |     assert checkpoint_sha256(checkpoint) != first
+00032 | 
+00033 | 
+00034 | def test_checkpoint_sha_requires_inference_weights(tmp_path):
+00035 |     (tmp_path / "config.json").write_text("{}")
+00036 |     with pytest.raises(FileNotFoundError, match="weight files"):
+00037 |         checkpoint_sha256(tmp_path)
+00038 | 
+00039 | 
+00040 | def test_canonical_statistics_sha_rejects_empty_payload():
+00041 |     with pytest.raises(ValueError, match="absent or empty"):
+00042 |         canonical_statistics_sha256({})

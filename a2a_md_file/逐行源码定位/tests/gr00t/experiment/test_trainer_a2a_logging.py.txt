@@ -1,0 +1,17 @@
+00001 | # SPDX-License-Identifier: Apache-2.0
+00002 | 
+00003 | """Regression tests for one-record-per-step A2A component logging."""
+00004 | 
+00005 | from gr00t.experiment.trainer import _should_log_step_metrics
+00006 | 
+00007 | 
+00008 | def test_a2a_component_logging_skips_step_zero_and_non_intervals():
+00009 |     assert not _should_log_step_metrics(0, 5, None)
+00010 |     assert not _should_log_step_metrics(4, 5, None)
+00011 |     assert not _should_log_step_metrics(5, 0, None)
+00012 | 
+00013 | 
+00014 | def test_a2a_component_logging_emits_once_per_global_step():
+00015 |     assert _should_log_step_metrics(10, 5, None)
+00016 |     assert not _should_log_step_metrics(10, 5, 10)
+00017 |     assert _should_log_step_metrics(15, 5, 10)

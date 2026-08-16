@@ -1,0 +1,119 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | #
+00004 | # Licensed under the Apache License, Version 2.0 (the "License");
+00005 | # you may not use this file except in compliance with the License.
+00006 | # You may obtain a copy of the License at
+00007 | #
+00008 | # http://www.apache.org/licenses/LICENSE-2.0
+00009 | #
+00010 | # Unless required by applicable law or agreed to in writing, software
+00011 | # distributed under the License is distributed on an "AS IS" BASIS,
+00012 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+00013 | # See the License for the specific language governing permissions and
+00014 | # limitations under the License.
+00015 | 
+00016 | import numpy as np
+00017 | from tqdm import tqdm
+00018 | 
+00019 | from gr00t.configs.base_config import Config
+00020 | from gr00t.data.dataset.a2a_single_step_dataset import (
+00021 |     A2AShardedSingleStepDataset,
+00022 |     is_a2a_model_config,
+00023 | )
+00024 | from gr00t.data.dataset.sharded_mixture_dataset import ShardedMixtureDataset
+00025 | from gr00t.data.dataset.sharded_single_step_dataset import ShardedSingleStepDataset
+00026 | from gr00t.data.embodiment_tags import EmbodimentTag
+00027 | from gr00t.data.interfaces import BaseProcessor
+00028 | from gr00t.data.stats import generate_rel_stats, generate_stats
+00029 | from gr00t.utils.dist_utils import run_or_wait_on_rank0
+00030 | 
+00031 | 
+00032 | def uses_a2a_dataset(config: Config) -> bool:
+00033 |     """Return whether ``config`` requires strict all-modality A2A windows.
+00034 | 
+00035 |     ``model_type`` is the primary, stable discriminator.  The horizon fallback
+00036 |     also supports programmatically constructed A2A configs before serialization.
+00037 |     Concrete type checks avoid treating an unset ``MagicMock``/proxy attribute as
+00038 |     opt-in in tests or downstream configuration wrappers.
+00039 |     """
+00040 | 
+00041 |     return is_a2a_model_config(config.model)
+00042 | 
+00043 | 
+00044 | class DatasetFactory:
+00045 |     """
+00046 |     Factory class for building training datasets. Model-agnostic.
+00047 |     """
+00048 | 
+00049 |     def __init__(self, config: Config):
+00050 |         self.config = config
+00051 | 
+00052 |     def build(
+00053 |         self, processor: BaseProcessor
+00054 |     ) -> tuple[ShardedMixtureDataset, ShardedMixtureDataset | None]:
+00055 |         """Build the dataset. Returns a tuple of (train_dataset, eval_dataset)."""
+00056 |         assert self.config.training.eval_strategy == "no", (
+00057 |             "Sharded dataset does not support evaluation sets"
+00058 |         )
+00059 | 
+00060 |         dataset_class = (
+00061 |             A2AShardedSingleStepDataset
+00062 |             if uses_a2a_dataset(self.config)
+00063 |             else ShardedSingleStepDataset
+00064 |         )
+00065 |         all_datasets = []
+00066 |         all_weights = []
+00067 |         for dataset_spec in tqdm(
+00068 |             self.config.data.datasets,
+00069 |             total=len(self.config.data.datasets),
+00070 |             desc="Initializing datasets",
+00071 |         ):
+00072 |             datasets = []
+00073 |             for dataset_path in dataset_spec.dataset_paths:
+00074 |                 embodiment_tag = dataset_spec.embodiment_tag
+00075 |                 assert embodiment_tag is not None, "Embodiment tag is required"
+00076 |                 assert self.config.data.mode == "single_turn", "Only single turn mode is supported"
+00077 |                 # rank-0 writes stats; helper barriers before peers read them.
+00078 |                 with run_or_wait_on_rank0(label=f"generate_stats({dataset_path})") as is_rank0:
+00079 |                     if is_rank0:
+00080 |                         generate_stats(dataset_path)
+00081 |                         generate_rel_stats(dataset_path, EmbodimentTag(embodiment_tag))
+00082 |                 dataset = dataset_class(
+00083 |                     dataset_path=dataset_path,
+00084 |                     embodiment_tag=EmbodimentTag(embodiment_tag),
+00085 |                     modality_configs=self.config.data.modality_configs[embodiment_tag],
+00086 |                     shard_size=self.config.data.shard_size,
+00087 |                     episode_sampling_rate=self.config.data.episode_sampling_rate,
+00088 |                     seed=self.config.data.seed,
+00089 |                     allow_padding=self.config.data.allow_padding,
+00090 |                 )
+00091 |                 datasets.append(dataset)
+00092 |             dataset_lengths = np.array([len(dataset) for dataset in datasets])
+00093 |             dataset_relative_lengths = dataset_lengths / dataset_lengths.sum()
+00094 |             for dataset, relative_length in zip(datasets, dataset_relative_lengths):
+00095 |                 weight = relative_length * dataset_spec.mix_ratio
+00096 |                 all_datasets.append(dataset)
+00097 |                 all_weights.append(weight)
+00098 | 
+00099 |         alpha = self.config.data.ds_weights_alpha
+00100 |         if alpha is not None and len(all_datasets) > 1:
+00101 |             ds_lengths = np.array([len(dataset) for dataset in all_datasets], dtype=np.float64)
+00102 |             all_weights = (np.power(ds_lengths, alpha) / np.power(ds_lengths[0], alpha)).tolist()
+00103 |             print(
+00104 |                 f"Applied ds_weights_alpha={alpha} across {len(all_datasets)} datasets; "
+00105 |                 "this overrides per-dataset mix_ratio sampling weights."
+00106 |             )
+00107 | 
+00108 |         return (
+00109 |             ShardedMixtureDataset(
+00110 |                 datasets=all_datasets,
+00111 |                 weights=all_weights,
+00112 |                 processor=processor,
+00113 |                 seed=self.config.data.seed,
+00114 |                 training=True,
+00115 |                 num_shards_per_epoch=self.config.data.num_shards_per_epoch,
+00116 |                 override_pretraining_statistics=self.config.data.override_pretraining_statistics,
+00117 |             ),
+00118 |             None,
+00119 |         )

@@ -1,0 +1,212 @@
+00001 | # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+00002 | # SPDX-License-Identifier: Apache-2.0
+00003 | 
+00004 | from __future__ import annotations
+00005 | 
+00006 | from gr00t.policy.a2a_history import A2AProprioHistoryBuffer
+00007 | import numpy as np
+00008 | import pytest
+00009 | 
+00010 | 
+00011 | def _actual(value: float, batch_size: int = 2) -> dict[str, np.ndarray]:
+00012 |     return {
+00013 |         "arm": np.full((batch_size, 2), value, dtype=np.float32),
+00014 |         "gripper": np.full((batch_size, 1, 1), value + 100, dtype=np.float32),
+00015 |     }
+00016 | 
+00017 | 
+00018 | def _external(start: float, batch_size: int = 2, horizon: int = 3) -> dict[str, np.ndarray]:
+00019 |     steps = np.arange(start, start + horizon, dtype=np.float32)
+00020 |     arm = np.broadcast_to(steps[None, :, None], (batch_size, horizon, 2)).copy()
+00021 |     gripper = np.broadcast_to((steps + 100)[None, :, None], (batch_size, horizon, 1)).copy()
+00022 |     return {"arm": arm, "gripper": gripper}
+00023 | 
+00024 | 
+00025 | def test_repeat_first_state_cold_start_and_source_metadata() -> None:
+00026 |     buffer = A2AProprioHistoryBuffer(3, state_keys=("arm", "gripper"))
+00027 | 
+00028 |     result = buffer.resolve(_actual(7), timestamp=np.array([1.0, 2.0]))
+00029 | 
+00030 |     assert result.metadata == {
+00031 |         "source": "repeat_first_state",
+00032 |         "history_horizon": 3,
+00033 |         "valid_steps": 1,
+00034 |         "padded_steps": 2,
+00035 |         "batch_size": 2,
+00036 |         "state_keys": ("arm", "gripper"),
+00037 |         "timestamps_validated": True,
+00038 |         "max_time_gap_s": None,
+00039 |         "external_current_ignored": False,
+00040 |     }
+00041 |     np.testing.assert_array_equal(result.states["arm"], 7)
+00042 |     np.testing.assert_array_equal(result.states["gripper"], 107)
+00043 |     np.testing.assert_array_equal(
+00044 |         result.timestamps,
+00045 |         np.array([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]),
+00046 |     )
+00047 |     np.testing.assert_array_equal(
+00048 |         result.valid_mask,
+00049 |         np.array([[False, False, True], [False, False, True]]),
+00050 |     )
+00051 |     assert not buffer.is_ready
+00052 | 
+00053 | 
+00054 | def test_multi_key_ring_buffer_is_ordered_and_rolls_over() -> None:
+00055 |     buffer = A2AProprioHistoryBuffer(3, state_keys=("arm", "gripper"))
+00056 |     for step in range(4):
+00057 |         buffer.append_actual(_actual(step), timestamp=float(step))
+00058 | 
+00059 |     result = buffer.get_history()
+00060 | 
+00061 |     assert buffer.size == 3
+00062 |     assert buffer.is_ready
+00063 |     assert result.metadata["source"] == "ring_buffer"
+00064 |     assert result.metadata["valid_steps"] == 3
+00065 |     np.testing.assert_array_equal(result.states["arm"][0, :, 0], [1, 2, 3])
+00066 |     np.testing.assert_array_equal(result.states["gripper"][1, :, 0], [101, 102, 103])
+00067 |     np.testing.assert_array_equal(result.timestamps, [[1, 2, 3], [1, 2, 3]])
+00068 |     assert result.valid_mask.all()
+00069 | 
+00070 | 
+00071 | def test_external_full_history_has_priority_and_reseeds_ring() -> None:
+00072 |     buffer = A2AProprioHistoryBuffer(3, state_keys=("arm", "gripper"))
+00073 |     buffer.append(_actual(-1), timestamp=0.0)
+00074 |     external = _external(10)
+00075 | 
+00076 |     result = buffer.resolve(
+00077 |         _actual(999),
+00078 |         timestamp=999.0,
+00079 |         external_history=external,
+00080 |         external_timestamps=np.array([10.0, 11.0, 12.0]),
+00081 |     )
+00082 | 
+00083 |     assert result.metadata["source"] == "external"
+00084 |     assert result.metadata["external_current_ignored"] is True
+00085 |     np.testing.assert_array_equal(result.states["arm"], external["arm"])
+00086 |     np.testing.assert_array_equal(result.timestamps, [[10, 11, 12], [10, 11, 12]])
+00087 | 
+00088 |     # The authoritative external sequence becomes the local ring's continuity
+00089 |     # anchor; the ignored current prediction/sample never enters the history.
+00090 |     buffer.append_actual(_actual(13), timestamp=13.0)
+00091 |     continued = buffer.get_history()
+00092 |     np.testing.assert_array_equal(continued.states["arm"][0, :, 0], [11, 12, 13])
+00093 |     assert 999 not in continued.states["arm"]
+00094 | 
+00095 | 
+00096 | def test_external_history_requires_exact_horizon_and_timestamp_shape() -> None:
+00097 |     buffer = A2AProprioHistoryBuffer(3)
+00098 | 
+00099 |     with pytest.raises(ValueError, match=r"shape \[B, 3, D\]"):
+00100 |         buffer.use_external_history(_external(0, horizon=2), timestamps=[0, 1, 2])
+00101 |     with pytest.raises(ValueError, match="external timestamps must have shape"):
+00102 |         buffer.use_external_history(_external(0), timestamps=[0, 1])
+00103 |     with pytest.raises(ValueError, match="external_timestamps is required"):
+00104 |         buffer.resolve(external_history=_external(0))
+00105 |     with pytest.raises(ValueError, match="without external_history"):
+00106 |         buffer.resolve(_actual(0), timestamp=0, external_timestamps=[0, 1, 2])
+00107 | 
+00108 | 
+00109 | def test_batch_is_checked_across_keys_and_updates() -> None:
+00110 |     buffer = A2AProprioHistoryBuffer(3, state_keys=("arm", "gripper"))
+00111 |     mismatched = _actual(0)
+00112 |     mismatched["gripper"] = np.zeros((1, 1), dtype=np.float32)
+00113 |     with pytest.raises(ValueError, match="share one batch size"):
+00114 |         buffer.append_actual(mismatched, timestamp=0)
+00115 | 
+00116 |     buffer.append_actual(_actual(0), timestamp=[0, 0])
+00117 |     with pytest.raises(ValueError, match="batch size changed"):
+00118 |         buffer.append_actual(_actual(1, batch_size=1), timestamp=1)
+00119 | 
+00120 | 
+00121 | def test_state_schema_shape_dtype_and_values_are_checked() -> None:
+00122 |     buffer = A2AProprioHistoryBuffer(3, state_keys=("arm", "gripper"))
+00123 | 
+00124 |     with pytest.raises(ValueError, match="missing=.*gripper"):
+00125 |         buffer.append_actual({"arm": _actual(0)["arm"]}, timestamp=0)
+00126 |     with pytest.raises(ValueError, match="one timestep"):
+00127 |         buffer.append_actual(
+00128 |             {
+00129 |                 "arm": np.zeros((2, 2, 2), dtype=np.float32),
+00130 |                 "gripper": _actual(0)["gripper"],
+00131 |             },
+00132 |             timestamp=0,
+00133 |         )
+00134 |     with pytest.raises(TypeError, match="floating dtype"):
+00135 |         integer_state = {key: value.astype(np.int32) for key, value in _actual(0).items()}
+00136 |         buffer.append_actual(integer_state, timestamp=0)
+00137 |     invalid = _actual(0)
+00138 |     invalid["arm"][0, 0] = np.nan
+00139 |     with pytest.raises(ValueError, match="NaN or infinity"):
+00140 |         buffer.append_actual(invalid, timestamp=0)
+00141 | 
+00142 |     buffer.append_actual(_actual(0), timestamp=[0, 0])
+00143 |     changed_dim = _actual(1)
+00144 |     changed_dim["arm"] = np.zeros((2, 3), dtype=np.float32)
+00145 |     with pytest.raises(ValueError, match="feature dimension"):
+00146 |         buffer.append_actual(changed_dim, timestamp=[1, 1])
+00147 | 
+00148 | 
+00149 | def test_timestamp_is_strictly_monotonic_per_batch() -> None:
+00150 |     buffer = A2AProprioHistoryBuffer(3)
+00151 |     buffer.append_actual(_actual(0), timestamp=[1.0, 10.0])
+00152 | 
+00153 |     with pytest.raises(ValueError, match="strictly increasing"):
+00154 |         buffer.append_actual(_actual(1), timestamp=[1.0, 11.0])
+00155 |     with pytest.raises(ValueError, match="strictly increasing"):
+00156 |         buffer.append_actual(_actual(1), timestamp=[2.0, 9.0])
+00157 |     with pytest.raises(ValueError, match="NaN or infinity"):
+00158 |         buffer.append_actual(_actual(1), timestamp=[2.0, np.nan])
+00159 | 
+00160 |     # Failed validation is transactional: no rejected sample was appended.
+00161 |     assert buffer.size == 1
+00162 |     np.testing.assert_array_equal(buffer.get_history().states["arm"], 0)
+00163 | 
+00164 | 
+00165 | def test_max_time_gap_is_checked_for_local_and_external_histories() -> None:
+00166 |     buffer = A2AProprioHistoryBuffer(3, max_time_gap_s=0.25)
+00167 |     buffer.append_actual(_actual(0), timestamp=[0.0, 1.0])
+00168 |     buffer.append_actual(_actual(1), timestamp=[0.2, 1.2])
+00169 |     with pytest.raises(ValueError, match="exceeds max_time_gap_s"):
+00170 |         buffer.append_actual(_actual(2), timestamp=[0.3, 1.6])
+00171 | 
+00172 |     buffer.reset()
+00173 |     with pytest.raises(ValueError, match="strictly increasing along history"):
+00174 |         buffer.use_external_history(_external(0), timestamps=[0.0, 0.2, 0.2])
+00175 |     with pytest.raises(ValueError, match="exceeds max_time_gap_s"):
+00176 |         buffer.use_external_history(_external(0), timestamps=[0.0, 0.2, 0.5])
+00177 | 
+00178 | 
+00179 | def test_reset_clears_episode_and_allows_new_batch_size() -> None:
+00180 |     buffer = A2AProprioHistoryBuffer(3)
+00181 |     buffer.append_actual(_actual(0, batch_size=2), timestamp=[0, 0])
+00182 | 
+00183 |     buffer.reset()
+00184 | 
+00185 |     assert buffer.size == 0
+00186 |     assert not buffer.is_ready
+00187 |     with pytest.raises(RuntimeError, match="history is empty"):
+00188 |         buffer.get_history()
+00189 |     result = buffer.resolve(_actual(5, batch_size=1), timestamp=5)
+00190 |     assert result.states["arm"].shape == (1, 3, 2)
+00191 |     assert result.metadata["source"] == "repeat_first_state"
+00192 | 
+00193 | 
+00194 | def test_returned_arrays_do_not_alias_internal_or_external_storage() -> None:
+00195 |     buffer = A2AProprioHistoryBuffer(3)
+00196 |     external = _external(0)
+00197 |     result = buffer.use_external_history(external, timestamps=[0, 1, 2])
+00198 | 
+00199 |     external["arm"].fill(-10)
+00200 |     result.states["arm"].fill(50)
+00201 |     result.timestamps.fill(50)
+00202 | 
+00203 |     fresh = buffer.get_history()
+00204 |     np.testing.assert_array_equal(fresh.states["arm"][0, :, 0], [0, 1, 2])
+00205 |     np.testing.assert_array_equal(fresh.timestamps[0], [0, 1, 2])
+00206 | 
+00207 | 
+00208 | def test_prediction_specific_keyword_is_not_accepted() -> None:
+00209 |     buffer = A2AProprioHistoryBuffer(3)
+00210 | 
+00211 |     with pytest.raises(TypeError, match="predicted_actions"):
+00212 |         buffer.resolve(predicted_actions=_actual(0), timestamp=0)  # type: ignore[call-arg]
